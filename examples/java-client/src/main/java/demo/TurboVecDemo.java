@@ -1,5 +1,7 @@
 package demo;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.grpc.Grpc;
 import io.grpc.InsecureChannelCredentials;
 import io.grpc.ManagedChannel;
@@ -227,40 +229,53 @@ public final class TurboVecDemo {
         }
         streamOne(channel, add.build());
 
-        System.out.printf("%n[4] uint64 id fidelity: JSON number (double) vs turbovec over gRPC%n");
-        System.out.printf(
-                "    %-22s  %-22s  %-22s%n", "id added", "through JSON number", "returned by gRPC");
+        // One large id seen by three JVM client setups. Both JSON columns use a
+        // real Jackson ObjectMapper on the same bytes; only the target type
+        // differs. "double" is what JavaScript's JSON.parse and any double field
+        // produce; "long" is a typed integer field, the correct JSON setup here.
+        ObjectMapper json = new ObjectMapper();
         float[] probe = randomVector(dim, new Random(5));
+        System.out.printf("%n[4] one uint64 id, three client setups%n");
+        System.out.printf(
+                "    %-21s %-25s %-23s %-23s%n",
+                "id", "JSON into a double", "JSON into a long", "gRPC uint64");
         for (long id : ids) {
-            long viaJson = (long) (double) id; // a JSON number is an IEEE-754 double
+            long viaDouble = jsonAsDouble(json, id);
+            long viaLong = jsonAsLong(json, id);
             long viaGrpc = lookupOnly(blocking, indexId, probe, id);
             System.out.printf(
-                    "    %-22d  %-22s  %-22s%n",
+                    "    %-21d %-25s %-23s %-23s%n",
                     id,
-                    viaJson + (viaJson == id ? "" : "  LOST"),
-                    viaGrpc + (viaGrpc == id ? "  ok" : "  LOST"));
+                    viaDouble + (viaDouble == id ? " ok" : " LOST"),
+                    viaLong + (viaLong == id ? " ok" : " LOST"),
+                    viaGrpc + (viaGrpc == id ? " ok" : " LOST"));
         }
+        System.out.printf(
+                "    the digits survive as a long or a string; they round only when a client"
+                        + " routes the number%n    through a double (JavaScript, Gson to Object, a"
+                        + " double field). gRPC's uint64 removes the choice.%n");
 
-        // The rounding does not just lose a digit, it collides: two distinct ids
-        // fold onto one number, so a JSON client can no longer address them apart.
+        // The double path does not just lose a digit, it collides: two distinct
+        // ids fold onto one number, so that client can no longer address them apart.
         long idA = ids[1]; // 2^53
         long idB = ids[2]; // 2^53 + 1, a different vector under a different id
-        long idBAsJson = (long) (double) idB; // what a JSON client receives for B
-        long askedViaJson = lookupOnly(blocking, indexId, probe, idBAsJson);
+        long idBAsDouble = jsonAsDouble(json, idB); // what the double path yields for B
+        long askedViaDouble = lookupOnly(blocking, indexId, probe, idBAsDouble);
         long askedViaGrpc = lookupOnly(blocking, indexId, probe, idB);
-        if (askedViaJson != idA || askedViaGrpc != idB) {
+        if (askedViaDouble != idA || askedViaGrpc != idB) {
             throw new IllegalStateException("id collision demo did not reproduce");
         }
-        System.out.printf("%n[5] id collision: two distinct ids JSON cannot tell apart%n");
+        System.out.printf("%n[5] id collision on the double path%n");
         System.out.printf("    stored id A = %d and id B = %d, different vectors%n", idA, idB);
-        System.out.printf("    JSON-encoding B yields %d, the very same number as A%n", idBAsJson);
+        System.out.printf("    through a double both become %d, so they are one number%n", idBAsDouble);
         System.out.printf(
-                "    ask for B as a JSON number -> server returns %d  (that is A, not B)%n",
-                askedViaJson);
+                "    ask for B via a double     -> server returns %d  (that is A, not B)%n",
+                askedViaDouble);
         System.out.printf(
                 "    ask for B as a gRPC uint64 -> server returns %d  (correct)%n", askedViaGrpc);
         System.out.printf(
-                "    over JSON, B is unreachable and A shadows it; over gRPC both are addressable.%n");
+                "    a typed long or a string id keeps them apart too; gRPC removes the choice"
+                        + " so no client can get it wrong.%n");
 
         System.out.printf("%n[6] float32 fidelity on the wire: protobuf vs a 6-digit JSON producer%n");
         System.out.printf(
@@ -333,6 +348,24 @@ public final class TurboVecDemo {
                 .addAllQueries(boxed(queries))
                 .setK(k)
                 .build();
+    }
+
+    /** A large id routed through a JSON double, the JavaScript and double-field default. */
+    private static long jsonAsDouble(ObjectMapper json, long id) {
+        try {
+            return (long) (double) json.readValue(Long.toString(id), Double.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** The same id read into a typed long, the correct JSON setup on the JVM. */
+    private static long jsonAsLong(ObjectMapper json, long id) {
+        try {
+            return json.readValue(Long.toString(id), Long.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     /** Top-1 restricted to a single allowlisted id; returns the id the server yields. */

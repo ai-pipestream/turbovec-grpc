@@ -17,6 +17,7 @@
     <maven.compiler.release>17</maven.compiler.release>
     <grpc.version>1.68.1</grpc.version>
     <protobuf.version>4.28.3</protobuf.version>
+    <jackson.version>2.18.2</jackson.version>
   </properties>
 
   <dependencies>
@@ -40,6 +41,12 @@
       <groupId>io.grpc</groupId>
       <artifactId>grpc-stub</artifactId>
       <version>${grpc.version}</version>
+    </dependency>
+    <!-- A real JSON library, so the id demo shows Jackson's actual behavior. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
     </dependency>
     <!-- Provides @Generated for the grpc-java generated code. -->
     <dependency>

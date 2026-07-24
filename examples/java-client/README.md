@@ -11,11 +11,13 @@ throughput and query latency (p50/p95/p99) measured from the client.
 reached over JSON REST. JSON has no binary number type, so every number is parsed
 into a 64-bit IEEE-754 double. That has two consequences the demo makes concrete:
 
-- **uint64 ids above 2^53 are silently rounded.** A double has 53 mantissa bits,
-  so id `9007199254740993` comes back as `...992`, and snowflake-scale ids collide
-  routinely. This is exactly why proto3's own JSON mapping encodes int64/uint64 as
-  strings. turbovec returns your ids as protobuf varints, so they survive exactly,
-  in every language, with no configuration.
+- **uint64 ids have no native JSON type.** Send a large id as a JSON number and it
+  rounds the moment a client routes it through a double: JavaScript's `JSON.parse`,
+  Gson to `Object`, any `double` field. Distinct ids past 2^53 then collide, and a
+  lookup for one record returns another. The fixes are a typed integer field or a
+  string id (what proto3's own JSON mapping does), but each is a convention every
+  client in the fleet has to honor. turbovec's `uint64` is a real type, exact in
+  every generated client with nothing to remember.
 - **float32 fidelity becomes a serializer setting.** protobuf puts the raw 4-byte
   IEEE-754 value on the wire, so the server receives byte-for-byte what the client
   sent. A JSON producer that trims to 6 significant digits drifts some values and
@@ -46,13 +48,18 @@ Defaults: 100,000 vectors, dim 768, 2,000 queries, 4-bit, top-10.
 ## What you will see
 
 Six blocks: ingest throughput, single-query latency percentiles and QPS, a
-server-streaming search, the id fidelity table, an id collision, then the float
-table. In the id table the JSON column reads `LOST` at and above 2^53 while the
-gRPC column stays `ok`. The collision block goes further: it stores two distinct
-ids (2^53 and 2^53+1), shows they fold onto the same JSON number, then asks the
-server for the second one both ways. Over JSON the server hands back the first id
-instead, so one record silently shadows the other; over gRPC both stay
-addressable.
+server-streaming search, the id table, an id collision, then the float table.
+
+The id table shows one large id under three JVM client setups. Both JSON columns
+use a real Jackson `ObjectMapper` on the same bytes and differ only in the target
+type: read into a `double` it rounds at and above 2^53, read into a `long` it is
+exact, and gRPC's `uint64` is exact. So JSON can be correct on the JVM, but only
+if every client remembers to keep the id a `long` or a string.
+
+The collision block goes further: it stores two distinct ids (2^53 and 2^53+1),
+shows the double path fold them onto one number, then asks the server for the
+second one both ways. Through a double the server hands back the first id instead,
+so one record silently shadows the other; a typed long or gRPC keeps them apart.
 
 ## Notes
 
