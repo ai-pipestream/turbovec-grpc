@@ -1,0 +1,25 @@
+[package]
+name = "turbovec-grpc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "A gRPC server for the turbovec vector index"
+license = "MIT"
+repository = "https://github.com/ai-pipestream/turbovec"
+keywords = ["vector-search", "grpc", "quantization", "nearest-neighbor", "turboquant"]
+categories = ["algorithms", "network-programming"]
+
+[[bin]]
+name = "turbovec-grpc"
+path = "src/main.rs"
+
+[dependencies]
+turbovec = { path = "../turbovec" }
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+tonic-build = "0.12"
