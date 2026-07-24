@@ -1,0 +1,265 @@
+// Demo-local copy of the crate contract at
+// `turbovec-grpc/proto/turbovec/v1/turbovec.proto`, kept byte-for-byte the same
+// except for the three Java `option` lines below. The crate proto stays
+// Rust-only; this copy exists so grpc-java generates flat, importable message
+// classes for the example client. If the crate proto changes, refresh this copy.
+//
+// gRPC contract for the turbovec vector index.
+//
+// The service is handle-based: create or load an index, receive an
+// `index_id`, then add vectors and run searches against that id. Handles are
+// independent, so many clients (or one client with many indexes) can search
+// concurrently. Searches never block one another; only the mutating calls
+// (Add, Remove) take an exclusive lock, and only on the single index they
+// touch.
+//
+// Vectors travel as flat, row-major `float` arrays. The row width is the
+// index dimensionality: fixed at creation for a normal index, or bound by
+// the first Add for a lazy one. The server reshapes by that width, so a
+// search request carries only the query floats and never repeats the dim.
+
+syntax = "proto3";
+
+package turbovec.v1;
+
+option java_package = "turbovec.v1";
+option java_multiple_files = true;
+option java_outer_classname = "TurboVecProto";
+
+// IndexKind selects the storage model, mirroring the two index types the
+// turbovec crate exposes.
+enum IndexKind {
+  // Zero value. Never returned by the server, and rejected in requests.
+  INDEX_KIND_UNSPECIFIED = 0;
+
+  // Positional index (turbovec::TurboQuantIndex). Search returns positional
+  // slot indices. This kind does not support Remove.
+  INDEX_KIND_POSITIONAL = 1;
+
+  // ID-mapped index (turbovec::IdMapIndex). Search returns the caller's own
+  // uint64 ids, and Remove deletes by id in constant time.
+  INDEX_KIND_ID_MAP = 2;
+}
+
+// TurboVec is the vector index service.
+service TurboVec {
+  // Creates an empty index and returns its handle. A non-lazy index locks
+  // its dim now; a lazy index leaves dim unbound until the first Add.
+  rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
+
+  // Releases an index handle. Closing an unknown handle is a no-op.
+  rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
+
+  // Returns the current metadata for one open index.
+  rpc GetIndexInfo(GetIndexInfoRequest) returns (IndexInfo);
+
+  // Lists the metadata for every open index.
+  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+
+  // Adds vectors to an index. Client-streaming: each frame carries a chunk
+  // of row-major vectors, so a large corpus is ingested without buffering
+  // the whole thing at once. There is no train step; vectors are indexed as
+  // they arrive. The single response reports how many were added.
+  rpc Add(stream AddRequest) returns (AddResponse);
+
+  // Removes one vector by its external id. ID_MAP indexes only.
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Runs a top-k search for one or more query vectors. An optional allowlist
+  // restricts the results to a candidate set, so a filter from another
+  // system (SQL, BM25, an ACL, a time window) is applied inside the search
+  // rather than by over-fetching and discarding afterward.
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Same as Search, but streams one QueryResult per query as it is computed,
+  // in query order. Useful when a caller wants to start handling the first
+  // query's neighbours before the whole batch has finished.
+  rpc SearchStream(SearchRequest) returns (stream QueryResult);
+
+  // Writes an index to a server-local path in turbovec's own format.
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+
+  // Loads an index from a server-local path and returns a new handle.
+  rpc Load(LoadRequest) returns (LoadResponse);
+}
+
+// IndexInfo is the metadata snapshot for one open index.
+message IndexInfo {
+  // Handle identifying the index.
+  string index_id = 1;
+
+  // Storage model of the index.
+  IndexKind kind = 2;
+
+  // Vector dimensionality, or 0 for a lazy index whose dim is not yet bound.
+  uint32 dim = 3;
+
+  // Quantization bit width (2 or 4).
+  uint32 bit_width = 4;
+
+  // Number of vectors currently in the index.
+  uint64 len = 5;
+}
+
+// CreateIndexRequest holds the settings for a new index.
+message CreateIndexRequest {
+  // Vector dimensionality. Must be a positive multiple of 8 unless `lazy` is
+  // set, in which case it is ignored and the first Add binds the dim.
+  uint32 dim = 1;
+
+  // Quantization bit width. Must be 2 or 4.
+  uint32 bit_width = 2;
+
+  // Storage model. Must not be INDEX_KIND_UNSPECIFIED.
+  IndexKind kind = 3;
+
+  // When true, defer binding the dim until the first Add.
+  bool lazy = 4;
+}
+
+// CreateIndexResponse returns the handle and metadata for the new index.
+message CreateIndexResponse {
+  // Handle for the created index.
+  string index_id = 1;
+
+  // Metadata for the created index.
+  IndexInfo info = 2;
+}
+
+// DropIndexRequest names the index to release.
+message DropIndexRequest {
+  // Handle returned by CreateIndex or Load.
+  string index_id = 1;
+}
+
+// DropIndexResponse acknowledges the release.
+message DropIndexResponse {
+  // True if the handle existed and was released, false if it was unknown.
+  bool dropped = 1;
+}
+
+// GetIndexInfoRequest names the index whose metadata is requested.
+message GetIndexInfoRequest {
+  // Handle returned by CreateIndex or Load.
+  string index_id = 1;
+}
+
+// ListIndexesRequest requests the metadata of every open index.
+message ListIndexesRequest {}
+
+// ListIndexesResponse returns the metadata of every open index.
+message ListIndexesResponse {
+  // Metadata for every open index, in no particular order.
+  repeated IndexInfo indexes = 1;
+}
+
+// AddRequest is one frame of the client-streaming Add upload.
+message AddRequest {
+  // Handle to add to. Read from the first frame; later frames must repeat
+  // the same id.
+  string index_id = 1;
+
+  // Row width of the vectors in this frame. For a lazy index this binds the
+  // dim on the first Add; afterward it must match the bound dim.
+  uint32 dim = 2;
+
+  // Row-major vector data for this frame. Length must be a whole multiple of
+  // `dim`.
+  repeated float vectors = 3;
+
+  // External ids for the vectors in this frame, one per row. Required for an
+  // ID_MAP index, and must be empty for a POSITIONAL index.
+  repeated uint64 ids = 4;
+}
+
+// AddResponse reports the result of an Add stream.
+message AddResponse {
+  // Number of vectors added across the whole stream.
+  uint64 added = 1;
+
+  // Total number of vectors in the index after the Add.
+  uint64 len = 2;
+}
+
+// RemoveRequest names one vector to delete by external id.
+message RemoveRequest {
+  // Handle of an ID_MAP index.
+  string index_id = 1;
+
+  // External id to remove.
+  uint64 id = 2;
+}
+
+// RemoveResponse acknowledges the delete.
+message RemoveResponse {
+  // True if the id was present and removed, false if it was not present.
+  bool removed = 1;
+}
+
+// SearchRequest carries one or more query vectors and the search settings.
+message SearchRequest {
+  // Handle to search.
+  string index_id = 1;
+
+  // Row-major query data. Length must be a whole multiple of the index dim.
+  repeated float queries = 2;
+
+  // Number of neighbours to return per query. The effective count per query
+  // is min(k, number of allowed candidates) when an allowlist is set.
+  uint32 k = 3;
+
+  // Optional candidate set to restrict the search to. For an ID_MAP index
+  // these are external ids; for a POSITIONAL index they are slot indices.
+  // Empty means search the whole index.
+  repeated uint64 allowlist = 4;
+}
+
+// QueryResult is the top-k for a single query, ordered best first.
+message QueryResult {
+  // Similarity scores, one per returned neighbour.
+  repeated float scores = 1;
+
+  // Neighbour identifiers, aligned with `scores`. For an ID_MAP index these
+  // are the caller's external ids; for a POSITIONAL index they are slot
+  // indices.
+  repeated uint64 ids = 2;
+}
+
+// SearchResponse returns one QueryResult per query, in query order.
+message SearchResponse {
+  // Results, aligned with the input queries.
+  repeated QueryResult results = 1;
+}
+
+// SnapshotRequest asks the server to write an index to a local path.
+message SnapshotRequest {
+  // Handle to write.
+  string index_id = 1;
+
+  // Server-local destination path.
+  string path = 2;
+}
+
+// SnapshotResponse acknowledges the write.
+message SnapshotResponse {
+  // Path the index was written to.
+  string path = 1;
+}
+
+// LoadRequest asks the server to load an index from a local path.
+message LoadRequest {
+  // Server-local source path.
+  string path = 1;
+
+  // Storage model of the file being loaded. Must match how it was written.
+  IndexKind kind = 2;
+}
+
+// LoadResponse returns the handle and metadata for the loaded index.
+message LoadResponse {
+  // Handle for the loaded index.
+  string index_id = 1;
+
+  // Metadata for the loaded index.
+  IndexInfo info = 2;
+}
