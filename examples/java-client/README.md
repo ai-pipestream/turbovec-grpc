@@ -45,9 +45,14 @@ Defaults: 100,000 vectors, dim 768, 2,000 queries, 4-bit, top-10.
 
 ## What you will see
 
-Five blocks: ingest throughput, single-query latency percentiles and QPS, a
-server-streaming search, then the id and float fidelity tables. In the id table
-the JSON column reads `LOST` at and above 2^53 while the gRPC column stays `ok`.
+Six blocks: ingest throughput, single-query latency percentiles and QPS, a
+server-streaming search, the id fidelity table, an id collision, then the float
+table. In the id table the JSON column reads `LOST` at and above 2^53 while the
+gRPC column stays `ok`. The collision block goes further: it stores two distinct
+ids (2^53 and 2^53+1), shows they fold onto the same JSON number, then asks the
+server for the second one both ways. Over JSON the server hands back the first id
+instead, so one record silently shadows the other; over gRPC both stay
+addressable.
 
 ## Notes
 

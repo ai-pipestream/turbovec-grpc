@@ -233,16 +233,7 @@ public final class TurboVecDemo {
         float[] probe = randomVector(dim, new Random(5));
         for (long id : ids) {
             long viaJson = (long) (double) id; // a JSON number is an IEEE-754 double
-            long viaGrpc =
-                    blocking.search(
-                                    SearchRequest.newBuilder()
-                                            .setIndexId(indexId)
-                                            .addAllQueries(boxed(probe))
-                                            .setK(1)
-                                            .addAllowlist(id)
-                                            .build())
-                            .getResults(0)
-                            .getIds(0);
+            long viaGrpc = lookupOnly(blocking, indexId, probe, id);
             System.out.printf(
                     "    %-22d  %-22s  %-22s%n",
                     id,
@@ -250,7 +241,28 @@ public final class TurboVecDemo {
                     viaGrpc + (viaGrpc == id ? "  ok" : "  LOST"));
         }
 
-        System.out.printf("%n[5] float32 fidelity on the wire: protobuf vs a 6-digit JSON producer%n");
+        // The rounding does not just lose a digit, it collides: two distinct ids
+        // fold onto one number, so a JSON client can no longer address them apart.
+        long idA = ids[1]; // 2^53
+        long idB = ids[2]; // 2^53 + 1, a different vector under a different id
+        long idBAsJson = (long) (double) idB; // what a JSON client receives for B
+        long askedViaJson = lookupOnly(blocking, indexId, probe, idBAsJson);
+        long askedViaGrpc = lookupOnly(blocking, indexId, probe, idB);
+        if (askedViaJson != idA || askedViaGrpc != idB) {
+            throw new IllegalStateException("id collision demo did not reproduce");
+        }
+        System.out.printf("%n[5] id collision: two distinct ids JSON cannot tell apart%n");
+        System.out.printf("    stored id A = %d and id B = %d, different vectors%n", idA, idB);
+        System.out.printf("    JSON-encoding B yields %d, the very same number as A%n", idBAsJson);
+        System.out.printf(
+                "    ask for B as a JSON number -> server returns %d  (that is A, not B)%n",
+                askedViaJson);
+        System.out.printf(
+                "    ask for B as a gRPC uint64 -> server returns %d  (correct)%n", askedViaGrpc);
+        System.out.printf(
+                "    over JSON, B is unreachable and A shadows it; over gRPC both are addressable.%n");
+
+        System.out.printf("%n[6] float32 fidelity on the wire: protobuf vs a 6-digit JSON producer%n");
         System.out.printf(
                 "    %-18s  %-18s  %-18s%n", "value", "protobuf wire", "JSON 6 sig-digits");
         float[] samples = {0.1f, 1e-7f, (float) Math.PI, 12345.678f, 0.036450123f};
@@ -321,6 +333,20 @@ public final class TurboVecDemo {
                 .addAllQueries(boxed(queries))
                 .setK(k)
                 .build();
+    }
+
+    /** Top-1 restricted to a single allowlisted id; returns the id the server yields. */
+    private static long lookupOnly(
+            TurboVecGrpc.TurboVecBlockingStub blocking, String indexId, float[] probe, long allowId) {
+        return blocking.search(
+                        SearchRequest.newBuilder()
+                                .setIndexId(indexId)
+                                .addAllQueries(boxed(probe))
+                                .setK(1)
+                                .addAllowlist(allowId)
+                                .build())
+                .getResults(0)
+                .getIds(0);
     }
 
     private static float[] randomVector(int dim, Random rng) {
