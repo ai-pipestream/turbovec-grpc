@@ -69,11 +69,17 @@ service TurboVec {
   // restricts the results to a candidate set, so a filter from another
   // system (SQL, BM25, an ACL, a time window) is applied inside the search
   // rather than by over-fetching and discarding afterward.
+  //
+  // Searching a lazy index that has never received an Add fails with
+  // FAILED_PRECONDITION: without a bound dim the server cannot chunk the
+  // query buffer into queries, so there is no well-defined result shape.
   rpc Search(SearchRequest) returns (SearchResponse);
 
-  // Same as Search, but streams one QueryResult per query as it is computed,
-  // in query order. Useful when a caller wants to start handling the first
-  // query's neighbours before the whole batch has finished.
+  // Same as Search, but streams one QueryResult per query, in query order.
+  // The batch is scored up front under a single short-lived read lock and
+  // streamed afterward, so a slow or stalled reader never holds index
+  // locks or server threads. The FAILED_PRECONDITION case for an unbound
+  // lazy index applies here too.
   rpc SearchStream(SearchRequest) returns (stream QueryResult);
 
   // Writes an index to a server-local path in turbovec's own format.

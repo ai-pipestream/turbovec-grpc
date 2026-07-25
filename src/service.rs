@@ -15,8 +15,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Iter;
 use tonic::{Request, Response, Status, Streaming};
 use turbovec::{first_invalid_coord, IdMapIndex, TurboQuantIndex};
 
@@ -28,12 +27,6 @@ use crate::proto::{
     SearchRequest, SearchResponse, SnapshotRequest, SnapshotResponse,
 };
 use crate::store::{Handle, Index, IndexStore};
-
-/// Channel depth between a blocking search task and a streamed response. Wide
-/// enough to keep the search running ahead of a reasonable reader, small
-/// enough that a stalled reader applies backpressure instead of letting the
-/// results pile up.
-const SEARCH_STREAM_CAPACITY: usize = 32;
 
 /// gRPC implementation of `turbovec.v1.TurboVec`.
 pub struct TurboVecService {
@@ -168,7 +161,10 @@ fn search_prepared(
             // The id-mapped search returns flat `nq * k_eff` buffers. Recover
             // the per-query stride from the returned length rather than from
             // `k`, because a filter caps the effective count at the number of
-            // allowed candidates.
+            // allowed candidates. The stride is uniform across queries:
+            // turbovec computes `effective_k = min(k, n_vectors, n_allowed)`
+            // once per call (see `search_with_mask` in the turbovec crate),
+            // and the mask is shared by every query in the batch.
             let nq = queries.len() / dim;
             let k_eff = scores.len().checked_div(nq).unwrap_or(0);
             (0..nq)
@@ -359,9 +355,11 @@ impl TurboVec for TurboVecService {
                 .read()
                 .map_err(|_| Status::internal("index lock poisoned"))?;
             let Some(dim) = guard.dim_opt() else {
-                // A lazy index that has never been added to has no dim and no
-                // vectors; there is nothing to search.
-                return Ok(Vec::new());
+                // A lazy index that has never been added to has no bound dim,
+                // so the query buffer cannot even be chunked into queries.
+                return Err(Status::failed_precondition(
+                    "index has no vectors; add vectors before searching",
+                ));
             };
             validate_queries(&req.queries, dim)?;
             let filter = prepare_filter(&guard, &req.allowlist)?;
@@ -372,54 +370,23 @@ impl TurboVec for TurboVecService {
         Ok(Response::new(SearchResponse { results }))
     }
 
-    type SearchStreamStream = ReceiverStream<Result<QueryResult, Status>>;
+    type SearchStreamStream = Iter<std::vec::IntoIter<Result<QueryResult, Status>>>;
 
+    /// Same batch search as [`Self::search`], returned as a stream of one
+    /// `QueryResult` per query. The whole batch is scored under a single
+    /// short read-lock hold and the lock is released before streaming
+    /// starts: holding it across the stream would let a stalled client pin
+    /// the lock (starving writers on the index) and park a blocking-pool
+    /// thread for the life of the stream, and enough such threads exhaust
+    /// the pool and stall every `spawn_blocking` call on every index.
     async fn search_stream(
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<Self::SearchStreamStream>, Status> {
-        let req = request.into_inner();
-        let handle = self.handle(&req.index_id)?;
-        let k = req.k as usize;
-        if k == 0 {
-            return Err(Status::invalid_argument("k must be at least 1"));
-        }
-        let (tx, rx) = mpsc::channel(SEARCH_STREAM_CAPACITY);
-        tokio::task::spawn_blocking(move || {
-            let guard = match handle.read() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    let _ = tx.blocking_send(Err(Status::internal("index lock poisoned")));
-                    return;
-                }
-            };
-            let Some(dim) = guard.dim_opt() else {
-                // Nothing to search; end the stream cleanly.
-                return;
-            };
-            if let Err(status) = validate_queries(&req.queries, dim) {
-                let _ = tx.blocking_send(Err(status));
-                return;
-            }
-            let filter = match prepare_filter(&guard, &req.allowlist) {
-                Ok(filter) => filter,
-                Err(status) => {
-                    let _ = tx.blocking_send(Err(status));
-                    return;
-                }
-            };
-            // One query at a time so the caller receives each neighbour list
-            // as soon as it is scored, rather than after the whole batch.
-            for query in req.queries.chunks_exact(dim) {
-                let mut result = search_prepared(&guard, query, dim, k, &filter);
-                let one = result.pop().unwrap_or_default();
-                if tx.blocking_send(Ok(one)).is_err() {
-                    // Receiver dropped: the client went away.
-                    return;
-                }
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let response = self.search(request).await?;
+        let items: Vec<Result<QueryResult, Status>> =
+            response.into_inner().results.into_iter().map(Ok).collect();
+        Ok(Response::new(tokio_stream::iter(items)))
     }
 
     async fn snapshot(

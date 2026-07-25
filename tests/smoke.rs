@@ -164,3 +164,40 @@ async fn create_add_search_filter_stream_idmap() {
         .into_inner();
     assert!(dropped.dropped);
 }
+
+/// Searching a lazy index whose dim was never bound by an Add fails with
+/// FAILED_PRECONDITION on both the unary and the streaming path: without a
+/// dim the query buffer cannot be chunked, so there is no result shape.
+#[tokio::test]
+async fn search_on_unbound_lazy_index_is_failed_precondition() {
+    let mut client = start().await;
+
+    let created = client
+        .create_index(CreateIndexRequest {
+            dim: 0,
+            bit_width: 4,
+            kind: IndexKind::IdMap as i32,
+            lazy: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let id = created.index_id;
+
+    let request = SearchRequest {
+        index_id: id.clone(),
+        queries: vector(0),
+        k: 5,
+        allowlist: vec![],
+    };
+    let err = client.search(request.clone()).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    let err = client.search_stream(request).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    client
+        .drop_index(DropIndexRequest { index_id: id })
+        .await
+        .unwrap();
+}
