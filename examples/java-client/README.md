@@ -1,15 +1,17 @@
 # java-client
 
-A JVM demo for the `turbovec-grpc` server. It exists to show two things a Rust or
-Python surface cannot show on their own.
+Two JVM demos for the `turbovec-grpc` server.
 
-**Speed from another language.** The index is built and queried entirely from
-Java over gRPC: client-stream a corpus in, then time top-k search. You get ingest
-throughput and query latency (p50/p95/p99) measured from the client.
+**Speed from another language** (`demo.TurboVecDemo`). The index is built and
+queried entirely from Java over gRPC: client-stream a corpus in, then time
+top-k search. You get ingest throughput and query latency (p50/p95/p99)
+measured from the client. Defaults match the TypeScript, Python, Go, and Rust
+examples, so numbers are comparable across languages.
 
-**A binary contract that cannot corrupt the payload.** Most vector stores are
-reached over JSON REST. JSON has no binary number type, so every number is parsed
-into a 64-bit IEEE-754 double. That has two consequences the demo makes concrete:
+**A binary contract that cannot corrupt the payload** (`demo.WireFidelityDemo`).
+Most vector stores are reached over JSON REST. JSON has no binary number type,
+so every number is parsed into a 64-bit IEEE-754 double. That has two
+consequences the demo makes concrete:
 
 - **uint64 ids have no native JSON type.** Send a large id as a JSON number and it
   rounds the moment a client routes it through a double: JavaScript's `JSON.parse`,
@@ -34,21 +36,25 @@ cargo run -p turbovec-grpc
 
 It listens on `0.0.0.0:50051`; override with `TURBOVEC_GRPC_ADDR`.
 
-Then run the demo (from this directory). Stubs are generated from `./proto` at
-build time; nothing generated is checked in.
+Then run the demos (from this directory). Stubs are generated from `./proto`
+at build time; nothing generated is checked in.
 
 ```bash
-mvn -q compile exec:java
-mvn -q compile exec:java -Dexec.args="1000000 768 2000"   # vectors dim queries
+mvn -q compile exec:java                                # speed test
+mvn -q compile exec:java -Dexec.args="100000 768 2000"  # vectors dim queries
+mvn -q compile exec:java -Dexec.mainClass=demo.WireFidelityDemo
 TURBOVEC_GRPC_ADDR=host:port mvn -q compile exec:java
 ```
 
-Defaults: 100,000 vectors, dim 768, 2,000 queries, 4-bit, top-10.
+Defaults: 20,000 vectors, dim 128, 500 queries, 4-bit, top-10.
 
 ## What you will see
 
-Six blocks: ingest throughput, single-query latency percentiles and QPS, a
-server-streaming search, the id table, an id collision, then the float table.
+The speed test prints three blocks: ingest throughput, single-query latency
+percentiles and QPS, then a server-streaming search.
+
+The fidelity demo prints three more: the id table, an id collision, then the
+float table.
 
 The id table shows one large id under three JVM client setups. Both JSON columns
 use a real Jackson `ObjectMapper` on the same bytes and differ only in the target

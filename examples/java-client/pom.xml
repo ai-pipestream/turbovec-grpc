@@ -18,6 +18,8 @@
     <grpc.version>1.68.1</grpc.version>
     <protobuf.version>4.28.3</protobuf.version>
     <jackson.version>2.18.2</jackson.version>
+    <!-- Default demo; override with -Dexec.mainClass=demo.WireFidelityDemo. -->
+    <exec.mainClass>demo.TurboVecDemo</exec.mainClass>
   </properties>
 
   <dependencies>
@@ -92,7 +94,7 @@
         <artifactId>exec-maven-plugin</artifactId>
         <version>3.5.0</version>
         <configuration>
-          <mainClass>demo.TurboVecDemo</mainClass>
+          <mainClass>${exec.mainClass}</mainClass>
         </configuration>
       </plugin>
     </plugins>

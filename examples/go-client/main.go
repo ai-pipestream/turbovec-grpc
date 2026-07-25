@@ -34,6 +34,8 @@ const (
 
 	bitWidth = 4
 	topK     = 10
+
+	warmupQueries = 50
 )
 
 func main() {
@@ -79,6 +81,12 @@ func main() {
 	// served QPS reflect the round trip and the server scan, not the client.
 	fmt.Printf("\n[2] top-%d search, one query at a time\n", topK)
 	rng := rand.New(rand.NewSource(1234))
+	for i := 0; i < warmupQueries; i++ {
+		_, err := client.Search(ctx, &pb.SearchRequest{
+			IndexId: indexID, Queries: randomVectors(dim, 1, rng), K: topK,
+		})
+		must("", err)
+	}
 	latencies := make([]time.Duration, 0, nQueries)
 	total := time.Duration(0)
 	for i := 0; i < nQueries; i++ {

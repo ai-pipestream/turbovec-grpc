@@ -1,7 +1,5 @@
 package demo;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.grpc.Grpc;
 import io.grpc.InsecureChannelCredentials;
 import io.grpc.ManagedChannel;
@@ -11,7 +9,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Locale;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -28,19 +25,19 @@ import turbovec.v1.SearchResponse;
 import turbovec.v1.TurboVecGrpc;
 
 /**
- * Java demo client for the turbovec-grpc server.
+ * Java demo client for the turbovec-grpc server: the speed test.
  *
- * <p>Two things, in one run. First, the index reached from another language:
- * build a large index by client-streaming vectors in, then time top-k queries
- * and report ingest throughput and query latency. Second, the reason the wire
- * format matters: protobuf carries {@code uint64} ids and {@code float}
- * coordinates exactly, while the JSON REST surface most vector stores expose
- * routes every number through a 64-bit double, which silently rounds ids at or
- * above 2^53 and makes float fidelity a serializer setting.
+ * <p>Build an index by client-streaming vectors in, then time top-k queries
+ * and report ingest throughput and query latency (p50/p95/p99), all measured
+ * from the JVM. Defaults match the TypeScript, Python, Go, and Rust examples,
+ * so numbers are comparable across languages.
+ *
+ * <p>For the wire-fidelity demonstration (uint64 ids vs JSON doubles, float32
+ * vs 6-digit JSON) see {@link WireFidelityDemo}.
  *
  * <pre>
  *   mvn -q compile exec:java
- *   mvn -q compile exec:java -Dexec.args="1000000 768 2000"
+ *   mvn -q compile exec:java -Dexec.args="100000 768 2000"
  *   TURBOVEC_GRPC_ADDR=host:port mvn -q compile exec:java
  * </pre>
  */
@@ -48,9 +45,9 @@ public final class TurboVecDemo {
 
     private static final String DEFAULT_ADDR = "127.0.0.1:50051";
 
-    private static final int DEFAULT_VECTORS = 100_000;
-    private static final int DEFAULT_DIM = 768;
-    private static final int DEFAULT_QUERIES = 2_000;
+    private static final int DEFAULT_VECTORS = 20_000;
+    private static final int DEFAULT_DIM = 128;
+    private static final int DEFAULT_QUERIES = 500;
 
     private static final int BIT_WIDTH = 4;
     private static final int TOP_K = 10;
@@ -69,7 +66,6 @@ public final class TurboVecDemo {
         try {
             System.out.printf("turbovec-grpc demo — connected to %s%n", addr);
             speedDemo(channel, nVectors, dim, nQueries);
-            fidelityDemo(channel, dim);
         } catch (StatusRuntimeException e) {
             System.err.printf(
                     "%nrpc failed: %s%nis the server up?  cargo run -p turbovec-grpc%n",
@@ -80,7 +76,7 @@ public final class TurboVecDemo {
         }
     }
 
-    /** Part A: build an index from the JVM, then time ingest and queries. */
+    /** Build an index from the JVM, then time ingest and queries. */
     private static void speedDemo(ManagedChannel channel, int nVectors, int dim, int nQueries) {
         TurboVecGrpc.TurboVecBlockingStub blocking = TurboVecGrpc.newBlockingStub(channel);
 
@@ -139,7 +135,7 @@ public final class TurboVecDemo {
                 percentileMs(latenciesNs, 50), percentileMs(latenciesNs, 95),
                 percentileMs(latenciesNs, 99));
 
-        // The server-streaming variant: neighbours arrive one query at a time.
+        // The server-streaming variant: one QueryResult per query, in order.
         System.out.printf("%n[3] server-streaming search, batch of 4 queries%n");
         SearchRequest batch = searchRequest(indexId, randomVectors(dim, 4, rng), TOP_K);
         Iterator<QueryResult> stream = blocking.searchStream(batch);
@@ -198,151 +194,7 @@ public final class TurboVecDemo {
         return done.join().getAdded();
     }
 
-    /**
-     * Part B: why the binary contract matters. The same values, carried by
-     * protobuf versus routed through a JSON number (an IEEE-754 double, which is
-     * what {@code JSON.parse} and every double-backed REST client produce).
-     */
-    private static void fidelityDemo(ManagedChannel channel, int dim) {
-        TurboVecGrpc.TurboVecBlockingStub blocking = TurboVecGrpc.newBlockingStub(channel);
-        String indexId =
-                blocking.createIndex(
-                                CreateIndexRequest.newBuilder()
-                                        .setDim(dim)
-                                        .setBitWidth(BIT_WIDTH)
-                                        .setKind(IndexKind.INDEX_KIND_ID_MAP)
-                                        .setLazy(false)
-                                        .build())
-                        .getIndexId();
-
-        // Ids chosen around the 2^53 mantissa limit of a 64-bit double, plus a
-        // snowflake-scale id of the kind real systems mint.
-        long[] ids = {42L, 1L << 53, (1L << 53) + 1, 1_861_392_837_450_923_417L};
-
-        AddRequest.Builder add = AddRequest.newBuilder().setIndexId(indexId).setDim(dim);
-        Random rng = new Random(11);
-        for (long id : ids) {
-            for (int d = 0; d < dim; d++) {
-                add.addVectors(rng.nextFloat() * 2f - 1f);
-            }
-            add.addIds(id);
-        }
-        streamOne(channel, add.build());
-
-        // One large id seen by three JVM client setups. Both JSON columns use a
-        // real Jackson ObjectMapper on the same bytes; only the target type
-        // differs. "double" is what JavaScript's JSON.parse and any double field
-        // produce; "long" is a typed integer field, the correct JSON setup here.
-        ObjectMapper json = new ObjectMapper();
-        float[] probe = randomVector(dim, new Random(5));
-        System.out.printf("%n[4] one uint64 id, three client setups%n");
-        System.out.printf(
-                "    %-21s %-25s %-23s %-23s%n",
-                "id", "JSON into a double", "JSON into a long", "gRPC uint64");
-        for (long id : ids) {
-            long viaDouble = jsonAsDouble(json, id);
-            long viaLong = jsonAsLong(json, id);
-            long viaGrpc = lookupOnly(blocking, indexId, probe, id);
-            System.out.printf(
-                    "    %-21d %-25s %-23s %-23s%n",
-                    id,
-                    viaDouble + (viaDouble == id ? " ok" : " LOST"),
-                    viaLong + (viaLong == id ? " ok" : " LOST"),
-                    viaGrpc + (viaGrpc == id ? " ok" : " LOST"));
-        }
-        System.out.printf(
-                "    the digits survive as a long or a string; they round only when a client"
-                        + " routes the number%n    through a double (JavaScript, Gson to Object, a"
-                        + " double field). gRPC's uint64 removes the choice.%n");
-
-        // The double path does not just lose a digit, it collides: two distinct
-        // ids fold onto one number, so that client can no longer address them apart.
-        long idA = ids[1]; // 2^53
-        long idB = ids[2]; // 2^53 + 1, a different vector under a different id
-        long idBAsDouble = jsonAsDouble(json, idB); // what the double path yields for B
-        long askedViaDouble = lookupOnly(blocking, indexId, probe, idBAsDouble);
-        long askedViaGrpc = lookupOnly(blocking, indexId, probe, idB);
-        if (askedViaDouble != idA || askedViaGrpc != idB) {
-            throw new IllegalStateException("id collision demo did not reproduce");
-        }
-        System.out.printf("%n[5] id collision on the double path%n");
-        System.out.printf("    stored id A = %d and id B = %d, different vectors%n", idA, idB);
-        System.out.printf("    through a double both become %d, so they are one number%n", idBAsDouble);
-        System.out.printf(
-                "    ask for B via a double     -> server returns %d  (that is A, not B)%n",
-                askedViaDouble);
-        System.out.printf(
-                "    ask for B as a gRPC uint64 -> server returns %d  (correct)%n", askedViaGrpc);
-        System.out.printf(
-                "    a typed long or a string id keeps them apart too; gRPC removes the choice"
-                        + " so no client can get it wrong.%n");
-
-        System.out.printf("%n[6] float32 fidelity on the wire: protobuf vs a 6-digit JSON producer%n");
-        System.out.printf(
-                "    %-18s  %-18s  %-18s%n", "value", "protobuf wire", "JSON 6 sig-digits");
-        float[] samples = {0.1f, 1e-7f, (float) Math.PI, 12345.678f, 0.036450123f};
-        for (float f : samples) {
-            float viaProto = protobufRoundTrip(f);
-            float viaJson = jsonRoundTrip(f);
-            System.out.printf(
-                    "    %-18s  %-18s  %-18s%n",
-                    f,
-                    bitsMatch(f, viaProto) ? viaProto + "  ok" : viaProto + "  DRIFT",
-                    bitsMatch(f, viaJson) ? viaJson + "  ok" : viaJson + "  DRIFT");
-        }
-        System.out.printf(
-                "    (turbovec quantizes storage by design; the point here is the wire, not"
-                        + " storage. Full-precision JSON can round-trip a float, but protobuf needs"
-                        + " no such care.)%n");
-
-        blocking.dropIndex(DropIndexRequest.newBuilder().setIndexId(indexId).build());
-    }
-
-    /** Send a single Add frame and wait for the summary. */
-    private static void streamOne(ManagedChannel channel, AddRequest frame) {
-        CompletableFuture<AddResponse> done = new CompletableFuture<>();
-        StreamObserver<AddRequest> upload =
-                TurboVecGrpc.newStub(channel)
-                        .add(
-                                new StreamObserver<>() {
-                                    @Override
-                                    public void onNext(AddResponse value) {
-                                        done.complete(value);
-                                    }
-
-                                    @Override
-                                    public void onError(Throwable t) {
-                                        done.completeExceptionally(t);
-                                    }
-
-                                    @Override
-                                    public void onCompleted() {}
-                                });
-        upload.onNext(frame);
-        upload.onCompleted();
-        done.join();
-    }
-
-    /** A float carried by the real generated message, byte-for-byte. */
-    private static float protobufRoundTrip(float f) {
-        try {
-            byte[] wire = SearchRequest.newBuilder().addQueries(f).build().toByteArray();
-            return SearchRequest.parseFrom(wire).getQueries(0);
-        } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
-    /** A float printed by a producer that keeps 6 significant digits, then reparsed. */
-    private static float jsonRoundTrip(float f) {
-        return Float.parseFloat(String.format(Locale.ROOT, "%.6g", (double) f));
-    }
-
-    private static boolean bitsMatch(float a, float b) {
-        return Float.floatToIntBits(a) == Float.floatToIntBits(b);
-    }
-
-    private static SearchRequest searchRequest(String indexId, float[] queries, int k) {
+    static SearchRequest searchRequest(String indexId, float[] queries, int k) {
         return SearchRequest.newBuilder()
                 .setIndexId(indexId)
                 .addAllQueries(boxed(queries))
@@ -350,43 +202,11 @@ public final class TurboVecDemo {
                 .build();
     }
 
-    /** A large id routed through a JSON double, the JavaScript and double-field default. */
-    private static long jsonAsDouble(ObjectMapper json, long id) {
-        try {
-            return (long) (double) json.readValue(Long.toString(id), Double.class);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
-    /** The same id read into a typed long, the correct JSON setup on the JVM. */
-    private static long jsonAsLong(ObjectMapper json, long id) {
-        try {
-            return json.readValue(Long.toString(id), Long.class);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
-    /** Top-1 restricted to a single allowlisted id; returns the id the server yields. */
-    private static long lookupOnly(
-            TurboVecGrpc.TurboVecBlockingStub blocking, String indexId, float[] probe, long allowId) {
-        return blocking.search(
-                        SearchRequest.newBuilder()
-                                .setIndexId(indexId)
-                                .addAllQueries(boxed(probe))
-                                .setK(1)
-                                .addAllowlist(allowId)
-                                .build())
-                .getResults(0)
-                .getIds(0);
-    }
-
-    private static float[] randomVector(int dim, Random rng) {
+    static float[] randomVector(int dim, Random rng) {
         return randomVectors(dim, 1, rng);
     }
 
-    private static float[] randomVectors(int dim, int count, Random rng) {
+    static float[] randomVectors(int dim, int count, Random rng) {
         float[] out = new float[dim * count];
         for (int i = 0; i < out.length; i++) {
             out[i] = rng.nextFloat() * 2f - 1f;
@@ -394,7 +214,7 @@ public final class TurboVecDemo {
         return out;
     }
 
-    private static List<Float> boxed(float[] values) {
+    static List<Float> boxed(float[] values) {
         List<Float> out = new ArrayList<>(values.length);
         for (float v : values) {
             out.add(v);
