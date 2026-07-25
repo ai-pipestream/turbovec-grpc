@@ -12,9 +12,9 @@ index, get an `index_id`, then add vectors and search against it.
   never block one another. `add` and `remove` take a write lock on the single
   index they touch. All of it runs on the blocking pool, off the async workers.
 - **Streaming both ways.** `Add` is client-streaming, so a large corpus is
-  ingested in chunks with no train step. `SearchStream` is server-streaming, so
-  a caller can start handling the first query's neighbours before the batch
-  finishes.
+  ingested in chunks with no train step. `SearchStream` is server-streaming:
+  the batch is scored under one short read-lock hold, then streamed one
+  result per query, so a slow reader never pins index locks or server threads.
 - **Filter at search time.** `Search` takes an optional allowlist (external ids
   for an id-mapped index, slot indices for a positional one) and pushes it into
   the kernel, rather than over-fetching and discarding.
@@ -28,6 +28,12 @@ cargo run -p turbovec-grpc
 
 `TURBOVEC_GRPC_ADDR` overrides the listen address.
 
+The server also registers the standard `grpc.health.v1.Health` service and
+gRPC server reflection, so orchestrator probes and `grpcurl` work out of the
+box. See [docs/deployment.md](docs/deployment.md) for the TLS/auth boundary,
+probes, persistence, and sizing, and the [Dockerfile](Dockerfile) for an
+example container build.
+
 ## The contract
 
 The proto is small, because the payload is just vectors. Every RPC is in
@@ -38,13 +44,27 @@ The proto is small, because the payload is just vectors. Every RPC is in
 | `CreateIndex` | unary | Make an empty index (positional or id-mapped, 2 or 4 bit, optionally lazy). |
 | `Add` | client-streaming | Stream vectors in. No train step. |
 | `Search` | unary | Top-k for one or more queries, with an optional allowlist. |
-| `SearchStream` | server-streaming | Same, one result per query as it is scored. |
+| `SearchStream` | server-streaming | Same, streamed one result per query after scoring. |
 | `Remove` | unary | Delete by external id (id-mapped indexes). |
 | `GetIndexInfo` / `ListIndexes` | unary | Metadata. |
 | `Snapshot` / `Load` | unary | Persist to and from a server-local path. |
 
 Vectors travel as flat, row-major `float` arrays. The row width is the index
 dimensionality, so a search request carries only the query floats.
+
+## Client examples
+
+Each [`examples/`](examples) directory is self-contained: its own toolchain
+setup, a vendored copy of the proto, and a README with startup instructions
+and a speed test for that stack.
+
+| Example | Stack | Angle |
+|---|---|---|
+| [`java-client`](examples/java-client) | Java (Maven) | Speed from the JVM; uint64 and float32 wire fidelity vs JSON. |
+| [`ts-client`](examples/ts-client) | Node.js (TypeScript) | The 2^53 id footgun is native to JS; gRPC removes it. |
+| [`python-client`](examples/python-client) | Python (grpcio) | The index the embedded bindings use, shared over the network. |
+| [`go-client`](examples/go-client) | Go | Sidecar-shaped client for the infra crowd. |
+| [`rust-client.rs`](examples/rust-client.rs) | Rust (cargo) | `cargo run -p turbovec-grpc --example rust-client` — the tonic client ships in the crate, no codegen needed. |
 
 ## Building
 
