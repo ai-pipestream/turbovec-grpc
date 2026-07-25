@@ -53,7 +53,7 @@ Defaults: 20,000 vectors, dim 128, 500 queries, 4-bit, top-10.
 The speed test prints three blocks: ingest throughput, single-query latency
 percentiles and QPS, then a server-streaming search.
 
-The fidelity demo prints three more: the id table, an id collision, then the
+The fidelity demo prints three blocks: the id table, an id collision, then the
 float table.
 
 The id table shows one large id under three JVM client setups. Both JSON columns

@@ -103,7 +103,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         added.added as f64 / ingest.as_secs_f64()
     );
 
-    // 3. Unary top-10 searches; collect per-call latency.
+    // 3. Unary top-10 searches; collect per-call latency. The 50 warmup
+    // queries match the other client examples: the first search after an
+    // add pays the server's one-time cache build (rotation, codebook,
+    // blocked layout), which belongs outside the timed window.
+    for q in 0..50 {
+        client
+            .search(SearchRequest {
+                index_id: index_id.clone(),
+                queries: vector(q % n, dim),
+                k: 10,
+                allowlist: vec![],
+            })
+            .await?;
+    }
     let mut latencies = Vec::with_capacity(queries);
     let start = Instant::now();
     for q in 0..queries {

@@ -30,6 +30,7 @@ import turbovec.v1.TurboVecGrpc;
  *
  * <pre>
  *   mvn -q compile exec:java -Dexec.mainClass=demo.WireFidelityDemo
+ *   mvn -q compile exec:java -Dexec.mainClass=demo.WireFidelityDemo -Dexec.args="256"   # dim
  *   TURBOVEC_GRPC_ADDR=host:port mvn -q compile exec:java -Dexec.mainClass=demo.WireFidelityDemo
  * </pre>
  */
