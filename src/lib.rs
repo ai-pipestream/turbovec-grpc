@@ -26,6 +26,11 @@
 pub mod proto {
     #![allow(clippy::all)]
     tonic::include_proto!("turbovec.v1");
+
+    /// Encoded `FileDescriptorSet` for the `turbovec.v1` package, emitted by
+    /// `build.rs`; used by the binary to serve gRPC reflection.
+    pub const FILE_DESCRIPTOR_SET: &[u8] =
+        tonic::include_file_descriptor_set!("turbovec_v1");
 }
 
 pub mod service;

@@ -4,7 +4,8 @@
 //! - `TURBOVEC_GRPC_ADDR` — listen address (default `0.0.0.0:50051`).
 
 use tonic::transport::Server;
-use turbovec_grpc::{IndexStore, TurboVecService};
+use turbovec_grpc::proto::turbo_vec_server::TurboVecServer;
+use turbovec_grpc::{proto, IndexStore, TurboVecService};
 
 /// Default listen address when `TURBOVEC_GRPC_ADDR` is not set.
 const DEFAULT_ADDR: &str = "0.0.0.0:50051";
@@ -25,10 +26,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
+    // Standard gRPC health checking (grpc.health.v1), so orchestrators and
+    // load balancers can probe liveness/readiness without calling the API.
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<TurboVecServer<TurboVecService>>()
+        .await;
+
+    // Server reflection, so grpcurl and similar tooling work without a local
+    // copy of the proto. Register the health descriptors too, or tooling can
+    // see the health service's methods but cannot resolve them by name.
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+
     eprintln!("turbovec-grpc listening on {addr}");
     Server::builder()
         .tcp_nodelay(true)
         .add_service(service)
+        .add_service(health_service)
+        .add_service(reflection)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
     eprintln!("turbovec-grpc shut down");
