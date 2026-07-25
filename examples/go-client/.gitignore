@@ -1,0 +1,5 @@
+# Generated protobuf stubs are build artifacts, produced by gen_stubs.sh.
+gen/
+
+# `go build` output.
+/turbovec-go-client

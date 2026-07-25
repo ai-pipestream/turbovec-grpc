@@ -1,0 +1,17 @@
+{
+  "name": "turbovec-grpc-ts-client",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TypeScript/Node demo client for the turbovec-grpc server",
+  "type": "module",
+  "scripts": {
+    "start": "node demo.ts"
+  },
+  "engines": {
+    "node": "^22.18 || >=23.6"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.13.4",
+    "@grpc/proto-loader": "^0.7.15"
+  }
+}
