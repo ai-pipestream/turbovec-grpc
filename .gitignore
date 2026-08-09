@@ -1,1 +1,9 @@
 /target
+
+# Python client and example build artifacts: the stubs are generated from the
+# vendored proto by gen_stubs.sh, never committed.
+.venv/
+__pycache__/
+*.egg-info/
+clients/python/turbovec_client/_generated/
+examples/python-client/generated/
