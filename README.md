@@ -8,7 +8,7 @@ A gRPC server for [turbovec](https://github.com/RyanCodrai/turbovec).
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
 | [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream` | Patch fork carrying the two core changes distributed search needs: seeded TQ+ calibration and a seedable top-k floor (`initial_threshold`). Rebased onto upstream main | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) (this repo) | Standalone single-node gRPC server for the upstream index, with client examples in Go, Java, Python, TypeScript, and Rust | upstream `turbovec` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) (this repo) | gRPC server for the upstream index, plus a thin coordinator that serves N of those servers as one collection. Client examples in Go, Java, Python, TypeScript, and Rust | upstream `turbovec` |
 | [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
@@ -58,9 +58,89 @@ The proto is small, because the payload is just vectors. Every RPC is in
 | `Remove` | unary | Delete by external id (id-mapped indexes). |
 | `GetIndexInfo` / `ListIndexes` | unary | Metadata. |
 | `Snapshot` / `Load` | unary | Persist to and from a server-local path. |
+| `SetCalibration` / `GetCalibration` | unary | Commit a TQ+ pair fitted elsewhere, and read one back coordinate by coordinate. |
+| `ExportRows` / `ImportRows` | unary | Move a run of rows between servers as the encoded codes the index already holds. |
 
 Vectors travel as flat, row-major `float` arrays. The row width is the index
 dimensionality, so a search request carries only the query floats.
+
+## When one machine is not enough
+
+A collection outgrows a node, or several collections already sit on different
+machines and you want to query them together. `turbovec-coordinator` serves N
+node servers as one collection: a client sends a query batch and a `k` and gets
+back the top-k a single index over all the same rows would have returned, with
+the same scores to the bit. It never names a shard and never learns there are
+any.
+
+The equality is not a tolerance that happens to be small. turbovec's TQ+
+calibration is a per-coordinate `(shift, scale)` pair, and under a fixed pair a
+row's encoded codes are a pure function of the row: the same vector added to
+two indexes calibrated alike encodes to the same bytes and scores the same
+against the same query. So a row's score does not depend on which index holds
+it, the union of the shards' top-k contains the collection's top-k, and merging
+by score is the merge rather than an approximation of it.
+
+Everything else in the layer defends that precondition. The collection is bound
+before it is served: every node is probed for its dim, bit width and
+calibration pair, and the pair is compared coordinate by coordinate. Nodes that
+disagree are refused by name, not merged under a correction, because a merge of
+differently calibrated scores is not a worse ranking but a ranking of nothing.
+A node that fails mid-query fails the search; `allow_partial` opts into the
+alternative explicitly, and the response then says it is partial and names what
+dropped out.
+
+**Split** redistributes one index's rows across nodes when a collection
+outgrows a machine. **Join** combines them back when you consolidate. Both move
+the encoded codes the index already holds, so neither re-encodes a row and
+neither can drift from its source; a row keeps its own id as it moves, and
+searches over the result are bit-identical to searches over the original.
+
+```bash
+# three nodes
+TURBOVEC_GRPC_ADDR=127.0.0.1:51051 cargo run --release --bin turbovec-grpc
+TURBOVEC_GRPC_ADDR=127.0.0.1:51052 cargo run --release --bin turbovec-grpc
+TURBOVEC_GRPC_ADDR=127.0.0.1:51053 cargo run --release --bin turbovec-grpc
+
+# one coordinator over them
+TURBOVEC_COORD_ADDR=127.0.0.1:51050 \
+TURBOVEC_COORD_NODES='127.0.0.1:51051,127.0.0.1:51052,127.0.0.1:51053' \
+  cargo run --release --bin turbovec-coordinator
+```
+
+`TURBOVEC_COORD_NODES` is one node per entry, entries separated by commas or
+newlines, each a node address and optionally the index handle on it; `@/path`
+reads the table from a file instead. A node named without a handle resolves to
+its only open index, and is refused as ambiguous if it holds none or several.
+The table is static: it changes only when Split or Join rebinds it, and it is
+not persisted across a coordinator restart.
+
+| RPC | Purpose |
+|---|---|
+| `Search` | Top-k over the whole collection, merged exactly. |
+| `FitCalibration` | Fit one calibration from a sample and commit it to every node. |
+| `Split` | Redistribute one index's rows across nodes. |
+| `Join` | Combine several same-calibration indexes into one. |
+| `ListNodes` | Live per-node state: reachability, rows, calibration, and why a collection is not servable. |
+
+Four calls on the node service exist for this layer rather than for a
+single-node client: `SetCalibration` and `GetCalibration` commit and read back
+the pair, and `ExportRows` and `ImportRows` move rows between servers as
+encoded codes. All four are positional-only, because they need
+`TurboQuantIndex`'s raw-parts accessors (`packed_codes`, `scales`, the TQ+
+getters, `from_parts`) and `IdMapIndex` does not forward them; an id-mapped
+index is refused by name rather than decoded and re-encoded, which would change
+its codes and so its scores. A distributed collection carries its external ids
+as a row label per shard instead, which is what survives rows moving between
+nodes.
+
+This is vector search only: no BM25, no hybrid fusion, no floor sharing. Those
+live in [turbovec-search](https://github.com/ai-pipestream/turbovec-search) and
+depend on fork patches; this layer builds on stock upstream turbovec, pinned to
+a revision with the explicit calibration API.
+
+[`clients/python`](clients/python) is a thin Python package over the
+coordinator, and its `example.py` runs the whole lifecycle against a live one.
 
 ## Client examples
 
@@ -76,13 +156,20 @@ and a speed test for that stack.
 | [`go-client`](examples/go-client) | Go | Sidecar-shaped client for the infra crowd. |
 | [`rust-client.rs`](examples/rust-client.rs) | Rust (cargo) | `cargo run -p turbovec-grpc --example rust-client` — the tonic client ships in the crate, no codegen needed. |
 
+[`clients/python`](clients/python) is different in kind: a package rather than
+a demo, and it talks to the coordinator rather than to a single node.
+
 ## Building
 
 The contract is compiled at build time by `tonic-build`, which needs `protoc` on
-`PATH`. The crate inherits turbovec's BLAS requirement: on Linux install
-OpenBLAS (`libopenblas-dev`), on macOS the Accelerate framework is used
-automatically.
+`PATH`. There is no BLAS requirement: the pinned turbovec revision replaced the
+dense rotation with a block-Hadamard transform and dropped the dependency.
 
 ```bash
-cargo test -p turbovec-grpc   # end-to-end smoke test against a live server
+cargo test -p turbovec-grpc   # smoke test, and the distributed proof, against live servers
 ```
+
+The distributed tests are the argument for the layer rather than a check on it:
+they stand up real node servers and a real coordinator, build one monolithic
+index, split it, and assert the sharded results are bit-identical to the
+monolithic ones through split, join and split again.
