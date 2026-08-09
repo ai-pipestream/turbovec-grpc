@@ -14,7 +14,7 @@ name = "turbovec-grpc"
 path = "src/main.rs"
 
 [dependencies]
-turbovec = { git = "https://github.com/RyanCodrai/turbovec", branch = "main" }
+turbovec = { git = "https://github.com/RyanCodrai/turbovec", rev = "714b7e128bd7fbe6d4c72c548e1724267483076d" }
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
