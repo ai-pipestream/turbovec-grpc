@@ -16,6 +16,21 @@ syntax = "proto3";
 
 package turbovec.v1;
 
+// CalibrationState mirrors turbovec::CalibrationState: whether a TQ+
+// calibration pair has been committed to an index.
+enum CalibrationState {
+  // Zero value. Never returned by the server.
+  CALIBRATION_STATE_UNSPECIFIED = 0;
+
+  // No pair committed. Encoding is plain TurboQuant, which is
+  // arithmetically the identity pair.
+  CALIBRATION_STATE_UNCALIBRATED = 1;
+
+  // A fitted pair is committed. Every add encodes under it, and it
+  // travels with the index through Snapshot/Load.
+  CALIBRATION_STATE_CALIBRATED = 2;
+}
+
 // IndexKind selects the storage model, mirroring the two index types the
 // turbovec crate exposes.
 enum IndexKind {
@@ -77,6 +92,35 @@ service TurboVec {
 
   // Loads an index from a server-local path and returns a new handle.
   rpc Load(LoadRequest) returns (LoadResponse);
+
+  // Commits a TQ+ calibration pair fitted elsewhere, so several indexes
+  // built on different servers encode into one shared coordinate system
+  // and their scores are directly comparable.
+  //
+  // POSITIONAL indexes only, and only while the index is still empty:
+  // committing a pair is `from_parts`, which builds the index around the
+  // pair rather than re-encoding rows into it. Calibrating a populated
+  // index from a sample is `turbovec::TurboQuantIndex::calibrate`, which
+  // this service does not expose.
+  rpc SetCalibration(SetCalibrationRequest) returns (Calibration);
+
+  // Reads back the committed calibration pair, coordinate by coordinate,
+  // so a caller can prove two indexes share one. POSITIONAL indexes only:
+  // turbovec's IdMapIndex reports its state but does not expose the pair,
+  // and a state alone cannot establish that two pairs are equal.
+  rpc GetCalibration(GetCalibrationRequest) returns (Calibration);
+
+  // Reads a contiguous run of rows out of an index as encoded codes, in
+  // exactly the form the index holds them. Pairs with ImportRows to move
+  // rows between servers without decoding, re-encoding, or rescoring.
+  // POSITIONAL indexes only, for the same reason GetCalibration is.
+  rpc ExportRows(ExportRowsRequest) returns (RowBlock);
+
+  // Builds a new POSITIONAL index from one or more exported row blocks,
+  // concatenated in the order given. Every block must agree on dim, bit
+  // width, and calibration pair; a disagreement is refused by name
+  // rather than resolved.
+  rpc ImportRows(ImportRowsRequest) returns (ImportRowsResponse);
 }
 
 // IndexInfo is the metadata snapshot for one open index.
@@ -95,6 +139,14 @@ message IndexInfo {
 
   // Number of vectors currently in the index.
   uint64 len = 5;
+
+  // Whether a TQ+ calibration pair is committed.
+  CalibrationState calibration_state = 6;
+
+  // True when the index carries an external id per row, set by ImportRows.
+  // A labelled index reports those ids in `QueryResult.labels`, and refuses
+  // Add: appending rows would leave the tail of the index unlabelled.
+  bool labelled = 7;
 }
 
 // CreateIndexRequest holds the settings for a new index.
@@ -219,6 +271,12 @@ message QueryResult {
   // are the caller's external ids; for a POSITIONAL index they are slot
   // indices.
   repeated uint64 ids = 2;
+
+  // External row ids, aligned with `scores`, for an index labelled by
+  // ImportRows. Empty for every other index. Slots move when rows are
+  // redistributed between servers; labels do not, so this is what a
+  // distributed caller reads.
+  repeated uint64 labels = 3;
 }
 
 // SearchResponse returns one QueryResult per query, in query order.
@@ -257,5 +315,116 @@ message LoadResponse {
   string index_id = 1;
 
   // Metadata for the loaded index.
+  IndexInfo info = 2;
+}
+
+// Calibration is one TQ+ calibration pair, in full.
+//
+// The pair is what makes scores from separately built indexes comparable:
+// two indexes calibrated to the same pair encode the same row to the same
+// codes, so their scores for one query are on one scale and can be merged
+// without correction. Two indexes calibrated to different pairs cannot,
+// and no amount of rescaling afterwards recovers the difference.
+message Calibration {
+  // Whether a pair is committed. The two arrays are empty unless this is
+  // CALIBRATION_STATE_CALIBRATED.
+  CalibrationState state = 1;
+
+  // Per-coordinate shift, length `dim`.
+  repeated float tqplus_shift = 2;
+
+  // Per-coordinate scale, length `dim`.
+  repeated float tqplus_scale = 3;
+}
+
+// SetCalibrationRequest commits a pair to an empty positional index.
+message SetCalibrationRequest {
+  // Handle of an empty POSITIONAL index.
+  string index_id = 1;
+
+  // Per-coordinate shift. Length must equal the index dim.
+  repeated float tqplus_shift = 2;
+
+  // Per-coordinate scale. Length must equal the index dim, and every
+  // entry must be finite and greater than zero.
+  repeated float tqplus_scale = 3;
+}
+
+// GetCalibrationRequest names the index whose pair is read back.
+message GetCalibrationRequest {
+  // Handle of a POSITIONAL index.
+  string index_id = 1;
+}
+
+// RowBlock is a run of rows in encoded form: the packed codes exactly as
+// the index holds them, the per-row correction scales, the calibration
+// pair they were encoded under, and one external id per row.
+//
+// Nothing here is decoded or re-encoded in transit. Under a fixed
+// calibration pair the codes are a pure function of the original row, so
+// moving a block between servers changes no score by any amount, in any
+// direction.
+message RowBlock {
+  // Vector dimensionality of the rows.
+  uint32 dim = 1;
+
+  // Quantization bit width (2, 3 or 4).
+  uint32 bit_width = 2;
+
+  // Number of rows carried.
+  uint64 rows = 3;
+
+  // Bit-plane packed codes, `rows * bit_width * dim / 8` bytes, row-major.
+  bytes packed_codes = 4;
+
+  // Per-row correction scales, one per row.
+  repeated float scales = 5;
+
+  // Calibration pair the codes were encoded under. Both arrays are empty
+  // for an uncalibrated source, which is arithmetically the identity pair.
+  repeated float tqplus_shift = 6;
+  repeated float tqplus_scale = 7;
+
+  // External id per row, one per row, in row order. ExportRows fills this
+  // from the source index's labels, or from the source slot numbers when
+  // the source carries none, so a block always identifies its own rows.
+  repeated uint64 labels = 8;
+}
+
+// ExportRowsRequest names a contiguous run of rows to read out.
+//
+// Runs are contiguous because rows are contiguous in the packed layout,
+// which makes an export a length check and a copy. A caller that wants a
+// non-contiguous set exports the runs it needs and concatenates them on
+// import.
+message ExportRowsRequest {
+  // Handle of a POSITIONAL index.
+  string index_id = 1;
+
+  // First slot to export. Must be at most the index length.
+  uint64 start = 2;
+
+  // Number of rows to export. Zero means "to the end of the index".
+  uint64 count = 3;
+}
+
+// ImportRowsRequest carries the blocks that make up a new index.
+message ImportRowsRequest {
+  // Blocks to concatenate, in the order given. At least one is required.
+  // Row order within the new index is block order, then row order inside
+  // each block, so the caller controls the resulting slot numbering.
+  //
+  // Blocks travel in one message rather than a stream, so a very large
+  // import is bounded by the server's frame limit; split it into several
+  // ImportRows calls and Join the results if it does not fit.
+  repeated RowBlock blocks = 1;
+}
+
+// ImportRowsResponse returns the handle and metadata for the new index.
+message ImportRowsResponse {
+  // Handle for the created index.
+  string index_id = 1;
+
+  // Metadata for the created index.
   IndexInfo info = 2;
 }

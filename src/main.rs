@@ -47,27 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(service)
         .add_service(health_service)
         .add_service(reflection)
-        .serve_with_shutdown(addr, shutdown_signal())
+        .serve_with_shutdown(addr, turbovec_grpc::shutdown_signal())
         .await?;
     eprintln!("turbovec-grpc shut down");
     Ok(())
-}
-
-/// Resolve when the process receives Ctrl-C or SIGTERM, so in-flight searches
-/// can drain instead of being cut off mid-response.
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = sigterm.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = ctrl_c.await;
-    }
 }

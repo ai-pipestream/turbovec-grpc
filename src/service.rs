@@ -12,6 +12,13 @@
 //! returned as typed [`Status`] values instead, so a bad request is an
 //! `INVALID_ARGUMENT`, not a dropped connection. The add path already returns
 //! a typed `AddError`, which is mapped the same way.
+//!
+//! Four calls exist for the distributed layer rather than for a single-node
+//! client: `SetCalibration` and `GetCalibration` commit and read back the TQ+
+//! pair that makes separately built indexes score comparably, and `ExportRows`
+//! and `ImportRows` move rows between servers as encoded codes. All four are
+//! positional-only, because they need `TurboQuantIndex`'s raw-parts accessors
+//! and `IdMapIndex` does not forward them.
 
 use std::sync::Arc;
 
@@ -19,14 +26,20 @@ use tokio_stream::Iter;
 use tonic::{Request, Response, Status, Streaming};
 use turbovec::{first_invalid_coord, IdMapIndex, TurboQuantIndex};
 
+use crate::errors::{
+    self, INDEX_NOT_EMPTY, INVALID_CALIBRATION, LABELLED_INDEX_IMMUTABLE,
+    POSITIONAL_INDEX_REQUIRED, ROW_COUNT_MISMATCH,
+};
 use crate::proto::turbo_vec_server::{TurboVec, TurboVecServer};
 use crate::proto::{
-    AddRequest, AddResponse, CreateIndexRequest, CreateIndexResponse, DropIndexRequest,
-    DropIndexResponse, GetIndexInfoRequest, IndexInfo, IndexKind, ListIndexesRequest,
-    ListIndexesResponse, LoadRequest, LoadResponse, QueryResult, RemoveRequest, RemoveResponse,
-    SearchRequest, SearchResponse, SnapshotRequest, SnapshotResponse,
+    AddRequest, AddResponse, Calibration, CreateIndexRequest, CreateIndexResponse,
+    DropIndexRequest, DropIndexResponse, ExportRowsRequest, GetCalibrationRequest,
+    GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse, IndexInfo, IndexKind,
+    ListIndexesRequest, ListIndexesResponse, LoadRequest, LoadResponse, QueryResult, RemoveRequest,
+    RemoveResponse, RowBlock, SearchRequest, SearchResponse, SetCalibrationRequest,
+    SnapshotRequest, SnapshotResponse,
 };
-use crate::store::{Handle, Index, IndexStore};
+use crate::store::{Handle, Index, IndexStore, Labels};
 
 /// gRPC implementation of `turbovec.v1.TurboVec`.
 pub struct TurboVecService {
@@ -52,16 +65,70 @@ impl TurboVecService {
             .get(id)
             .ok_or_else(|| Status::not_found(format!("unknown index_id: {id}")))
     }
+
+    /// Build the metadata message for one open index, reading its label table
+    /// out of the registry.
+    fn info(&self, id: &str, index: &Index) -> IndexInfo {
+        index_info(id, index, self.store.labels(id).is_some())
+    }
 }
 
 /// Build the metadata message for one open index.
-fn index_info(id: &str, index: &Index) -> IndexInfo {
+fn index_info(id: &str, index: &Index, labelled: bool) -> IndexInfo {
     IndexInfo {
         index_id: id.to_string(),
         kind: index.kind() as i32,
         dim: index.dim_opt().unwrap_or(0) as u32,
         bit_width: index.bit_width() as u32,
         len: index.len() as u64,
+        calibration_state: calibration_state(index.calibration_state()) as i32,
+        labelled,
+    }
+}
+
+/// Map turbovec's calibration state onto the wire enum.
+///
+/// `turbovec::CalibrationState` is `#[non_exhaustive]`, so a future upstream
+/// state has no wire value here. It is reported as unspecified rather than
+/// guessed at, and nothing in the distributed layer decides anything on this
+/// field: whether two indexes share a calibration is settled by comparing the
+/// pairs themselves, which is a question this enum cannot answer either way.
+fn calibration_state(state: turbovec::CalibrationState) -> crate::proto::CalibrationState {
+    match state {
+        turbovec::CalibrationState::Uncalibrated => crate::proto::CalibrationState::Uncalibrated,
+        turbovec::CalibrationState::Calibrated => crate::proto::CalibrationState::Calibrated,
+        _ => crate::proto::CalibrationState::Unspecified,
+    }
+}
+
+/// Borrow the positional index behind a handle, or fail by name.
+///
+/// The raw-parts accessors this server's distribution calls are built on
+/// (`packed_codes`, `scales`, the TQ+ getters, `from_parts`) exist on
+/// `TurboQuantIndex` and are not forwarded by `IdMapIndex`, so an id-mapped
+/// index cannot be exported, imported into, or have its pair read back. That
+/// is a limit of the upstream surface, not a policy, and it is reported as
+/// such rather than worked around by decoding and re-encoding rows, which
+/// would change the codes and so the scores.
+fn positional<'a>(index: &'a Index, what: &str) -> Result<&'a TurboQuantIndex, Status> {
+    match index {
+        Index::Positional(inner) => Ok(inner),
+        Index::IdMap(_) => Err(errors::precondition(
+            POSITIONAL_INDEX_REQUIRED,
+            format!(
+                "{what} needs a POSITIONAL index; turbovec's IdMapIndex does not expose the \
+                 packed codes or the calibration pair this call reads"
+            ),
+        )),
+    }
+}
+
+/// Read one index's calibration pair into the wire message.
+fn calibration_of(index: &TurboQuantIndex) -> Calibration {
+    Calibration {
+        state: calibration_state(index.calibration_state()) as i32,
+        tqplus_shift: index.tqplus_shift().to_vec(),
+        tqplus_scale: index.tqplus_scale().to_vec(),
     }
 }
 
@@ -117,12 +184,17 @@ fn prepare_filter<'a>(index: &Index, allowlist: &'a [u64]) -> Result<Filter<'a>,
 /// Search a slice of one or more queries against a prepared filter and return
 /// one [`QueryResult`] per query. `queries` must be validated (finite, length
 /// a whole multiple of `dim`) before this is called.
+///
+/// `labels`, when the index carries them, is reported alongside the slots: a
+/// distributed caller reads those, because a row's slot changes when it moves
+/// between servers and its label does not.
 fn search_prepared(
     index: &Index,
     queries: &[f32],
     dim: usize,
     k: usize,
     filter: &Filter,
+    labels: Option<&Labels>,
 ) -> Vec<QueryResult> {
     if index.is_empty() {
         // An empty index scores nothing; return an empty neighbour list per
@@ -137,13 +209,31 @@ fn search_prepared(
                 _ => inner.search(queries, k),
             };
             (0..results.nq)
-                .map(|qi| QueryResult {
-                    scores: results.scores_for_query(qi).to_vec(),
-                    ids: results
+                .map(|qi| {
+                    let slots: Vec<u64> = results
                         .indices_for_query(qi)
                         .iter()
                         .map(|&slot| slot as u64)
-                        .collect(),
+                        .collect();
+                    // A label table is registered with exactly one entry per
+                    // row and the index it covers never takes another row
+                    // (Add refuses a labelled index), so every returned slot
+                    // is in range.
+                    let labels = labels.map_or_else(Vec::new, |table| {
+                        slots
+                            .iter()
+                            .map(|&slot| {
+                                *table
+                                    .get(slot as usize)
+                                    .expect("label table covers every slot of its index")
+                            })
+                            .collect()
+                    });
+                    QueryResult {
+                        scores: results.scores_for_query(qi).to_vec(),
+                        ids: slots,
+                        labels,
+                    }
                 })
                 .collect()
         }
@@ -174,6 +264,11 @@ fn search_prepared(
                     QueryResult {
                         scores: scores[lo..hi].to_vec(),
                         ids: ids[lo..hi].to_vec(),
+                        // An id-mapped index already returns the caller's own
+                        // ids, so there is nothing a label table would add;
+                        // ImportRows, the only call that registers one, is
+                        // positional-only.
+                        labels: Vec::new(),
                     }
                 })
                 .collect()
@@ -243,7 +338,7 @@ impl TurboVec for TurboVecService {
             let guard = handle
                 .read()
                 .map_err(|_| Status::internal("index lock poisoned"))?;
-            index_info(&id, &guard)
+            self.info(&id, &guard)
         };
         Ok(Response::new(CreateIndexResponse {
             index_id: id,
@@ -268,7 +363,7 @@ impl TurboVec for TurboVecService {
         let guard = handle
             .read()
             .map_err(|_| Status::internal("index lock poisoned"))?;
-        Ok(Response::new(index_info(&id, &guard)))
+        Ok(Response::new(self.info(&id, &guard)))
     }
 
     async fn list_indexes(
@@ -280,7 +375,7 @@ impl TurboVec for TurboVecService {
             let guard = handle
                 .read()
                 .map_err(|_| Status::internal("index lock poisoned"))?;
-            indexes.push(index_info(&id, &guard));
+            indexes.push(self.info(&id, &guard));
         }
         Ok(Response::new(ListIndexesResponse { indexes }))
     }
@@ -296,6 +391,19 @@ impl TurboVec for TurboVecService {
             .ok_or_else(|| Status::invalid_argument("empty add stream: no frames received"))?;
         let index_id = first.index_id.clone();
         let handle = self.handle(&index_id)?;
+        if self.store.labels(&index_id).is_some() {
+            // The label table was built with one entry per row at import and
+            // there is no id to give a row added afterwards, so an add would
+            // leave the tail of the index unlabelled and every search on it
+            // returning ids for some rows and nothing for others.
+            return Err(errors::precondition(
+                LABELLED_INDEX_IMMUTABLE,
+                format!(
+                    "index {index_id} carries external row labels from ImportRows; \
+                     build a new index from its rows plus the new ones instead"
+                ),
+            ));
+        }
 
         // The first frame carries the index_id; process it, then take the rest
         // of the stream, holding every later frame to the same id.
@@ -346,6 +454,7 @@ impl TurboVec for TurboVecService {
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
         let handle = self.handle(&req.index_id)?;
+        let labels = self.store.labels(&req.index_id);
         let k = req.k as usize;
         if k == 0 {
             return Err(Status::invalid_argument("k must be at least 1"));
@@ -363,7 +472,14 @@ impl TurboVec for TurboVecService {
             };
             validate_queries(&req.queries, dim)?;
             let filter = prepare_filter(&guard, &req.allowlist)?;
-            Ok::<_, Status>(search_prepared(&guard, &req.queries, dim, k, &filter))
+            Ok::<_, Status>(search_prepared(
+                &guard,
+                &req.queries,
+                dim,
+                k,
+                &filter,
+                labels.as_ref(),
+            ))
         })
         .await
         .map_err(join_err)??;
@@ -435,13 +551,335 @@ impl TurboVec for TurboVecService {
             let guard = handle
                 .read()
                 .map_err(|_| Status::internal("index lock poisoned"))?;
-            index_info(&id, &guard)
+            self.info(&id, &guard)
         };
         Ok(Response::new(LoadResponse {
             index_id: id,
             info: Some(info),
         }))
     }
+
+    async fn set_calibration(
+        &self,
+        request: Request<SetCalibrationRequest>,
+    ) -> Result<Response<Calibration>, Status> {
+        let req = request.into_inner();
+        let handle = self.handle(&req.index_id)?;
+        let calibration = tokio::task::spawn_blocking(move || {
+            let mut guard = handle
+                .write()
+                .map_err(|_| Status::internal("index lock poisoned"))?;
+            let index = positional(&guard, "SetCalibration")?;
+            if !index.is_empty() {
+                // Committing a pair here is `from_parts`, which builds an
+                // index around the pair. Rows already in the index were
+                // encoded under whatever pair was committed when they arrived,
+                // and reinterpreting those codes under a different pair would
+                // silently change every one of their scores. Re-encoding them
+                // instead is turbovec's `calibrate`, a different operation with
+                // a different (lossy) contract, which this call does not stand
+                // in for.
+                return Err(errors::precondition(
+                    INDEX_NOT_EMPTY,
+                    format!(
+                        "SetCalibration needs an empty index; this one holds {} vectors \
+                         already encoded under its current pair",
+                        index.len()
+                    ),
+                ));
+            }
+            let dim = index.dim_opt().ok_or_else(|| {
+                errors::precondition(
+                    INVALID_CALIBRATION,
+                    "SetCalibration needs an index with a bound dim; a lazy index binds its \
+                     dim on the first Add, and a pair is per-coordinate",
+                )
+            })?;
+            if req.tqplus_shift.len() != dim || req.tqplus_scale.len() != dim {
+                return Err(errors::invalid(
+                    INVALID_CALIBRATION,
+                    format!(
+                        "calibration pair has {} shift and {} scale coordinates, index dim is {dim}",
+                        req.tqplus_shift.len(),
+                        req.tqplus_scale.len()
+                    ),
+                ));
+            }
+            let rebuilt = TurboQuantIndex::from_parts(
+                Some(dim),
+                index.bit_width(),
+                0,
+                Vec::new(),
+                Vec::new(),
+                req.tqplus_shift,
+                req.tqplus_scale,
+            )
+            .map_err(|e| errors::invalid(INVALID_CALIBRATION, e.to_string()))?;
+            let calibration = calibration_of(&rebuilt);
+            *guard = Index::Positional(rebuilt);
+            Ok::<_, Status>(calibration)
+        })
+        .await
+        .map_err(join_err)??;
+        Ok(Response::new(calibration))
+    }
+
+    async fn get_calibration(
+        &self,
+        request: Request<GetCalibrationRequest>,
+    ) -> Result<Response<Calibration>, Status> {
+        let req = request.into_inner();
+        let handle = self.handle(&req.index_id)?;
+        let guard = handle
+            .read()
+            .map_err(|_| Status::internal("index lock poisoned"))?;
+        Ok(Response::new(calibration_of(positional(
+            &guard,
+            "GetCalibration",
+        )?)))
+    }
+
+    async fn export_rows(
+        &self,
+        request: Request<ExportRowsRequest>,
+    ) -> Result<Response<RowBlock>, Status> {
+        let req = request.into_inner();
+        let handle = self.handle(&req.index_id)?;
+        let labels = self.store.labels(&req.index_id);
+        let block = tokio::task::spawn_blocking(move || {
+            let guard = handle
+                .read()
+                .map_err(|_| Status::internal("index lock poisoned"))?;
+            let index = positional(&guard, "ExportRows")?;
+            export_block(index, labels.as_ref(), req.start, req.count)
+        })
+        .await
+        .map_err(join_err)??;
+        Ok(Response::new(block))
+    }
+
+    async fn import_rows(
+        &self,
+        request: Request<ImportRowsRequest>,
+    ) -> Result<Response<ImportRowsResponse>, Status> {
+        let blocks = request.into_inner().blocks;
+        let (index, labels) = tokio::task::spawn_blocking(move || import_blocks(&blocks))
+            .await
+            .map_err(join_err)??;
+
+        let id = self.store.insert_labelled(Index::Positional(index), labels);
+        let handle = self.handle(&id)?;
+        let info = {
+            let guard = handle
+                .read()
+                .map_err(|_| Status::internal("index lock poisoned"))?;
+            self.info(&id, &guard)
+        };
+        Ok(Response::new(ImportRowsResponse {
+            index_id: id,
+            info: Some(info),
+        }))
+    }
+}
+
+/// Copy `count` rows starting at `start` out of `index` into a [`RowBlock`].
+///
+/// The copy is a byte-range slice of the packed codes: rows are contiguous in
+/// the packed layout, `bit_width * dim / 8` bytes each, so nothing is decoded
+/// and no code changes. `count` of zero means "to the end".
+fn export_block(
+    index: &TurboQuantIndex,
+    labels: Option<&Labels>,
+    start: u64,
+    count: u64,
+) -> Result<RowBlock, Status> {
+    let len = index.len();
+    let start = usize::try_from(start).map_err(|_| {
+        errors::invalid(ROW_COUNT_MISMATCH, format!("start {start} is out of range"))
+    })?;
+    let count = usize::try_from(count).map_err(|_| {
+        errors::invalid(ROW_COUNT_MISMATCH, format!("count {count} is out of range"))
+    })?;
+    if start > len {
+        return Err(errors::invalid(
+            ROW_COUNT_MISMATCH,
+            format!("start {start} is past the end of an index holding {len} rows"),
+        ));
+    }
+    let rows = if count == 0 { len - start } else { count };
+    if start + rows > len {
+        return Err(errors::invalid(
+            ROW_COUNT_MISMATCH,
+            format!(
+                "rows {start}..{} run past an index holding {len} rows",
+                start + rows
+            ),
+        ));
+    }
+
+    // An empty index has no bound dim to describe the export with, and a
+    // zero-row block from a populated one still carries the geometry, so the
+    // only unanswerable case is exporting from an index that has never held a
+    // row.
+    let dim = index.dim_opt().ok_or_else(|| {
+        errors::precondition(
+            ROW_COUNT_MISMATCH,
+            "ExportRows needs an index with a bound dim; this one has never held a row",
+        )
+    })?;
+    let bytes_per_row = index.bit_width() * (dim / 8);
+    let packed = index.packed_codes();
+    Ok(RowBlock {
+        dim: dim as u32,
+        bit_width: index.bit_width() as u32,
+        rows: rows as u64,
+        packed_codes: packed[start * bytes_per_row..(start + rows) * bytes_per_row].to_vec(),
+        scales: index.scales()[start..start + rows].to_vec(),
+        tqplus_shift: index.tqplus_shift().to_vec(),
+        tqplus_scale: index.tqplus_scale().to_vec(),
+        // A source that carries no labels of its own is labelled by slot, so
+        // a block always names its own rows and a caller never has to know
+        // where the rows came from to keep track of them.
+        labels: match labels {
+            Some(table) => table[start..start + rows].to_vec(),
+            None => (start as u64..(start + rows) as u64).collect(),
+        },
+    })
+}
+
+/// Concatenate `blocks` into one positional index and its label table.
+///
+/// Every block must agree on dim, bit width and calibration pair. The first
+/// block sets what the rest are held to, and a disagreement is named rather
+/// than reconciled: two blocks encoded under different pairs describe rows in
+/// different coordinate systems, and concatenating their codes would produce
+/// an index whose scores mean two different things.
+fn import_blocks(blocks: &[RowBlock]) -> Result<(TurboQuantIndex, Vec<u64>), Status> {
+    let Some(head) = blocks.first() else {
+        return Err(errors::invalid(
+            ROW_COUNT_MISMATCH,
+            "ImportRows needs at least one row block",
+        ));
+    };
+    let dim = head.dim as usize;
+    let bit_width = head.bit_width as usize;
+
+    let mut rows = 0usize;
+    let mut packed = Vec::new();
+    let mut scales = Vec::new();
+    let mut labels = Vec::new();
+    for (bi, block) in blocks.iter().enumerate() {
+        if block.dim != head.dim {
+            return Err(errors::precondition(
+                crate::errors::DIMENSION_MISMATCH,
+                format!(
+                    "block 0 carries dim {} and block {bi} carries dim {}",
+                    head.dim, block.dim
+                ),
+            ));
+        }
+        if block.bit_width != head.bit_width {
+            return Err(errors::precondition(
+                crate::errors::BIT_WIDTH_MISMATCH,
+                format!(
+                    "block 0 is {}-bit and block {bi} is {}-bit",
+                    head.bit_width, block.bit_width
+                ),
+            ));
+        }
+        if let Some(detail) = calibration_difference(
+            (&head.tqplus_shift, &head.tqplus_scale),
+            (&block.tqplus_shift, &block.tqplus_scale),
+        ) {
+            return Err(errors::precondition(
+                crate::errors::MIXED_CALIBRATION,
+                format!("block 0 and block {bi} were encoded under different pairs: {detail}"),
+            ));
+        }
+        let block_rows = usize::try_from(block.rows).map_err(|_| {
+            errors::invalid(
+                ROW_COUNT_MISMATCH,
+                format!(
+                    "block {bi} claims {} rows, which is out of range",
+                    block.rows
+                ),
+            )
+        })?;
+        if block.scales.len() != block_rows || block.labels.len() != block_rows {
+            return Err(errors::invalid(
+                ROW_COUNT_MISMATCH,
+                format!(
+                    "block {bi} claims {block_rows} rows but carries {} scales and {} labels",
+                    block.scales.len(),
+                    block.labels.len()
+                ),
+            ));
+        }
+        rows += block_rows;
+        packed.extend_from_slice(&block.packed_codes);
+        scales.extend_from_slice(&block.scales);
+        labels.extend_from_slice(&block.labels);
+    }
+
+    // `from_parts` checks the rest: that the packed length matches the row
+    // count and geometry, that dim and bit width are ones the encoder has a
+    // layout for, and that every scale and calibration coordinate is a value
+    // the kernel can use. Those checks are the loader's, so an index built
+    // here is one that would have survived a write and a load.
+    let index = TurboQuantIndex::from_parts(
+        Some(dim),
+        bit_width,
+        rows,
+        packed,
+        scales,
+        head.tqplus_shift.clone(),
+        head.tqplus_scale.clone(),
+    )
+    .map_err(|e| Status::invalid_argument(format!("row blocks do not form an index: {e}")))?;
+    Ok((index, labels))
+}
+
+/// Compare two calibration pairs coordinate by coordinate, returning a
+/// description of the first difference, or `None` when they are equal.
+///
+/// The comparison is exact. Two pairs that differ in the last bit of one
+/// coordinate encode some rows to different codes, so "close enough" is not a
+/// property that exists here: either the pairs are the same pair, and the two
+/// indexes' scores can be merged, or they are not, and no correction applied
+/// afterwards recovers what the difference cost.
+pub(crate) fn calibration_difference(
+    left: (&[f32], &[f32]),
+    right: (&[f32], &[f32]),
+) -> Option<String> {
+    if left.0.len() != right.0.len() {
+        return Some(format!(
+            "shift has {} coordinates on one side and {} on the other",
+            left.0.len(),
+            right.0.len()
+        ));
+    }
+    if left.1.len() != right.1.len() {
+        return Some(format!(
+            "scale has {} coordinates on one side and {} on the other",
+            left.1.len(),
+            right.1.len()
+        ));
+    }
+    for (i, (a, b)) in left.0.iter().zip(right.0.iter()).enumerate() {
+        if a.to_bits() != b.to_bits() {
+            return Some(format!(
+                "shift coordinate {i} is {a} on one side and {b} on the other"
+            ));
+        }
+    }
+    for (i, (a, b)) in left.1.iter().zip(right.1.iter()).enumerate() {
+        if a.to_bits() != b.to_bits() {
+            return Some(format!(
+                "scale coordinate {i} is {a} on one side and {b} on the other"
+            ));
+        }
+    }
+    None
 }
 
 /// Add one streamed chunk of vectors to an index under the write lock, on the

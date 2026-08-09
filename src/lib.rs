@@ -18,6 +18,14 @@
 //! The wire contract lives in `proto/turbovec/v1/turbovec.proto` and is
 //! compiled at build time; see [`proto`].
 
+// Every fallible path in this crate ends at a tonic RPC, whose generated trait
+// signature is `Result<Response<T>, Status>`. `Status` is 176 bytes, which
+// `result_large_err` objects to, and the objection has nowhere to go: the type
+// at the boundary is not ours to box, and boxing internally only to unbox at
+// the boundary trades a size warning for a layer of indirection on every
+// error path.
+#![allow(clippy::result_large_err)]
+
 /// Generated protobuf types, client, and server for the `turbovec.v1`
 /// package.
 ///
@@ -29,12 +37,31 @@ pub mod proto {
 
     /// Encoded `FileDescriptorSet` for the `turbovec.v1` package, emitted by
     /// `build.rs`; used by the binary to serve gRPC reflection.
-    pub const FILE_DESCRIPTOR_SET: &[u8] =
-        tonic::include_file_descriptor_set!("turbovec_v1");
+    pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("turbovec_v1");
 }
 
+pub mod errors;
 pub mod service;
 pub mod store;
 
 pub use service::TurboVecService;
 pub use store::{Index, IndexStore};
+
+/// Resolve when the process receives Ctrl-C or SIGTERM, so in-flight work can
+/// drain instead of being cut off mid-response.
+pub async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
+}
