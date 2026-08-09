@@ -158,7 +158,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(result) = stream.next().await {
         let result = result?;
         let best = result.scores.first().copied().unwrap_or(f32::NAN);
-        println!("search_stream query {q}: {} neighbours, best score {best:.4}", result.ids.len());
+        println!(
+            "search_stream query {q}: {} neighbours, best score {best:.4}",
+            result.ids.len()
+        );
         q += 1;
     }
 
