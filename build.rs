@@ -6,8 +6,11 @@ fn main() {
     tonic_build::configure()
         .file_descriptor_set_path(&descriptor_set)
         .compile_protos(
-            &["proto/turbovec/v1/turbovec.proto"],
+            &[
+                "proto/turbovec/v1/turbovec.proto",
+                "proto/turbovec/v1/coordinator.proto",
+            ],
             &["proto"],
         )
-        .expect("compile turbovec.v1 proto");
+        .expect("compile turbovec.v1 protos");
 }

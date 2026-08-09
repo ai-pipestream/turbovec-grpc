@@ -40,15 +40,17 @@ pub mod proto {
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("turbovec_v1");
 }
 
+pub mod coordinator;
 pub mod errors;
 pub mod service;
 pub mod store;
 
+pub use coordinator::{CoordinatorService, NodeTable, ShardConfig};
 pub use service::TurboVecService;
 pub use store::{Index, IndexStore};
 
 /// Resolve when the process receives Ctrl-C or SIGTERM, so in-flight work can
-/// drain instead of being cut off mid-response.
+/// drain instead of being cut off mid-response. Shared by both binaries.
 pub async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
