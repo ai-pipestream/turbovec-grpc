@@ -6,10 +6,10 @@ A gRPC server for [turbovec](https://github.com/RyanCodrai/turbovec).
 
 | Repository | Role | Depends on |
 |---|---|---|
-| [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream` | Patch fork carrying the two core changes distributed search needs: seeded TQ+ calibration and a seedable top-k floor (`initial_threshold`). Rebased onto upstream main | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) (this repo) | gRPC server for the upstream index, plus a thin coordinator that serves N of those servers as one collection. Client examples in Go, Java, Python, TypeScript, and Rust | upstream `turbovec` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream` |
+| [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 2/3/4-bit TurboQuant encoding, SIMD top-k search | — |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s13` | Patch fork carrying the two small scan primitives distributed search needs: a seedable score floor (`initial_threshold`) and a live-floor candidate stream (`search_streaming`). Rebased onto upstream main | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) (this repo) | Minimal sharded distributed engine: gRPC nodes plus an exact coordinator. Client examples in Go, Java, Python, TypeScript, and Rust | fork branch `turbovec-pipestream-s13` |
+| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Larger distributed hybrid implementation: sharded vector + BM25 nodes, coordinator, write-ahead log, and offline resharding | fork branch `turbovec-pipestream-s13` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 turbovec is a fast, in-memory, quantized vector index with Python bindings. This
@@ -25,6 +25,9 @@ index, get an `index_id`, then add vectors and search against it.
   ingested in chunks with no train step. `SearchStream` is server-streaming:
   the batch is scored under one short read-lock hold, then streamed one
   result per query, so a slow reader never pins index locks or server threads.
+  `StreamSearch` is the separate bidirectional node protocol used by the
+  coordinator: nodes emit candidates while the coordinator feeds a rising
+  global score floor back into their scans.
 - **Filter at search time.** `Search` takes an optional allowlist (external ids
   for an id-mapped index, slot indices for a positional one) and pushes it into
   the kernel, rather than over-fetching and discarding.
@@ -40,9 +43,10 @@ cargo run -p turbovec-grpc
 
 The server also registers the standard `grpc.health.v1.Health` service and
 gRPC server reflection, so orchestrator probes and `grpcurl` work out of the
-box. See [docs/deployment.md](docs/deployment.md) for the TLS/auth boundary,
-probes, persistence, and sizing, and the [Dockerfile](Dockerfile) for an
-example container build.
+box. See [docs/architecture.md](docs/architecture.md) for the thin coordinator
+design, [docs/deployment.md](docs/deployment.md) for the TLS/auth boundary,
+probes, persistence, and sizing, and the [Dockerfile](Dockerfile) for an example
+container build.
 
 ## The contract
 
@@ -51,10 +55,11 @@ The proto is small, because the payload is just vectors. Every RPC is in
 
 | RPC | Shape | Purpose |
 |---|---|---|
-| `CreateIndex` | unary | Make an empty index (positional or id-mapped, 2 or 4 bit, optionally lazy). |
+| `CreateIndex` | unary | Make an empty index (positional or id-mapped, 2, 3, or 4 bit, optionally lazy). |
 | `Add` | client-streaming | Stream vectors in. No train step. |
 | `Search` | unary | Top-k for one or more queries, with an optional allowlist. |
 | `SearchStream` | server-streaming | Same, streamed one result per query after scoring. |
+| `StreamSearch` | bidirectional streaming | Internal distributed scan: emit candidates above a live inclusive floor and finish with a completion certificate. |
 | `Remove` | unary | Delete by external id (id-mapped indexes). |
 | `GetIndexInfo` / `ListIndexes` | unary | Metadata. |
 | `Snapshot` / `Load` | unary | Persist to and from a server-local path. |
@@ -89,6 +94,16 @@ differently calibrated scores is not a worse ranking but a ranking of nothing.
 A node that fails mid-query fails the search; `allow_partial` opts into the
 alternative explicitly, and the response then says it is partial and names what
 dropped out.
+
+For a complete search, the coordinator owns the only top-k heap. Each node
+streams every candidate admitted by the inclusive floor in effect for its scan
+chunk. Once the global heap holds `k` rows, the coordinator broadcasts its
+k-th score back to every unfinished node. That score is a lower bound on the
+final global k-th score because it came from an observed subset, so pruning
+below it cannot remove a true result. Scores equal to the floor remain
+eligible. The coordinator answers only after every node returns
+`completed=true`; a broken or incomplete stream is not treated as a short
+result.
 
 **Split** redistributes one index's rows across nodes when a collection
 outgrows a machine. **Join** combines them back when you consolidate. Both move
@@ -134,13 +149,15 @@ its codes and so its scores. A distributed collection carries its external ids
 as a row label per shard instead, which is what survives rows moving between
 nodes.
 
-This is vector search only: no BM25, no hybrid fusion, no floor sharing. Those
-live in [turbovec-search](https://github.com/ai-pipestream/turbovec-search) and
-depend on fork patches; this layer builds on stock upstream turbovec, pinned to
-a revision with the explicit calibration API.
+This is vector search only: no BM25 or hybrid fusion yet. The distributed
+protocol and global heap live here, while turbovec remains the engine library
+and exposes only the small generally useful scan primitives. The larger
+[turbovec-search](https://github.com/ai-pipestream/turbovec-search) repository
+is a source of proven mechanisms, not the required shape of this service.
 
-[`clients/python`](clients/python) is a thin Python package over the
-coordinator, and its `example.py` runs the whole lifecycle against a live one.
+[`clients/python`](clients/python) is an early thin wrapper over the
+coordinator. The Rust gRPC engine is the current priority; the wrapper is not a
+release gate until that engine is functionally complete.
 
 ## Client examples
 

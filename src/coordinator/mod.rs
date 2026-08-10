@@ -36,9 +36,12 @@
 
 pub mod nodes;
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 use turbovec::TurboQuantIndex;
@@ -55,7 +58,7 @@ use crate::proto::{
     GetIndexInfoRequest, ImportRowsRequest, IndexInfo, JoinRequest, JoinResponse,
     ListIndexesRequest, ListNodesRequest, ListNodesResponse, Neighbour, QueryResult, RowBlock,
     SearchRequest, SetCalibrationRequest, ShardFailure, ShardRef, ShardStatus, SplitRequest,
-    SplitResponse,
+    SplitResponse, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
 };
 use crate::service::calibration_difference;
 
@@ -110,6 +113,61 @@ struct Pinned {
 
     /// The calibration pair every shard holds.
     calibration: Calibration,
+}
+
+/// One candidate in the coordinator's bounded global heap.
+///
+/// [`BinaryHeap`] exposes its greatest item. This ordering deliberately makes
+/// the worst candidate greatest: lower scores lose, then later shards and
+/// larger slots lose ties. The heap root is therefore the current global
+/// k-th candidate and its score is the safe floor broadcast to every shard.
+#[derive(Clone)]
+struct HeapCandidate {
+    score: f32,
+    shard_rank: usize,
+    address: String,
+    index_id: String,
+    slot: u64,
+    label: Option<u64>,
+}
+
+impl PartialEq for HeapCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for HeapCandidate {}
+
+impl PartialOrd for HeapCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.shard_rank.cmp(&other.shard_rank))
+            .then_with(|| self.slot.cmp(&other.slot))
+    }
+}
+
+/// Event forwarded by one shard response task to the query's collector.
+enum StreamEvent {
+    Message {
+        shard_rank: usize,
+        response: StreamSearchResponse,
+    },
+    Error {
+        shard_rank: usize,
+        status: Status,
+    },
+    Closed {
+        shard_rank: usize,
+    },
 }
 
 impl CoordinatorService {
@@ -179,6 +237,218 @@ impl CoordinatorService {
         Ok(TurboVecClient::new(channel)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES))
+    }
+
+    /// Search one query with one global heap while every shard streams
+    /// candidates above the highest floor observed so far.
+    async fn stream_query(
+        &self,
+        pinned: &Pinned,
+        vector: Vec<f32>,
+        k: usize,
+    ) -> Result<CollectionQueryResult, Status> {
+        let event_capacity = (pinned.shards.len() * 4).max(16);
+        let (event_tx, mut event_rx) = mpsc::channel(event_capacity);
+        let mut outbound = Vec::with_capacity(pinned.shards.len());
+
+        for (shard_rank, shard) in pinned.shards.iter().enumerate() {
+            let mut client = self.client(&shard.address)?;
+            let (request_tx, request_rx) = mpsc::channel(8);
+            request_tx
+                .send(StreamSearchRequest {
+                    payload: Some(crate::proto::stream_search_request::Payload::Start(
+                        StartStreamSearch {
+                            index_id: shard.index_id.clone(),
+                            vector: vector.clone(),
+                            initial_floor: None,
+                            request_id: uuid::Uuid::new_v4().to_string(),
+                        },
+                    )),
+                })
+                .await
+                .map_err(|_| Status::internal("cannot start shard request stream"))?;
+            let mut responses = client
+                .stream_search(ReceiverStream::new(request_rx))
+                .await
+                .map_err(|status| node_error(&shard.address, &status))?
+                .into_inner();
+            let shard_events = event_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match responses.message().await {
+                        Ok(Some(response)) => {
+                            if shard_events
+                                .send(StreamEvent::Message {
+                                    shard_rank,
+                                    response,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = shard_events.send(StreamEvent::Closed { shard_rank }).await;
+                            break;
+                        }
+                        Err(status) => {
+                            let _ = shard_events
+                                .send(StreamEvent::Error { shard_rank, status })
+                                .await;
+                            break;
+                        }
+                    }
+                }
+            });
+            outbound.push(Some(request_tx));
+        }
+        drop(event_tx);
+
+        let mut heap = BinaryHeap::with_capacity(k + 1);
+        let mut published_floor = f32::NEG_INFINITY;
+        let mut completed = vec![false; pinned.shards.len()];
+        let mut remaining = pinned.shards.len();
+
+        while remaining > 0 {
+            let event = event_rx.recv().await.ok_or_else(|| {
+                Status::internal("all shard response streams closed before completing")
+            })?;
+            match event {
+                StreamEvent::Message {
+                    shard_rank,
+                    response,
+                } => match response.payload {
+                    Some(crate::proto::stream_search_response::Payload::Batch(batch)) => {
+                        if completed[shard_rank] {
+                            return Err(Status::internal(format!(
+                                "shard {} emitted candidates after its completion summary",
+                                pinned.shards[shard_rank].address
+                            )));
+                        }
+                        if batch.scores.len() != batch.slots.len()
+                            || (!batch.labels.is_empty()
+                                && batch.labels.len() != batch.scores.len())
+                        {
+                            return Err(Status::internal(format!(
+                                "shard {} returned misaligned streaming candidates",
+                                pinned.shards[shard_rank].address
+                            )));
+                        }
+                        let labelled = !batch.labels.is_empty();
+                        let shard = &pinned.shards[shard_rank];
+                        for (rank, (score, slot)) in
+                            batch.scores.into_iter().zip(batch.slots).enumerate()
+                        {
+                            if score.is_nan() {
+                                return Err(Status::internal(format!(
+                                    "shard {} returned a NaN score",
+                                    shard.address
+                                )));
+                            }
+                            let candidate = HeapCandidate {
+                                score,
+                                shard_rank,
+                                address: shard.address.clone(),
+                                index_id: shard.index_id.clone(),
+                                slot,
+                                label: labelled.then(|| batch.labels[rank]),
+                            };
+                            if heap.len() < k {
+                                heap.push(candidate);
+                            } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+                                heap.pop();
+                                heap.push(candidate);
+                            }
+                        }
+
+                        if heap.len() == k {
+                            let floor = heap.peek().expect("a full top-k heap has a root").score;
+                            if floor > published_floor {
+                                published_floor = floor;
+                                for (rank, sender) in outbound.iter().enumerate() {
+                                    if completed[rank] {
+                                        continue;
+                                    }
+                                    sender
+                                        .as_ref()
+                                        .expect("incomplete shard retains its request stream")
+                                        .send(StreamSearchRequest {
+                                            payload: Some(
+                                                crate::proto::stream_search_request::Payload::FloorUpdate(
+                                                    crate::proto::FloorUpdate { floor },
+                                                ),
+                                            ),
+                                        })
+                                        .await
+                                        .map_err(|_| {
+                                            errors::unavailable(
+                                                NODE_UNREACHABLE,
+                                                format!(
+                                                    "{} closed its floor-update stream",
+                                                    pinned.shards[rank].address
+                                                ),
+                                            )
+                                        })?;
+                                }
+                            }
+                        }
+                    }
+                    Some(crate::proto::stream_search_response::Payload::Summary(summary)) => {
+                        if completed[shard_rank] {
+                            return Err(Status::internal(format!(
+                                "shard {} sent more than one completion summary",
+                                pinned.shards[shard_rank].address
+                            )));
+                        }
+                        if !summary.completed {
+                            return Err(Status::aborted(format!(
+                                "shard {} did not complete its streaming scan",
+                                pinned.shards[shard_rank].address
+                            )));
+                        }
+                        completed[shard_rank] = true;
+                        remaining -= 1;
+                        outbound[shard_rank] = None;
+                    }
+                    None => {
+                        return Err(Status::internal(format!(
+                            "shard {} returned an empty streaming response",
+                            pinned.shards[shard_rank].address
+                        )))
+                    }
+                },
+                StreamEvent::Error { shard_rank, status } => {
+                    return Err(node_error(&pinned.shards[shard_rank].address, &status));
+                }
+                StreamEvent::Closed { shard_rank } => {
+                    if !completed[shard_rank] {
+                        return Err(errors::unavailable(
+                            NODE_UNREACHABLE,
+                            format!(
+                                "{} closed its streaming scan without a completion summary",
+                                pinned.shards[shard_rank].address
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut candidates = heap.into_vec();
+        candidates.sort();
+        Ok(CollectionQueryResult {
+            neighbours: candidates
+                .into_iter()
+                .map(|candidate| Neighbour {
+                    score: candidate.score,
+                    label: candidate.label,
+                    address: candidate.address,
+                    index_id: candidate.index_id,
+                    slot: candidate.slot,
+                })
+                .collect(),
+        })
     }
 
     /// Probe every configured shard concurrently, keeping table order.
@@ -559,6 +829,23 @@ impl Coordinator for CoordinatorService {
             )));
         }
         let nq = req.queries.len() / pinned.dim;
+
+        // Complete searches use the collaborative streaming collector: the
+        // coordinator owns the only top-k heap and sends its rising k-th score
+        // back to every shard. The legacy unary path below remains solely for
+        // allow_partial until that response contract can identify a shard
+        // failure for a particular query in a batch without ambiguity.
+        if !req.allow_partial {
+            let mut results = Vec::with_capacity(nq);
+            for vector in req.queries.chunks_exact(pinned.dim) {
+                results.push(self.stream_query(&pinned, vector.to_vec(), k).await?);
+            }
+            return Ok(Response::new(CollectionSearchResponse {
+                results,
+                partial: false,
+                failures: Vec::new(),
+            }));
+        }
 
         // Every shard is asked for its own top-k. A shard can contribute at
         // most k rows to a global top-k, so k per shard is exactly enough:

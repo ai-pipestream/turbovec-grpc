@@ -20,11 +20,13 @@
 //! positional-only, because they need `TurboQuantIndex`'s raw-parts accessors
 //! and `IdMapIndex` does not forward them.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Iter;
 use tonic::{Request, Response, Status, Streaming};
-use turbovec::{first_invalid_coord, IdMapIndex, TurboQuantIndex};
+use turbovec::{first_invalid_coord, IdMapIndex, SearchOptions, StreamControl, TurboQuantIndex};
 
 use crate::errors::{
     self, INDEX_NOT_EMPTY, INVALID_CALIBRATION, LABELLED_INDEX_IMMUTABLE,
@@ -37,7 +39,8 @@ use crate::proto::{
     GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse, IndexInfo, IndexKind,
     ListIndexesRequest, ListIndexesResponse, LoadRequest, LoadResponse, QueryResult, RemoveRequest,
     RemoveResponse, RowBlock, SearchRequest, SearchResponse, SetCalibrationRequest,
-    SnapshotRequest, SnapshotResponse,
+    SnapshotRequest, SnapshotResponse, StreamSearchBatch, StreamSearchRequest,
+    StreamSearchResponse, StreamSearchSummary,
 };
 use crate::store::{Handle, Index, IndexStore, Labels};
 
@@ -298,6 +301,30 @@ fn join_err(err: tokio::task::JoinError) -> Status {
     Status::internal(format!("index task failed: {err}"))
 }
 
+/// Raise an atomic floating-point floor if `candidate` is strictly greater.
+///
+/// Every caller rejects NaN first. AtomicU32 is used only as a transport for
+/// the bits; ordering is performed as f32 so negative floors retain their
+/// numeric order.
+fn raise_floor(cell: &AtomicU32, candidate: f32) {
+    let mut current_bits = cell.load(Ordering::Acquire);
+    loop {
+        let current = f32::from_bits(current_bits);
+        if candidate <= current {
+            return;
+        }
+        match cell.compare_exchange_weak(
+            current_bits,
+            candidate.to_bits(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current_bits = actual,
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl TurboVec for TurboVecService {
     async fn create_index(
@@ -503,6 +530,194 @@ impl TurboVec for TurboVecService {
         let items: Vec<Result<QueryResult, Status>> =
             response.into_inner().results.into_iter().map(Ok).collect();
         Ok(Response::new(tokio_stream::iter(items)))
+    }
+
+    type StreamSearchStream = ReceiverStream<Result<StreamSearchResponse, Status>>;
+
+    /// Run one positional-index scan whose candidate floor can rise while the
+    /// scan is in progress. The node owns no top-k heap. It emits every
+    /// candidate admitted by turbovec's inclusive live floor and lets the
+    /// coordinator decide which candidates survive globally.
+    async fn stream_search(
+        &self,
+        request: Request<Streaming<StreamSearchRequest>>,
+    ) -> Result<Response<Self::StreamSearchStream>, Status> {
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("stream must start with StartStreamSearch"))?;
+        let start = match first.payload {
+            Some(crate::proto::stream_search_request::Payload::Start(start)) => start,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first stream message must be StartStreamSearch",
+                ))
+            }
+        };
+        let handle = self.handle(&start.index_id)?;
+        let labels = self.store.labels(&start.index_id);
+        let initial_floor = start.initial_floor.unwrap_or(f32::NEG_INFINITY);
+        if initial_floor.is_nan() {
+            return Err(Status::invalid_argument("initial_floor must not be NaN"));
+        }
+
+        let floor = Arc::new(AtomicU32::new(initial_floor.to_bits()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let protocol_error: Arc<Mutex<Option<Status>>> = Arc::new(Mutex::new(None));
+
+        // The inbound pump is deliberately independent of the response
+        // channel. It may wait for another update after the scan has already
+        // completed, and must not keep the outbound stream alive by retaining
+        // a sender.
+        let pump_floor = Arc::clone(&floor);
+        let pump_stop = Arc::clone(&stop);
+        let pump_error = Arc::clone(&protocol_error);
+        tokio::spawn(async move {
+            loop {
+                match inbound.message().await {
+                    Ok(Some(message)) => match message.payload {
+                        Some(crate::proto::stream_search_request::Payload::FloorUpdate(update)) => {
+                            if update.floor.is_nan() {
+                                *pump_error.lock().expect("stream protocol lock poisoned") =
+                                    Some(Status::invalid_argument("floor must not be NaN"));
+                                pump_stop.store(true, Ordering::Release);
+                                break;
+                            }
+                            raise_floor(&pump_floor, update.floor);
+                        }
+                        Some(crate::proto::stream_search_request::Payload::Stop(_)) => {
+                            pump_stop.store(true, Ordering::Release);
+                            break;
+                        }
+                        Some(crate::proto::stream_search_request::Payload::Start(_)) | None => {
+                            *pump_error.lock().expect("stream protocol lock poisoned") =
+                                Some(Status::invalid_argument(
+                                    "StartStreamSearch must appear exactly once and first",
+                                ));
+                            pump_stop.store(true, Ordering::Release);
+                            break;
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(status) => {
+                        *pump_error.lock().expect("stream protocol lock poisoned") = Some(status);
+                        pump_stop.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            let scan_tx = tx.clone();
+            let scan_floor = Arc::clone(&floor);
+            let scan_stop = Arc::clone(&stop);
+            let outcome = tokio::task::spawn_blocking(move || {
+                let guard = handle
+                    .read()
+                    .map_err(|_| Status::internal("index lock poisoned"))?;
+                let inner = positional(&guard, "StreamSearch")?;
+                let Some(dim) = inner.dim_opt() else {
+                    return Err(Status::failed_precondition(
+                        "index has no vectors; add vectors before searching",
+                    ));
+                };
+                validate_queries(&start.vector, dim)?;
+                if start.vector.len() != dim {
+                    return Err(Status::invalid_argument(format!(
+                        "StreamSearch accepts exactly one query of dim {dim}; got {} coordinates",
+                        start.vector.len()
+                    )));
+                }
+
+                let options = if initial_floor == f32::NEG_INFINITY {
+                    SearchOptions::new()
+                } else {
+                    SearchOptions::new().with_initial_threshold(initial_floor)
+                };
+                let mut floor_now = initial_floor;
+                let mut floor_raises = 0u64;
+                let summary = inner
+                    .try_search_streaming(&start.vector, options, |batch| {
+                        let slots: Vec<u64> = batch
+                            .slots
+                            .iter()
+                            .map(|&slot| {
+                                u64::try_from(slot)
+                                    .expect("streaming search emits only live non-negative slots")
+                            })
+                            .collect();
+                        let labels = labels.as_ref().map_or_else(Vec::new, |table| {
+                            slots
+                                .iter()
+                                .map(|&slot| {
+                                    *table
+                                        .get(slot as usize)
+                                        .expect("label table covers every slot of its index")
+                                })
+                                .collect()
+                        });
+                        let response = StreamSearchResponse {
+                            payload: Some(crate::proto::stream_search_response::Payload::Batch(
+                                StreamSearchBatch {
+                                    scores: batch.scores.to_vec(),
+                                    slots,
+                                    labels,
+                                },
+                            )),
+                        };
+                        if scan_tx.blocking_send(Ok(response)).is_err()
+                            || scan_stop.load(Ordering::Acquire)
+                        {
+                            return StreamControl::Stop;
+                        }
+                        let candidate = f32::from_bits(scan_floor.load(Ordering::Acquire));
+                        if candidate > floor_now {
+                            floor_now = candidate;
+                            floor_raises += 1;
+                            StreamControl::RaiseFloor(candidate)
+                        } else {
+                            StreamControl::Continue
+                        }
+                    })
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                Ok::<_, Status>(StreamSearchSummary {
+                    completed: summary.completed,
+                    emitted: summary.emitted as u64,
+                    blocks_scanned: summary.blocks_scanned as u64,
+                    floor_raises_applied: floor_raises,
+                })
+            })
+            .await
+            .map_err(join_err);
+
+            let protocol_error = protocol_error
+                .lock()
+                .expect("stream protocol lock poisoned")
+                .take();
+            if let Some(status) = protocol_error {
+                let _ = tx.send(Err(status)).await;
+                return;
+            }
+            match outcome {
+                Ok(Ok(summary)) => {
+                    let _ = tx
+                        .send(Ok(StreamSearchResponse {
+                            payload: Some(crate::proto::stream_search_response::Payload::Summary(
+                                summary,
+                            )),
+                        }))
+                        .await;
+                }
+                Ok(Err(status)) | Err(status) => {
+                    let _ = tx.send(Err(status)).await;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn snapshot(

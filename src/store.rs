@@ -69,7 +69,7 @@ impl Index {
         }
     }
 
-    /// Quantization bit width (2 or 4).
+    /// Quantization bit width (2, 3, or 4).
     pub fn bit_width(&self) -> usize {
         match self {
             Self::Positional(index) => index.bit_width(),

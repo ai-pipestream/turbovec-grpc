@@ -39,11 +39,14 @@ service Coordinator {
   // listing is usable precisely when something is wrong. Search refuses.
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
 
-  // Runs a top-k search over the whole collection.
+  // Runs a top-k search over the whole collection. Complete searches use one
+  // coordinator-owned global heap while nodes stream candidates and accept
+  // monotonically rising inclusive floors. The call returns only after every
+  // node certifies that its scan completed.
   //
-  // Fails, by name, if any shard is unreachable or if the shards do not
-  // share one calibration pair. A short result set is never returned as
-  // if it were complete; see `allow_partial` for the opt-in.
+  // Fails, by name, if any shard is unreachable or incomplete, or if the
+  // shards do not share one calibration pair. A short result set is never
+  // returned as if it were complete; see `allow_partial` for the opt-in.
   rpc Search(CollectionSearchRequest) returns (CollectionSearchResponse);
 
   // Fits one TQ+ calibration from a caller-supplied sample and commits

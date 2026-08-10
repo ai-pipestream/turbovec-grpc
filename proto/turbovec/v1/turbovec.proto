@@ -87,6 +87,17 @@ service TurboVec {
   // lazy index applies here too.
   rpc SearchStream(SearchRequest) returns (stream QueryResult);
 
+  // Collaborative streaming scan used by a distributed coordinator. The
+  // client sends exactly one StartStreamSearch first, then monotonically
+  // rising FloorUpdate messages. The node emits every candidate at or above
+  // the floor in effect for its scan chunk and finishes with a summary.
+  //
+  // This RPC deliberately has no k. The coordinator owns the only top-k heap
+  // and feeds its global k-th score back to every shard. A result is exact
+  // only when every shard returns a summary with completed=true.
+  // POSITIONAL indexes only.
+  rpc StreamSearch(stream StreamSearchRequest) returns (stream StreamSearchResponse);
+
   // Writes an index to a server-local path in turbovec's own format.
   rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
 
@@ -134,7 +145,7 @@ message IndexInfo {
   // Vector dimensionality, or 0 for a lazy index whose dim is not yet bound.
   uint32 dim = 3;
 
-  // Quantization bit width (2 or 4).
+  // Quantization bit width (2, 3, or 4).
   uint32 bit_width = 4;
 
   // Number of vectors currently in the index.
@@ -155,7 +166,7 @@ message CreateIndexRequest {
   // set, in which case it is ignored and the first Add binds the dim.
   uint32 dim = 1;
 
-  // Quantization bit width. Must be 2 or 4.
+  // Quantization bit width. Must be 2, 3, or 4.
   uint32 bit_width = 2;
 
   // Storage model. Must not be INDEX_KIND_UNSPECIFIED.
@@ -283,6 +294,85 @@ message QueryResult {
 message SearchResponse {
   // Results, aligned with the input queries.
   repeated QueryResult results = 1;
+}
+
+// One message on the coordinator-to-node side of StreamSearch.
+message StreamSearchRequest {
+  oneof payload {
+    // Opens the scan. Exactly one, and it must be the first message.
+    StartStreamSearch start = 1;
+
+    // Raises the emission floor. Lower and duplicate values are harmless and
+    // ignored; NaN is rejected.
+    FloorUpdate floor_update = 2;
+
+    // Abandons the scan. The terminal summary reports completed=false.
+    StopStreamSearch stop = 3;
+  }
+}
+
+// Opens one streaming scan against one positional index and one query.
+message StartStreamSearch {
+  // Handle to search.
+  string index_id = 1;
+
+  // Exactly one query vector. Length must equal the index dimension.
+  repeated float vector = 2;
+
+  // Optional starting floor. This supports a later cascade or other stage
+  // that already holds a safe lower bound. Absent means negative infinity.
+  optional float initial_floor = 3;
+
+  // Coordinator-assigned opaque identifier for logs and diagnostics.
+  string request_id = 4;
+}
+
+// Monotonically raises a running scan's inclusive score floor.
+message FloorUpdate {
+  float floor = 1;
+}
+
+// Requests cancellation of a running scan.
+message StopStreamSearch {}
+
+// One message on the node-to-coordinator side of StreamSearch.
+message StreamSearchResponse {
+  oneof payload {
+    // Candidates from one scan chunk.
+    StreamSearchBatch batch = 1;
+
+    // Exactly one terminal completion certificate.
+    StreamSearchSummary summary = 2;
+  }
+}
+
+// Every candidate from one scan chunk that met its inclusive live floor.
+message StreamSearchBatch {
+  // Scores in descending order, aligned with slots and optional labels.
+  repeated float scores = 1;
+
+  // Positional slots in the index.
+  repeated uint64 slots = 2;
+
+  // External row ids when the index is labelled, aligned with scores. Empty
+  // for an unlabelled index.
+  repeated uint64 labels = 3;
+}
+
+// Terminal certificate and work counters for one streaming scan.
+message StreamSearchSummary {
+  // True only when every scan chunk completed. False after StopStreamSearch
+  // or a closed response channel.
+  bool completed = 1;
+
+  // Candidates emitted across all batches.
+  uint64 emitted = 2;
+
+  // Scan chunks scored.
+  uint64 blocks_scanned = 3;
+
+  // Monotonic floor raises observed and applied between chunks.
+  uint64 floor_raises_applied = 4;
 }
 
 // SnapshotRequest asks the server to write an index to a local path.
