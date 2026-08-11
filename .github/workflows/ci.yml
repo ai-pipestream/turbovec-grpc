@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: clippy,rustfmt
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Proto drift
+        run: |
+          cmp proto/turbovec/v1/turbovec.proto clients/python/proto/turbovec/v1/turbovec.proto
+          cmp proto/turbovec/v1/coordinator.proto clients/python/proto/turbovec/v1/coordinator.proto
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --release --locked --test distributed --test smoke
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag turbovec-grpc:test .

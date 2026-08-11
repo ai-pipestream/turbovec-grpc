@@ -17,7 +17,8 @@ import turbovec.v1.CreateIndexRequest;
 import turbovec.v1.DropIndexRequest;
 import turbovec.v1.IndexKind;
 import turbovec.v1.SearchRequest;
-import turbovec.v1.TurboVecGrpc;
+import turbovec.v1.TurboVecAdminGrpc;
+import turbovec.v1.TurboVecQueryGrpc;
 
 /**
  * Wire-fidelity demo for the turbovec-grpc server, companion to the
@@ -53,7 +54,7 @@ public final class WireFidelityDemo {
             fidelityDemo(channel, dim);
         } catch (StatusRuntimeException e) {
             System.err.printf(
-                    "%nrpc failed: %s%nis the server up?  cargo run -p turbovec-grpc%n",
+                    "%nrpc failed: %s%nis the server up?  TURBOVEC_ALLOW_EPHEMERAL=true cargo run --bin turbovec-grpc%n",
                     e.getStatus());
             System.exit(1);
         } finally {
@@ -67,9 +68,10 @@ public final class WireFidelityDemo {
      * double-backed REST client produce).
      */
     private static void fidelityDemo(ManagedChannel channel, int dim) {
-        TurboVecGrpc.TurboVecBlockingStub blocking = TurboVecGrpc.newBlockingStub(channel);
+        TurboVecAdminGrpc.TurboVecAdminBlockingStub admin = TurboVecAdminGrpc.newBlockingStub(channel);
+        TurboVecQueryGrpc.TurboVecQueryBlockingStub query = TurboVecQueryGrpc.newBlockingStub(channel);
         String indexId =
-                blocking.createIndex(
+                admin.createIndex(
                                 CreateIndexRequest.newBuilder()
                                         .setDim(dim)
                                         .setBitWidth(BIT_WIDTH)
@@ -105,7 +107,7 @@ public final class WireFidelityDemo {
         for (long id : ids) {
             long viaDouble = jsonAsDouble(json, id);
             long viaLong = jsonAsLong(json, id);
-            long viaGrpc = lookupOnly(blocking, indexId, probe, id);
+            long viaGrpc = lookupOnly(query, indexId, probe, id);
             System.out.printf(
                     "    %-21d %-25s %-23s %-23s%n",
                     id,
@@ -123,8 +125,8 @@ public final class WireFidelityDemo {
         long idA = ids[1]; // 2^53
         long idB = ids[2]; // 2^53 + 1, a different vector under a different id
         long idBAsDouble = jsonAsDouble(json, idB); // what the double path yields for B
-        long askedViaDouble = lookupOnly(blocking, indexId, probe, idBAsDouble);
-        long askedViaGrpc = lookupOnly(blocking, indexId, probe, idB);
+        long askedViaDouble = lookupOnly(query, indexId, probe, idBAsDouble);
+        long askedViaGrpc = lookupOnly(query, indexId, probe, idB);
         if (askedViaDouble != idA || askedViaGrpc != idB) {
             throw new IllegalStateException("id collision demo did not reproduce");
         }
@@ -158,14 +160,14 @@ public final class WireFidelityDemo {
                         + " storage. Full-precision JSON can round-trip a float, but protobuf needs"
                         + " no such care.)%n");
 
-        blocking.dropIndex(DropIndexRequest.newBuilder().setIndexId(indexId).build());
+        admin.dropIndex(DropIndexRequest.newBuilder().setIndexId(indexId).build());
     }
 
     /** Send a single Add frame and wait for the summary. */
     private static void streamOne(ManagedChannel channel, AddRequest frame) {
         CompletableFuture<AddResponse> done = new CompletableFuture<>();
         StreamObserver<AddRequest> upload =
-                TurboVecGrpc.newStub(channel)
+                TurboVecAdminGrpc.newStub(channel)
                         .add(
                                 new StreamObserver<>() {
                                     @Override
@@ -225,8 +227,8 @@ public final class WireFidelityDemo {
 
     /** Top-1 restricted to a single allowlisted id; returns the id the server yields. */
     private static long lookupOnly(
-            TurboVecGrpc.TurboVecBlockingStub blocking, String indexId, float[] probe, long allowId) {
-        return blocking.search(
+            TurboVecQueryGrpc.TurboVecQueryBlockingStub query, String indexId, float[] probe, long allowId) {
+        return query.search(
                         SearchRequest.newBuilder()
                                 .setIndexId(indexId)
                                 .addAllQueries(TurboVecDemo.boxed(probe))

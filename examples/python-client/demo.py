@@ -64,11 +64,12 @@ def main():
     addr = os.environ.get("TURBOVEC_GRPC_ADDR", DEFAULT_ADDR)
 
     channel = grpc.insecure_channel(addr)
-    stub = turbovec_pb2_grpc.TurboVecStub(channel)
+    admin = turbovec_pb2_grpc.TurboVecAdminStub(channel)
+    query = turbovec_pb2_grpc.TurboVecQueryStub(channel)
     try:
         print(f"turbovec-grpc demo — connected to {addr}")
 
-        created = stub.CreateIndex(
+        created = admin.CreateIndex(
             turbovec_pb2.CreateIndexRequest(
                 dim=dim,
                 bit_width=BIT_WIDTH,
@@ -81,12 +82,12 @@ def main():
         # [1] Ingest: client-stream the corpus in chunked frames.
         print(f"\n[1] indexing {n_vectors:,} vectors of dim {dim} at {BIT_WIDTH}-bit")
         start = time.perf_counter_ns()
-        added = stub.Add(add_frames(stub, index_id, n_vectors, dim)).added
+        added = admin.Add(add_frames(admin, index_id, n_vectors, dim)).added
         secs = (time.perf_counter_ns() - start) / 1e9
         wire_mb = n_vectors * dim * 4 / 1e6
         print(f"    added {added:,} in {secs:.2f}s  =  {added / secs:,.0f} vectors/sec"
               f"  ({wire_mb:,.0f} MB of raw float32 sent)")
-        info = stub.GetIndexInfo(turbovec_pb2.GetIndexInfoRequest(index_id=index_id))
+        info = query.GetIndexInfo(turbovec_pb2.GetIndexInfoRequest(index_id=index_id))
         print(f"    server reports {info.len:,} vectors in the index")
 
         # [2] Unary top-k search, one query at a time. Query vectors are
@@ -95,14 +96,14 @@ def main():
         print(f"\n[2] top-{TOP_K} search, one query at a time")
         rng = random.Random(1234)
         for _ in range(WARMUP_QUERIES):
-            stub.Search(turbovec_pb2.SearchRequest(
+            query.Search(turbovec_pb2.SearchRequest(
                 index_id=index_id, queries=random_vectors(rng, dim, 1), k=TOP_K))
         latencies_ns = []
         for _ in range(n_queries):
             req = turbovec_pb2.SearchRequest(
                 index_id=index_id, queries=random_vectors(rng, dim, 1), k=TOP_K)
             t0 = time.perf_counter_ns()
-            resp = stub.Search(req)
+            resp = query.Search(req)
             latencies_ns.append(time.perf_counter_ns() - t0)
             if len(resp.results[0].ids) != TOP_K:
                 raise RuntimeError(f"expected {TOP_K} neighbours")
@@ -122,13 +123,14 @@ def main():
         print("\n[3] server-streaming search, batch of 4 queries")
         batch = turbovec_pb2.SearchRequest(
             index_id=index_id, queries=random_vectors(rng, dim, 4), k=TOP_K)
-        for i, qr in enumerate(stub.SearchStream(batch)):
+        for i, qr in enumerate(query.SearchStream(batch)):
             print(f"    query {i} -> {len(qr.ids)} neighbours, best score {qr.scores[0]:.4f}")
 
-        stub.DropIndex(turbovec_pb2.DropIndexRequest(index_id=index_id))
+        admin.DropIndex(turbovec_pb2.DropIndexRequest(index_id=index_id))
     except grpc.RpcError as e:
         print(f"\nrpc failed: {e.code()}"
-              "\nis the server up?  cargo run -p turbovec-grpc", file=sys.stderr)
+              "\nis the server up?  TURBOVEC_ALLOW_EPHEMERAL=true cargo run --bin turbovec-grpc",
+              file=sys.stderr)
         sys.exit(1)
     finally:
         channel.close()

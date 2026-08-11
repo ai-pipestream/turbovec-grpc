@@ -22,7 +22,8 @@ import turbovec.v1.IndexKind;
 import turbovec.v1.QueryResult;
 import turbovec.v1.SearchRequest;
 import turbovec.v1.SearchResponse;
-import turbovec.v1.TurboVecGrpc;
+import turbovec.v1.TurboVecAdminGrpc;
+import turbovec.v1.TurboVecQueryGrpc;
 
 /**
  * Java demo client for the turbovec-grpc server: the speed test.
@@ -68,7 +69,7 @@ public final class TurboVecDemo {
             speedDemo(channel, nVectors, dim, nQueries);
         } catch (StatusRuntimeException e) {
             System.err.printf(
-                    "%nrpc failed: %s%nis the server up?  cargo run -p turbovec-grpc%n",
+                    "%nrpc failed: %s%nis the server up?  TURBOVEC_ALLOW_EPHEMERAL=true cargo run --bin turbovec-grpc%n",
                     e.getStatus());
             System.exit(1);
         } finally {
@@ -78,10 +79,11 @@ public final class TurboVecDemo {
 
     /** Build an index from the JVM, then time ingest and queries. */
     private static void speedDemo(ManagedChannel channel, int nVectors, int dim, int nQueries) {
-        TurboVecGrpc.TurboVecBlockingStub blocking = TurboVecGrpc.newBlockingStub(channel);
+        TurboVecAdminGrpc.TurboVecAdminBlockingStub admin = TurboVecAdminGrpc.newBlockingStub(channel);
+        TurboVecQueryGrpc.TurboVecQueryBlockingStub query = TurboVecQueryGrpc.newBlockingStub(channel);
 
         CreateIndexResponse created =
-                blocking.createIndex(
+                admin.createIndex(
                         CreateIndexRequest.newBuilder()
                                 .setDim(dim)
                                 .setBitWidth(BIT_WIDTH)
@@ -101,7 +103,7 @@ public final class TurboVecDemo {
                 added, ingestSecs, added / ingestSecs, wireMb);
 
         long len =
-                blocking.getIndexInfo(
+                query.getIndexInfo(
                                 GetIndexInfoRequest.newBuilder().setIndexId(indexId).build())
                         .getLen();
         System.out.printf("    server reports %,d vectors in the index%n", len);
@@ -109,7 +111,7 @@ public final class TurboVecDemo {
         System.out.printf("%n[2] top-%d search, one query at a time%n", TOP_K);
         Random rng = new Random(1234);
         for (int i = 0; i < WARMUP_QUERIES; i++) {
-            blocking.search(searchRequest(indexId, randomVector(dim, rng), TOP_K));
+            query.search(searchRequest(indexId, randomVector(dim, rng), TOP_K));
         }
         // Query vectors are generated outside the timed region, so latency and
         // served QPS reflect the round trip and the server scan, not the client.
@@ -118,7 +120,7 @@ public final class TurboVecDemo {
         for (int i = 0; i < nQueries; i++) {
             SearchRequest req = searchRequest(indexId, randomVector(dim, rng), TOP_K);
             long start = System.nanoTime();
-            SearchResponse resp = blocking.search(req);
+            SearchResponse resp = query.search(req);
             long elapsed = System.nanoTime() - start;
             latenciesNs[i] = elapsed;
             totalNs += elapsed;
@@ -138,7 +140,7 @@ public final class TurboVecDemo {
         // The server-streaming variant: one QueryResult per query, in order.
         System.out.printf("%n[3] server-streaming search, batch of 4 queries%n");
         SearchRequest batch = searchRequest(indexId, randomVectors(dim, 4, rng), TOP_K);
-        Iterator<QueryResult> stream = blocking.searchStream(batch);
+        Iterator<QueryResult> stream = query.searchStream(batch);
         int streamed = 0;
         while (stream.hasNext()) {
             QueryResult qr = stream.next();
@@ -148,7 +150,7 @@ public final class TurboVecDemo {
             streamed++;
         }
 
-        blocking.dropIndex(DropIndexRequest.newBuilder().setIndexId(indexId).build());
+        admin.dropIndex(DropIndexRequest.newBuilder().setIndexId(indexId).build());
     }
 
     /**
@@ -159,7 +161,7 @@ public final class TurboVecDemo {
         int perFrame = Math.max(1, 3_000_000 / (dim * Float.BYTES));
         CompletableFuture<AddResponse> done = new CompletableFuture<>();
         StreamObserver<AddRequest> upload =
-                TurboVecGrpc.newStub(channel)
+                TurboVecAdminGrpc.newStub(channel)
                         .add(
                                 new StreamObserver<>() {
                                     @Override

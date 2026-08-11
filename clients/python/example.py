@@ -123,9 +123,12 @@ def main():
             print(f"    still searchable: {len(found)} neighbours")
 
 
-def _node_stub(channel):
-    """A node stub over an open channel."""
-    return turbovec_pb2_grpc.TurboVecStub(channel)
+def _node_stubs(channel):
+    """The separately authorizable node data and control plane stubs."""
+    return (
+        turbovec_pb2_grpc.TurboVecQueryStub(channel),
+        turbovec_pb2_grpc.TurboVecAdminStub(channel),
+    )
 
 
 def _ensure_index(address, dim):
@@ -136,10 +139,10 @@ def _ensure_index(address, dim):
     refuses as ambiguous.
     """
     with grpc.insecure_channel(_bare(address)) as channel:
-        stub = _node_stub(channel)
-        if stub.ListIndexes(turbovec_pb2.ListIndexesRequest()).indexes:
+        query, admin = _node_stubs(channel)
+        if query.ListIndexes(turbovec_pb2.ListIndexesRequest()).indexes:
             return
-        stub.CreateIndex(
+        admin.CreateIndex(
             turbovec_pb2.CreateIndexRequest(
                 dim=dim,
                 bit_width=BIT_WIDTH,
@@ -165,7 +168,8 @@ def _fill(address, index_id, vectors, dim):
             yield turbovec_pb2.AddRequest(index_id=index_id, dim=dim, vectors=flat)
 
     with grpc.insecure_channel(_bare(address)) as channel:
-        _node_stub(channel).Add(frames())
+        _, admin = _node_stubs(channel)
+        admin.Add(frames())
 
 
 def _bare(address):

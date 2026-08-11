@@ -43,8 +43,8 @@ except CollectionError as e:
         ...
 ```
 
-`search(..., allow_partial=True)` opts out of that for unreachable nodes only.
-It does not make a collection that does not add up servable.
+If any shard is unavailable, the coordinator fails the search. It never
+returns a partial ranking as if it were complete.
 
 ## Install
 
@@ -70,10 +70,11 @@ a coordinator first:
 
 ```bash
 # from the repo root, in three shells or with setsid
-TURBOVEC_GRPC_ADDR=127.0.0.1:51051 cargo run --release --bin turbovec-grpc
-TURBOVEC_GRPC_ADDR=127.0.0.1:51052 cargo run --release --bin turbovec-grpc
-TURBOVEC_GRPC_ADDR=127.0.0.1:51053 cargo run --release --bin turbovec-grpc
+TURBOVEC_ALLOW_EPHEMERAL=true TURBOVEC_GRPC_ADDR=127.0.0.1:51051 cargo run --release --bin turbovec-grpc
+TURBOVEC_ALLOW_EPHEMERAL=true TURBOVEC_GRPC_ADDR=127.0.0.1:51052 cargo run --release --bin turbovec-grpc
+TURBOVEC_ALLOW_EPHEMERAL=true TURBOVEC_GRPC_ADDR=127.0.0.1:51053 cargo run --release --bin turbovec-grpc
 
+TURBOVEC_ALLOW_EPHEMERAL=true \
 TURBOVEC_COORD_ADDR=127.0.0.1:51050 \
 TURBOVEC_COORD_NODES='127.0.0.1:51051,127.0.0.1:51052,127.0.0.1:51053' \
   cargo run --release --bin turbovec-coordinator
@@ -131,6 +132,9 @@ turbovec collection - connected to 127.0.0.1:51050
   a collection is what you search, and it is assembled out of indexes that
   already exist. `example.py` shows the node stub being used directly for the
   fill, alongside the collection handle for everything else.
+- **Durability.** The launch commands above explicitly use ephemeral mode to
+  keep the demo short. Production nodes and coordinators require durable data
+  and topology paths; see the repository deployment guide.
 - **This is not the `turbovec` pip package.** Those bindings embed an index in
   your process. This talks to a coordinator over the network, over a collection
   that may be larger than any one machine.

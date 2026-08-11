@@ -4,14 +4,14 @@
 //!   1. Connect to the server (`TURBOVEC_GRPC_ADDR`, default 127.0.0.1:50051).
 //!   2. Create an ID_MAP index (bit width 4).
 //!   3. Ingest 20,000 vectors over the client-streaming `Add` RPC, chunked
-//!      into frames well under the 4 MB gRPC message cap, and report the
+//!      into frames well under the 16 MiB gRPC message cap, and report the
 //!      ingest wall time and vectors/sec.
 //!   4. Run 500 unary top-10 searches and report QPS plus p50/p95/p99 latency.
 //!   5. Run one `SearchStream` batch of 4 queries and print per-query results.
 //!
-//! All client types (`TurboVecClient` and the request/response messages) come
+//! All client types and request/response messages come
 //! from the `turbovec-grpc` crate itself, generated from
-//! `proto/turbovec/v1/turbovec.proto` at build time — a Rust consumer needs
+//! `proto/turbovec/v1/turbovec.proto` at build time. A Rust consumer needs
 //! no protoc or codegen of its own, just the crate as a dependency.
 //!
 //! Run it:
@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 
 use tokio_stream::StreamExt;
 use tonic::transport::Endpoint;
-use turbovec_grpc::proto::turbo_vec_client::TurboVecClient;
+use turbovec_grpc::proto::turbo_vec_admin_client::TurboVecAdminClient;
+use turbovec_grpc::proto::turbo_vec_query_client::TurboVecQueryClient;
 use turbovec_grpc::proto::{AddRequest, CreateIndexRequest, IndexKind, SearchRequest};
 
 /// Deterministic pseudo-random-looking vector, so the example needs no RNG
@@ -56,11 +57,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channel = Endpoint::from_shared(format!("http://{addr}"))?
         .connect()
         .await?;
-    let mut client = TurboVecClient::new(channel);
+    let mut admin = TurboVecAdminClient::new(channel.clone());
+    let mut query = TurboVecQueryClient::new(channel);
     println!("connected to {addr}");
 
     // 1. Create an ID_MAP index with 4-bit quantization.
-    let created = client
+    let created = admin
         .create_index(CreateIndexRequest {
             dim: dim as u32,
             bit_width: 4,
@@ -78,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     // Collect the frames up front: tonic's streaming request must be 'static,
     // so a lazy iterator borrowing `index_id` will not do.
-    let frames: Vec<AddRequest> = (0..n)
+    let mut frames: Vec<AddRequest> = (0..n)
         .step_by(chunk)
         .map(|base| {
             let rows = chunk.min(n - base);
@@ -91,10 +93,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dim: dim as u32,
                 vectors,
                 ids: (base..base + rows).map(|i| i as u64).collect(),
+                ..Default::default()
             }
         })
         .collect();
-    let added = client.add(tokio_stream::iter(frames)).await?.into_inner();
+    if let Some(first) = frames.first_mut() {
+        first.operation_id = format!("rust-example-{index_id}");
+        first.expected_len = Some(0);
+        first.expected_rows = n as u64;
+    }
+    let added = admin.add(tokio_stream::iter(frames)).await?.into_inner();
     let ingest = start.elapsed();
     println!(
         "ingested {} vectors in {:.2?} ({:.0} vectors/sec)",
@@ -108,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // add pays the server's one-time cache build (rotation, codebook,
     // blocked layout), which belongs outside the timed window.
     for q in 0..50 {
-        client
+        query
             .search(SearchRequest {
                 index_id: index_id.clone(),
                 queries: vector(q % n, dim),
@@ -121,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     for q in 0..queries {
         let t = Instant::now();
-        client
+        query
             .search(SearchRequest {
                 index_id: index_id.clone(),
                 queries: vector(q % n, dim),
@@ -145,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Server-streaming search: one batch of 4 queries, one QueryResult
     // streamed back per query, in order.
     let batch: Vec<f32> = (0..4).flat_map(|q| vector(q * 7 + 1, dim)).collect();
-    let mut stream = client
+    let mut stream = query
         .search_stream(SearchRequest {
             index_id: index_id.clone(),
             queries: batch,
@@ -166,7 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 5. Release the handle.
-    client
+    admin
         .drop_index(turbovec_grpc::proto::DropIndexRequest { index_id })
         .await?;
     println!("done");

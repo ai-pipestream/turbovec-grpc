@@ -11,10 +11,9 @@ import grpc
 
 from ._stubs import coordinator_pb2, coordinator_pb2_grpc
 
-# Vector batches are large, and a Split or a Join moves a whole shard's codes
-# through the coordinator, so the default 4 MB limit is lifted to match the
-# servers'.
-_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
+# Match the bounded server frame limit. Split and Join stream fixed-size row
+# blocks, so neither side needs a whole-shard message allowance.
+_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 
 _CHANNEL_OPTIONS = [
     ("grpc.max_send_message_length", _MAX_MESSAGE_BYTES),
@@ -121,7 +120,7 @@ class Collection:
         if self._owns_channel:
             self._channel.close()
 
-    def search(self, vectors, k: int, allow_partial: bool = False):
+    def search(self, vectors, k: int):
         """Return the top ``k`` neighbours for each query vector.
 
         ``vectors`` is either one query as a flat sequence of floats, or a
@@ -132,16 +131,11 @@ class Collection:
         The results are the results one index holding every row in the
         collection would have returned, with the same scores to the bit. If any
         node cannot answer, this raises rather than returning a shorter list.
-        ``allow_partial`` opts out of that: the search then merges whatever
-        answered, and is still refused if the collection itself does not add up
-        or if nothing answered at all.
         """
         if k < 1:
             raise ValueError("k must be at least 1")
         queries, batched = _flatten(vectors)
-        request = coordinator_pb2.CollectionSearchRequest(
-            queries=queries, k=k, allow_partial=allow_partial
-        )
+        request = coordinator_pb2.CollectionSearchRequest(queries=queries, k=k)
         try:
             response = self._stub.Search(request)
         except grpc.RpcError as error:

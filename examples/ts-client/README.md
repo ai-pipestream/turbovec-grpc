@@ -21,7 +21,7 @@ halves concrete.
 Start the server (from the repo root):
 
 ```bash
-cargo run -p turbovec-grpc
+TURBOVEC_ALLOW_EPHEMERAL=true cargo run --bin turbovec-grpc
 ```
 
 It listens on `0.0.0.0:50051`; override with `TURBOVEC_GRPC_ADDR`.

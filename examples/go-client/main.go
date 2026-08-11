@@ -52,28 +52,29 @@ func main() {
 		fatal(err)
 	}
 	defer conn.Close()
-	client := pb.NewTurboVecClient(conn)
+	admin := pb.NewTurboVecAdminClient(conn)
+	query := pb.NewTurboVecQueryClient(conn)
 	ctx := context.Background()
 
 	fmt.Printf("turbovec-grpc demo — connected to %s\n", addr)
 
-	created, err := client.CreateIndex(ctx, &pb.CreateIndexRequest{
+	created, err := admin.CreateIndex(ctx, &pb.CreateIndexRequest{
 		Dim:      uint32(dim),
 		BitWidth: bitWidth,
 		Kind:     pb.IndexKind_INDEX_KIND_ID_MAP,
 	})
-	must("is the server up?  cargo run -p turbovec-grpc", err)
+	must("is the server up?  TURBOVEC_ALLOW_EPHEMERAL=true cargo run --bin turbovec-grpc", err)
 	indexID := created.GetIndexId()
 
 	fmt.Printf("\n[1] indexing %d vectors of dim %d at %d-bit\n", nVectors, dim, bitWidth)
 	start := time.Now()
-	added := streamVectors(ctx, client, indexID, nVectors, dim)
+	added := streamVectors(ctx, admin, indexID, nVectors, dim)
 	ingest := time.Since(start).Seconds()
 	wireMb := float64(nVectors*dim*4) / 1e6
 	fmt.Printf("    added %d in %.2fs  =  %.0f vectors/sec  (%.0f MB of raw float32 sent)\n",
 		added, ingest, float64(added)/ingest, wireMb)
 
-	info, err := client.GetIndexInfo(ctx, &pb.GetIndexInfoRequest{IndexId: indexID})
+	info, err := query.GetIndexInfo(ctx, &pb.GetIndexInfoRequest{IndexId: indexID})
 	must("", err)
 	fmt.Printf("    server reports %d vectors in the index\n", info.GetLen())
 
@@ -82,7 +83,7 @@ func main() {
 	fmt.Printf("\n[2] top-%d search, one query at a time\n", topK)
 	rng := rand.New(rand.NewSource(1234))
 	for i := 0; i < warmupQueries; i++ {
-		_, err := client.Search(ctx, &pb.SearchRequest{
+		_, err := query.Search(ctx, &pb.SearchRequest{
 			IndexId: indexID, Queries: randomVectors(dim, 1, rng), K: topK,
 		})
 		must("", err)
@@ -92,7 +93,7 @@ func main() {
 	for i := 0; i < nQueries; i++ {
 		req := &pb.SearchRequest{IndexId: indexID, Queries: randomVectors(dim, 1, rng), K: topK}
 		t0 := time.Now()
-		resp, err := client.Search(ctx, req)
+		resp, err := query.Search(ctx, req)
 		must("", err)
 		elapsed := time.Since(t0)
 		latencies = append(latencies, elapsed)
@@ -109,7 +110,7 @@ func main() {
 
 	// The server-streaming variant: neighbours arrive one query at a time.
 	fmt.Printf("\n[3] server-streaming search, batch of 4 queries\n")
-	stream, err := client.SearchStream(ctx, &pb.SearchRequest{
+	stream, err := query.SearchStream(ctx, &pb.SearchRequest{
 		IndexId: indexID, Queries: randomVectors(dim, 4, rng), K: topK,
 	})
 	must("", err)
@@ -124,22 +125,22 @@ func main() {
 
 	// A snowflake-scale id, round-tripped through an allowlist lookup.
 	bigID := uint64(1_861_392_837_450_923_417)
-	addOne(ctx, client, indexID, dim, bigID, rand.New(rand.NewSource(11)))
-	one, err := client.Search(ctx, &pb.SearchRequest{
+	addOne(ctx, admin, indexID, dim, bigID, rand.New(rand.NewSource(11)))
+	one, err := query.Search(ctx, &pb.SearchRequest{
 		IndexId: indexID, Queries: randomVectors(dim, 1, rng), K: 1, Allowlist: []uint64{bigID},
 	})
 	must("", err)
 	fmt.Printf("\n[4] uint64 ids: Go's uint64 is exact end to end — stored %d, server returned %d\n",
 		bigID, one.GetResults()[0].GetIds()[0])
 
-	if _, err := client.DropIndex(ctx, &pb.DropIndexRequest{IndexId: indexID}); err != nil {
+	if _, err := admin.DropIndex(ctx, &pb.DropIndexRequest{IndexId: indexID}); err != nil {
 		fatal(err)
 	}
 }
 
 // Client-streaming Add. Vectors are generated frame by frame and never all
 // held in memory at once. Frames stay under the server's 4 MB message limit.
-func streamVectors(ctx context.Context, client pb.TurboVecClient, indexID string, nVectors, dim int) uint64 {
+func streamVectors(ctx context.Context, client pb.TurboVecAdminClient, indexID string, nVectors, dim int) uint64 {
 	perFrame := max(1, 3_000_000/(dim*4))
 	upload, err := client.Add(ctx)
 	must("", err)
@@ -165,7 +166,7 @@ func streamVectors(ctx context.Context, client pb.TurboVecClient, indexID string
 }
 
 // addOne uploads a single vector under one external id.
-func addOne(ctx context.Context, client pb.TurboVecClient, indexID string, dim int, id uint64, rng *rand.Rand) {
+func addOne(ctx context.Context, client pb.TurboVecAdminClient, indexID string, dim int, id uint64, rng *rand.Rand) {
 	upload, err := client.Add(ctx)
 	must("", err)
 	must("", upload.Send(&pb.AddRequest{

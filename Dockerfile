@@ -1,28 +1,24 @@
-# Example Dockerfile for turbovec-grpc.
-#
-# This is a starting point for running the server in a container, not a
-# hardened production image: it runs as root, sets no resource limits, and
-# does no TLS termination. See docs/deployment.md before deploying for real.
-#
-# Build from the repo root (the workspace is the build context):
-#   docker build -f turbovec-grpc/Dockerfile -t turbovec-grpc .
-# Run:
-#   docker run --rm -p 50051:50051 turbovec-grpc
+FROM rust:1.89-bookworm AS build
 
-FROM rust:1-bookworm AS build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        protobuf-compiler libopenblas-dev \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-# The repo's .cargo/config.toml targets x86-64-v3, so the resulting binary
-# needs a Haswell-or-newer CPU at runtime — same as any local build.
-RUN cargo build --release -p turbovec-grpc
+RUN cargo build --release --locked --bins
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libopenblas0 \
-    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/turbovec \
+    && chown 65532:65532 /var/lib/turbovec
 COPY --from=build /src/target/release/turbovec-grpc /usr/local/bin/turbovec-grpc
-EXPOSE 50051
-ENTRYPOINT ["turbovec-grpc"]
+COPY --from=build /src/target/release/turbovec-coordinator /usr/local/bin/turbovec-coordinator
+
+USER 65532:65532
+VOLUME ["/var/lib/turbovec"]
+EXPOSE 50050 50051 9090
+ENV TURBOVEC_DATA_DIR=/var/lib/turbovec
+ENTRYPOINT ["/usr/local/bin/turbovec-grpc"]
