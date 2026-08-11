@@ -16,9 +16,9 @@ use tonic::transport::{Channel, Endpoint, Server};
 use turbovec_grpc::proto::coordinator_client::CoordinatorClient;
 use turbovec_grpc::proto::turbo_vec_client::TurboVecClient;
 use turbovec_grpc::proto::{
-    AddRequest, Calibration, CollectionSearchRequest, CreateIndexRequest, ExportRowsRequest,
-    ImportRowsRequest, IndexKind, JoinRequest, RowBlock, SearchRequest, SetCalibrationRequest,
-    ShardRef, SplitRequest,
+    import_rows_request, AddRequest, Calibration, CollectionSearchRequest, CreateIndexRequest,
+    ExportRowsRequest, ImportRowsRequest, ImportRowsStart, IndexKind, JoinRequest, RowBlock,
+    SearchRequest, SetCalibrationRequest, ShardRef, SplitRequest,
 };
 use turbovec_grpc::{CoordinatorService, IndexStore, NodeTable, ShardConfig, TurboVecService};
 
@@ -35,6 +35,35 @@ const ROWS: usize = 600;
 /// Neighbours asked for. Comfortably smaller than any one shard, so every
 /// shard is a real contributor to the merge rather than being exhausted.
 const K: u32 = 12;
+
+fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+    std::fs::create_dir_all(target).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let destination = target.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &destination);
+        } else {
+            std::fs::copy(entry.path(), destination).unwrap();
+        }
+    }
+}
+
+fn import_stream(
+    expected_rows: u64,
+    blocks: Vec<RowBlock>,
+) -> impl tokio_stream::Stream<Item = ImportRowsRequest> {
+    let mut frames = Vec::with_capacity(blocks.len() + 1);
+    frames.push(ImportRowsRequest {
+        payload: Some(import_rows_request::Payload::Start(ImportRowsStart {
+            expected_rows,
+        })),
+    });
+    frames.extend(blocks.into_iter().map(|block| ImportRowsRequest {
+        payload: Some(import_rows_request::Payload::Block(block)),
+    }));
+    tokio_stream::iter(frames)
+}
 
 /// A tiny linear congruential generator, so the corpora are deterministic and
 /// the test needs no RNG dependency. The constants are Numerical Recipes'.
@@ -55,12 +84,21 @@ impl Lcg {
 
 /// Start a node server on a loopback ephemeral port; returns its address.
 async fn start_node() -> String {
+    start_node_with_store(IndexStore::new()).await
+}
+
+async fn start_node_with_store(store: IndexStore) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let service = TurboVecService::new(IndexStore::new()).into_server();
+    let service = TurboVecService::new(store);
+    let compatibility = service.clone().into_server();
+    let query = service.clone().into_query_server();
+    let admin = service.into_admin_server();
     tokio::spawn(async move {
         Server::builder()
-            .add_service(service)
+            .add_service(compatibility)
+            .add_service(query)
+            .add_service(admin)
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -70,9 +108,21 @@ async fn start_node() -> String {
 
 /// Start a coordinator over `table`; returns a connected client.
 async fn start_coordinator(table: NodeTable) -> CoordinatorClient<Channel> {
+    start_coordinator_service(CoordinatorService::new(table)).await
+}
+
+/// Start a coordinator whose topology generations are persisted at `path`.
+async fn start_persistent_coordinator(
+    table: NodeTable,
+    path: &std::path::Path,
+) -> CoordinatorClient<Channel> {
+    start_coordinator_service(CoordinatorService::with_state_file(table, path).unwrap()).await
+}
+
+async fn start_coordinator_service(service: CoordinatorService) -> CoordinatorClient<Channel> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let service = CoordinatorService::new(table).into_server();
+    let service = service.into_server();
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)
@@ -142,6 +192,7 @@ async fn build_monolith(address: &str, pair: &(Vec<f32>, Vec<f32>)) -> (String, 
             dim: DIM as u32,
             vectors: corpus.clone(),
             ids: Vec::new(),
+            ..Default::default()
         }]))
         .await
         .unwrap()
@@ -195,16 +246,10 @@ async fn distributed_ranking(
         .search(CollectionSearchRequest {
             queries: queries.to_vec(),
             k: K,
-            allow_partial: false,
         })
         .await
         .unwrap()
         .into_inner();
-    assert!(
-        !response.partial,
-        "a complete search must never report itself partial"
-    );
-    assert!(response.failures.is_empty());
     response
         .results
         .into_iter()
@@ -273,9 +318,24 @@ fn assert_same_ranking(monolithic: &[Ranking], distributed: &[Ranking], label: &
 /// comparison rather than being carried forward.
 #[tokio::test]
 async fn split_search_join_all_equal_the_monolithic_index() {
-    let nodes = [start_node().await, start_node().await, start_node().await];
+    let node_root = std::env::temp_dir().join(format!(
+        "turbovec-distributed-nodes-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let nodes = [
+        start_node_with_store(IndexStore::open(node_root.join("node-0")).unwrap()).await,
+        start_node_with_store(IndexStore::open(node_root.join("node-1")).unwrap()).await,
+        start_node_with_store(IndexStore::open(node_root.join("node-2")).unwrap()).await,
+    ];
     let pair = fit_pair(7);
     let (monolith_id, _corpus) = build_monolith(&nodes[0], &pair).await;
+    node_client(&nodes[0])
+        .await
+        .flush(turbovec_grpc::proto::FlushRequest {
+            index_id: monolith_id.clone(),
+        })
+        .await
+        .unwrap();
 
     // Four queries, none of them drawn from the corpus, so the rankings are
     // not a set of exact hits that any implementation would get right.
@@ -286,11 +346,17 @@ async fn split_search_join_all_equal_the_monolithic_index() {
     }
 
     // The collection starts as the single monolithic shard.
-    let mut coordinator = start_coordinator(NodeTable::new(vec![ShardConfig::with_index(
+    let initial_table = NodeTable::new(vec![ShardConfig::with_index_generation(
         &nodes[0],
         &monolith_id,
-    )]))
-    .await;
+        Some(1),
+    )]);
+    let topology_root = std::env::temp_dir().join(format!(
+        "turbovec-coordinator-topology-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let topology_path = topology_root.join("topology.json");
+    let mut coordinator = start_persistent_coordinator(initial_table.clone(), &topology_path).await;
 
     // One shard is still a collection, and searching it must already agree.
     assert_same_ranking(
@@ -327,6 +393,23 @@ async fn split_search_join_all_equal_the_monolithic_index() {
         "split across three nodes",
     );
 
+    // A fresh coordinator process given the original startup table must load
+    // the activated split topology instead of silently reverting to the old
+    // monolithic shard.
+    let mut restarted = start_persistent_coordinator(initial_table.clone(), &topology_path).await;
+    let listed_after_restart = restarted
+        .list_nodes(turbovec_grpc::proto::ListNodesRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed_after_restart.topology_generation, 2);
+    assert_eq!(listed_after_restart.shards.len(), 3);
+    assert_same_ranking(
+        &expected,
+        &distributed_ranking(&mut restarted, &queries).await,
+        "split topology after coordinator restart",
+    );
+
     // Every row now lives on a shard that is not the one it was added to, and
     // every result still names it by the id it had in the monolithic index.
     // That is what makes the comparison above a comparison of rows rather than
@@ -335,7 +418,6 @@ async fn split_search_join_all_equal_the_monolithic_index() {
         .search(CollectionSearchRequest {
             queries: queries.clone(),
             k: K,
-            allow_partial: false,
         })
         .await
         .unwrap()
@@ -401,6 +483,7 @@ async fn split_search_join_all_equal_the_monolithic_index() {
         &distributed_ranking(&mut coordinator, &queries).await,
         "split again after the join",
     );
+    std::fs::remove_dir_all(topology_root).unwrap();
 }
 
 /// The coordinator fits one pair and every shard ends up holding it.
@@ -489,7 +572,6 @@ async fn mixed_calibration_is_refused_by_name() {
         .search(CollectionSearchRequest {
             queries: Lcg(5).rows(1),
             k: K,
-            allow_partial: false,
         })
         .await
         .unwrap_err();
@@ -511,18 +593,6 @@ async fn mixed_calibration_is_refused_by_name() {
         "join said: {}",
         join.message()
     );
-
-    // `allow_partial` is about unreachable nodes, not about serving a
-    // collection that does not add up: it must not open a back door here.
-    let partial = coordinator
-        .search(CollectionSearchRequest {
-            queries: Lcg(5).rows(1),
-            k: K,
-            allow_partial: true,
-        })
-        .await
-        .unwrap_err();
-    assert!(partial.message().starts_with("mixed_calibration:"));
 }
 
 /// Two shards of different width are refused, by name, for both search and
@@ -535,7 +605,6 @@ async fn dimension_mismatch_is_refused_by_name() {
         .search(CollectionSearchRequest {
             queries: Lcg(6).rows(1),
             k: K,
-            allow_partial: false,
         })
         .await
         .unwrap_err();
@@ -656,10 +725,9 @@ async fn split_refuses_an_unreadable_source_and_a_plan_that_does_not_add_up() {
     assert_eq!(listed.rows, ROWS as u64);
 }
 
-/// A node that has gone away fails the search rather than shortening it, and
-/// the opt-in that allows a short result says so in the response.
+/// A node that has gone away fails the search rather than shortening it.
 #[tokio::test]
-async fn an_unreachable_shard_fails_the_search_unless_partial_is_asked_for() {
+async fn an_unreachable_shard_fails_the_search() {
     let nodes = [start_node().await, start_node().await];
     let pair = fit_pair(7);
     let (monolith_id, _corpus) = build_monolith(&nodes[0], &pair).await;
@@ -697,7 +765,6 @@ async fn an_unreachable_shard_fails_the_search_unless_partial_is_asked_for() {
         .search(CollectionSearchRequest {
             queries: queries.clone(),
             k: K,
-            allow_partial: false,
         })
         .await
         .unwrap_err();
@@ -707,21 +774,50 @@ async fn an_unreachable_shard_fails_the_search_unless_partial_is_asked_for() {
         refused.message()
     );
 
-    // Even asked for explicitly, a partial search is still refused here: the
-    // collection could not be bound at all, so there is no calibration to
-    // merge the survivors under.
-    let still_refused = with_dead
+    // The healthy collection is unaffected by any of that.
+    assert_eq!(whole.len(), 2);
+}
+
+#[tokio::test]
+async fn a_replica_is_used_only_at_the_required_generation() {
+    let root = std::env::temp_dir().join(format!("turbovec-replica-{}", uuid::Uuid::new_v4()));
+    let primary_root = root.join("primary");
+    let replica_root = root.join("replica");
+    let primary = start_node_with_store(IndexStore::open(&primary_root).unwrap()).await;
+    let pair = fit_pair(71);
+    let (index_id, _corpus) = build_monolith(&primary, &pair).await;
+    let queries = Lcg(810).rows(2);
+    let expected = monolithic_ranking(&primary, &index_id, &queries).await;
+    node_client(&primary)
+        .await
+        .flush(turbovec_grpc::proto::FlushRequest {
+            index_id: index_id.clone(),
+        })
+        .await
+        .unwrap();
+    copy_tree(&primary_root, &replica_root);
+    let replica = start_node_with_store(IndexStore::open(&replica_root).unwrap()).await;
+
+    let mut shard = ShardConfig::with_index_generation("http://127.0.0.1:1", &index_id, Some(1));
+    shard.replicas.push(replica.clone());
+    let mut coordinator = start_coordinator(NodeTable::new(vec![shard])).await;
+    assert_same_ranking(
+        &expected,
+        &distributed_ranking(&mut coordinator, &queries).await,
+        "generation-safe replica failover",
+    );
+    let mut stale = ShardConfig::with_index_generation("http://127.0.0.1:1", &index_id, Some(2));
+    stale.replicas.push(replica);
+    let mut stale_coordinator = start_coordinator(NodeTable::new(vec![stale])).await;
+    let refused = stale_coordinator
         .search(CollectionSearchRequest {
             queries: queries.clone(),
             k: K,
-            allow_partial: true,
         })
         .await
         .unwrap_err();
-    assert!(still_refused.message().starts_with("node_unreachable:"));
-
-    // The healthy collection is unaffected by any of that.
-    assert_eq!(whole.len(), 2);
+    assert!(refused.message().starts_with("node_unreachable:"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// The node-level guards Join leans on, checked directly: two blocks that
@@ -748,11 +844,12 @@ async fn import_rows_refuses_blocks_that_disagree() {
             dim: DIM as u32,
             vectors: Lcg(3).rows(64),
             ids: Vec::new(),
+            ..Default::default()
         }]))
         .await
         .unwrap();
 
-    let block = client
+    let mut exported = client
         .export_rows(ExportRowsRequest {
             index_id: index_id.clone(),
             start: 0,
@@ -761,9 +858,33 @@ async fn import_rows_refuses_blocks_that_disagree() {
         .await
         .unwrap()
         .into_inner();
+    let block = exported.message().await.unwrap().unwrap();
+    assert!(exported.message().await.unwrap().is_none());
     assert_eq!(block.rows, 64);
     assert_eq!(block.labels, (0..64u64).collect::<Vec<_>>());
     assert_eq!(block.tqplus_shift, pair.0);
+
+    // A truncated stream cannot publish a plausible short shard.
+    let before = client
+        .list_indexes(turbovec_grpc::proto::ListIndexesRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .indexes
+        .len();
+    let refused = client
+        .import_rows(import_stream(65, vec![block.clone()]))
+        .await
+        .unwrap_err();
+    assert!(refused.message().starts_with("row_count_mismatch:"));
+    let after = client
+        .list_indexes(turbovec_grpc::proto::ListIndexesRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .indexes
+        .len();
+    assert_eq!(after, before, "a failed import must not activate an index");
 
     // A second block under a different pair.
     let other = fit_pair(2);
@@ -773,9 +894,7 @@ async fn import_rows_refuses_blocks_that_disagree() {
         ..block.clone()
     };
     let refused = client
-        .import_rows(ImportRowsRequest {
-            blocks: vec![block.clone(), mismatched],
-        })
+        .import_rows(import_stream(128, vec![block.clone(), mismatched]))
         .await
         .unwrap_err();
     assert!(
@@ -790,9 +909,7 @@ async fn import_rows_refuses_blocks_that_disagree() {
         ..block.clone()
     };
     let refused = client
-        .import_rows(ImportRowsRequest {
-            blocks: vec![block.clone(), wider],
-        })
+        .import_rows(import_stream(128, vec![block.clone(), wider]))
         .await
         .unwrap_err();
     assert!(
@@ -804,9 +921,7 @@ async fn import_rows_refuses_blocks_that_disagree() {
     // An imported index carries labels, and refuses to take further rows,
     // because there would be no id to give them.
     let imported = client
-        .import_rows(ImportRowsRequest {
-            blocks: vec![block],
-        })
+        .import_rows(import_stream(64, vec![block]))
         .await
         .unwrap()
         .into_inner();
@@ -817,6 +932,7 @@ async fn import_rows_refuses_blocks_that_disagree() {
             dim: DIM as u32,
             vectors: Lcg(4).rows(1),
             ids: Vec::new(),
+            ..Default::default()
         }]))
         .await
         .unwrap_err();

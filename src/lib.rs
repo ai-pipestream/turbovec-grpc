@@ -40,14 +40,30 @@ pub mod proto {
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("turbovec_v1");
 }
 
+pub mod config;
 pub mod coordinator;
 pub mod errors;
+pub mod observability;
 pub mod service;
 pub mod store;
 
-pub use coordinator::{CoordinatorService, NodeTable, ShardConfig};
-pub use service::TurboVecService;
+pub use coordinator::{CoordinatorLimits, CoordinatorService, NodeTable, ShardConfig};
+pub use observability::Metrics;
+pub use service::{ServiceLimits, TurboVecService};
 pub use store::{Index, IndexStore};
+
+/// Install JSON structured logging controlled by `RUST_LOG`.
+pub fn init_tracing(service: &'static str) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .with_current_span(true)
+        .with_span_list(false)
+        .init();
+    tracing::info!(service, "structured logging initialized");
+}
 
 /// Resolve when the process receives Ctrl-C or SIGTERM, so in-flight work can
 /// drain instead of being cut off mid-response. Shared by both binaries.

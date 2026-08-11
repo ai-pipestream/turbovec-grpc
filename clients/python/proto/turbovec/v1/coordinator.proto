@@ -46,7 +46,7 @@ service Coordinator {
   //
   // Fails, by name, if any shard is unreachable or incomplete, or if the
   // shards do not share one calibration pair. A short result set is never
-  // returned as if it were complete; see `allow_partial` for the opt-in.
+  // returned as if it were complete.
   rpc Search(CollectionSearchRequest) returns (CollectionSearchResponse);
 
   // Fits one TQ+ calibration from a caller-supplied sample and commits
@@ -124,6 +124,9 @@ message ListNodesResponse {
 
   // Total rows across the collection, when servable.
   uint64 rows = 4;
+
+  // Atomic topology generation this table belongs to.
+  uint64 topology_generation = 5;
 }
 
 // CollectionSearchRequest is a top-k search over the whole collection.
@@ -135,12 +138,7 @@ message CollectionSearchRequest {
   // Number of neighbours to return per query, across the collection.
   uint32 k = 2;
 
-  // Opt in to a result merged from the shards that answered, when some
-  // shard fails. Off by default: a top-k missing a shard is not a top-k,
-  // and returning one as if it were complete is the failure mode this
-  // layer exists to avoid. When it is on and a shard did fail, the
-  // response says so in `partial` and names every shard that dropped out.
-  bool allow_partial = 3;
+  reserved 3;
 }
 
 // Neighbour is one result row, identified without reference to sharding.
@@ -174,27 +172,16 @@ message CollectionQueryResult {
   repeated Neighbour neighbours = 1;
 }
 
-// ShardFailure names a shard that dropped out of a partial search.
-message ShardFailure {
-  // The shard that failed.
-  ShardRef shard = 1;
-
-  // The failure, in the node's own words.
-  string error = 2;
-}
-
 // CollectionSearchResponse returns one result per query, in query order.
 message CollectionSearchResponse {
   // Results, aligned with the input queries.
   repeated CollectionQueryResult results = 1;
 
-  // True when `allow_partial` was set and at least one shard did drop
-  // out, so these results are a top-k over part of the collection. False
-  // on every complete search.
-  bool partial = 2;
+  reserved 2, 3;
 
-  // The shards that dropped out. Empty unless `partial`.
-  repeated ShardFailure failures = 3;
+  // Topology generation searched. In-flight requests may finish on the old
+  // generation while an administrative rebind activates the next one.
+  uint64 topology_generation = 4;
 }
 
 // FitCalibrationRequest carries the sample to fit the collection's pair
@@ -225,6 +212,8 @@ message FitCalibrationResponse {
 
   // Shards the pair was committed to, in shard order.
   repeated ShardRef shards = 2;
+
+  uint64 topology_generation = 3;
 }
 
 // SplitRequest describes a redistribution of one index's rows.
@@ -254,6 +243,8 @@ message SplitResponse {
 
   // The calibration pair the rows moved under, unchanged from the source.
   Calibration calibration = 3;
+
+  uint64 topology_generation = 4;
 }
 
 // JoinRequest describes a consolidation of several indexes into one.
@@ -278,4 +269,6 @@ message JoinResponse {
   // The calibration pair the rows moved under, unchanged from the
   // sources'.
   Calibration calibration = 3;
+
+  uint64 topology_generation = 4;
 }

@@ -22,8 +22,7 @@
 //!   scores is not a worse ranking, it is a ranking of nothing.
 //! - A shard that fails mid-query fails the search. A top-k missing a shard
 //!   is a plausible answer to a question nobody asked, and it is the failure
-//!   this layer exists to make impossible. `allow_partial` opts into it
-//!   explicitly, and the response then says so and names what dropped out.
+//!   this layer exists to make impossible.
 //! - Split and Join move encoded codes, never vectors, so neither one
 //!   re-encodes a row and neither one can drift from the source.
 //!
@@ -38,10 +37,12 @@ pub mod nodes;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{mpsc, watch};
+use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 use turbovec::TurboQuantIndex;
@@ -50,15 +51,17 @@ use crate::errors::{
     self, AMBIGUOUS_INDEX, BIT_WIDTH_MISMATCH, DIMENSION_MISMATCH, EMPTY_COLLECTION,
     MIXED_CALIBRATION, NODE_UNREACHABLE, ROW_COUNT_MISMATCH,
 };
+use crate::observability::Metrics;
 use crate::proto::coordinator_server::{Coordinator, CoordinatorServer};
-use crate::proto::turbo_vec_client::TurboVecClient;
+use crate::proto::turbo_vec_admin_client::TurboVecAdminClient;
+use crate::proto::turbo_vec_query_client::TurboVecQueryClient;
 use crate::proto::{
     Calibration, CollectionQueryResult, CollectionSearchRequest, CollectionSearchResponse,
-    ExportRowsRequest, FitCalibrationRequest, FitCalibrationResponse, GetCalibrationRequest,
-    GetIndexInfoRequest, ImportRowsRequest, IndexInfo, JoinRequest, JoinResponse,
-    ListIndexesRequest, ListNodesRequest, ListNodesResponse, Neighbour, QueryResult, RowBlock,
-    SearchRequest, SetCalibrationRequest, ShardFailure, ShardRef, ShardStatus, SplitRequest,
-    SplitResponse, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
+    ExportRowsRequest, FitCalibrationRequest, FitCalibrationResponse, FlushRequest,
+    GetCalibrationRequest, GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse,
+    ImportRowsStart, IndexInfo, JoinRequest, JoinResponse, ListIndexesRequest, ListNodesRequest,
+    ListNodesResponse, Neighbour, RowBlock, SetCalibrationRequest, ShardRef, ShardStatus,
+    SplitRequest, SplitResponse, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
 };
 use crate::service::calibration_difference;
 
@@ -67,21 +70,77 @@ pub use nodes::{NodeTable, ShardConfig};
 /// Frame limit for a message between the coordinator and a node. Row blocks
 /// carry a whole shard's codes, which is the largest thing on this wire by a
 /// wide margin, so it matches the node binary's own limit.
-const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Coordinator-side request limits.
+#[derive(Clone, Debug)]
+pub struct CoordinatorLimits {
+    pub max_k: usize,
+    pub max_queries_per_request: usize,
+    pub max_concurrent_queries: usize,
+    pub query_timeout: Duration,
+}
+
+impl Default for CoordinatorLimits {
+    fn default() -> Self {
+        Self {
+            max_k: 1_000,
+            max_queries_per_request: 64,
+            max_concurrent_queries: 4,
+            query_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl CoordinatorLimits {
+    pub fn from_env() -> Result<Self, String> {
+        let defaults = Self::default();
+        let timeout_ms = crate::config::positive_usize(
+            "TURBOVEC_QUERY_TIMEOUT_MS",
+            defaults.query_timeout.as_millis() as usize,
+        )?;
+        Ok(Self {
+            max_k: crate::config::positive_usize("TURBOVEC_MAX_K", defaults.max_k)?,
+            max_queries_per_request: crate::config::positive_usize(
+                "TURBOVEC_MAX_QUERIES",
+                defaults.max_queries_per_request,
+            )?,
+            max_concurrent_queries: crate::config::positive_usize(
+                "TURBOVEC_MAX_CONCURRENT_QUERIES",
+                defaults.max_concurrent_queries,
+            )?,
+            query_timeout: Duration::from_millis(timeout_ms as u64),
+        })
+    }
+}
 
 /// gRPC implementation of `turbovec.v1.Coordinator`.
+#[derive(Clone)]
 pub struct CoordinatorService {
-    /// The configured shards, replaced wholesale by Split and Join.
-    table: RwLock<Vec<ShardConfig>>,
+    /// The active topology generation and its shards, replaced atomically by
+    /// Split and Join.
+    topology: Arc<RwLock<Topology>>,
+
+    /// Optional durable topology state file. When configured, a new
+    /// generation is fsynced here before it becomes active in memory.
+    topology_path: Option<PathBuf>,
 
     /// The bound collection, or `None` when it has yet to be established or
     /// has been invalidated by a rebind.
-    pinned: Mutex<Option<Arc<Pinned>>>,
+    pinned: Arc<Mutex<Option<Arc<Pinned>>>>,
 
     /// Lazily dialled channels, one per node address. A `Channel` is a handle
     /// to a connection pool that reconnects on its own, so caching one per
     /// address costs nothing and saves a dial per call.
-    channels: Mutex<HashMap<String, Channel>>,
+    channels: Arc<Mutex<HashMap<String, Channel>>>,
+
+    limits: CoordinatorLimits,
+    metrics: Metrics,
+}
+
+struct Topology {
+    generation: u64,
+    shards: Vec<ShardConfig>,
 }
 
 /// One shard as the coordinator found it on the node.
@@ -100,8 +159,17 @@ struct Probe {
     calibration: Calibration,
 }
 
+struct ExportPlan {
+    source: Probe,
+    start: u64,
+    count: u64,
+}
+
 /// A collection that has been probed and found servable.
 struct Pinned {
+    /// Topology generation this binding was built from.
+    generation: u64,
+
     /// The shards, in table order.
     shards: Vec<Probe>,
 
@@ -125,8 +193,6 @@ struct Pinned {
 struct HeapCandidate {
     score: f32,
     shard_rank: usize,
-    address: String,
-    index_id: String,
     slot: u64,
     label: Option<u64>,
 }
@@ -170,13 +236,114 @@ enum StreamEvent {
     },
 }
 
+struct ShardControl {
+    sender: watch::Sender<StreamSearchRequest>,
+    completed: bool,
+}
+
+impl Drop for ShardControl {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.sender.send_replace(StreamSearchRequest {
+                payload: Some(crate::proto::stream_search_request::Payload::Stop(
+                    crate::proto::StopStreamSearch {},
+                )),
+            });
+        }
+    }
+}
+
 impl CoordinatorService {
     /// Create the service over a configured node table.
     pub fn new(table: NodeTable) -> Self {
+        Self::with_limits(table, CoordinatorLimits::default())
+    }
+
+    pub fn with_limits(table: NodeTable, limits: CoordinatorLimits) -> Self {
+        Self::with_limits_and_metrics(table, limits, Metrics::default())
+    }
+
+    pub fn with_limits_and_metrics(
+        table: NodeTable,
+        limits: CoordinatorLimits,
+        metrics: Metrics,
+    ) -> Self {
+        Self::from_topology(1, table, None, limits, metrics)
+    }
+
+    /// Create a coordinator whose topology survives restart. An existing
+    /// state file wins over startup nodes; an absent one is seeded at
+    /// generation 1 before the service starts.
+    pub fn with_state_file(table: NodeTable, path: impl Into<PathBuf>) -> Result<Self, String> {
+        Self::with_state_file_and_limits(table, path, CoordinatorLimits::default())
+    }
+
+    pub fn with_state_file_and_limits(
+        table: NodeTable,
+        path: impl Into<PathBuf>,
+        limits: CoordinatorLimits,
+    ) -> Result<Self, String> {
+        Self::with_state_file_limits_and_metrics(table, path, limits, Metrics::default())
+    }
+
+    pub fn with_state_file_limits_and_metrics(
+        table: NodeTable,
+        path: impl Into<PathBuf>,
+        limits: CoordinatorLimits,
+        metrics: Metrics,
+    ) -> Result<Self, String> {
+        let path = path.into();
+        let (generation, table) = nodes::load_or_initialize(&path, &table)?;
+        if table
+            .shards
+            .iter()
+            .any(|shard| shard.required_generation.is_none())
+        {
+            return Err(format!(
+                "durable topology {} requires an index id and generation for every shard",
+                path.display()
+            ));
+        }
+        Ok(Self::from_topology(
+            generation,
+            table,
+            Some(path),
+            limits,
+            metrics,
+        ))
+    }
+
+    fn from_topology(
+        generation: u64,
+        table: NodeTable,
+        topology_path: Option<PathBuf>,
+        limits: CoordinatorLimits,
+        metrics: Metrics,
+    ) -> Self {
+        assert!(limits.max_k > 0, "max_k must be positive");
+        assert!(
+            limits.max_queries_per_request > 0,
+            "max_queries_per_request must be positive"
+        );
+        assert!(
+            limits.max_concurrent_queries > 0,
+            "max_concurrent_queries must be positive"
+        );
+        assert!(
+            !limits.query_timeout.is_zero(),
+            "query_timeout must be positive"
+        );
+        metrics.set_topology_generation(generation);
         Self {
-            table: RwLock::new(table.shards),
-            pinned: Mutex::new(None),
-            channels: Mutex::new(HashMap::new()),
+            topology: Arc::new(RwLock::new(Topology {
+                generation,
+                shards: table.shards,
+            })),
+            topology_path,
+            pinned: Arc::new(Mutex::new(None)),
+            channels: Arc::new(Mutex::new(HashMap::new())),
+            limits,
+            metrics,
         }
     }
 
@@ -185,12 +352,32 @@ impl CoordinatorService {
         CoordinatorServer::new(self)
     }
 
+    /// Active topology generation and shard table, for startup diagnostics.
+    pub fn topology_snapshot(&self) -> (u64, NodeTable) {
+        let (generation, shards) = self.topology();
+        (generation, NodeTable::new(shards))
+    }
+
+    pub async fn ready(&self) -> bool {
+        let (generation, table) = self.topology();
+        let probes = self.probe_all(&table).await;
+        if probes.iter().any(Result::is_err) {
+            return false;
+        }
+        bind(generation, probes.into_iter().map(Result::unwrap).collect()).is_ok()
+    }
+
     /// The configured shards, copied out from under the lock.
-    fn table(&self) -> Vec<ShardConfig> {
-        self.table
+    fn topology(&self) -> (u64, Vec<ShardConfig>) {
+        let topology = self
+            .topology
             .read()
-            .expect("coordinator node table lock poisoned")
-            .clone()
+            .expect("coordinator topology lock poisoned");
+        (topology.generation, topology.shards.clone())
+    }
+
+    fn table(&self) -> Vec<ShardConfig> {
+        self.topology().1
     }
 
     /// Replace the shard table and drop the binding built from the old one.
@@ -198,19 +385,33 @@ impl CoordinatorService {
     /// Split and Join both end here. Neither reshapes a collection in place:
     /// they build the new shards, and only once every one of them exists does
     /// the collection start pointing at them.
-    fn rebind(&self, shards: Vec<ShardConfig>) {
-        *self
-            .table
+    fn rebind(&self, shards: Vec<ShardConfig>) -> Result<u64, Status> {
+        let mut topology = self
+            .topology
             .write()
-            .expect("coordinator node table lock poisoned") = shards;
+            .expect("coordinator topology lock poisoned");
+        let generation = topology
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Status::internal("topology generation counter overflow"))?;
+        if let Some(path) = self.topology_path.as_deref() {
+            nodes::persist_topology(path, generation, &shards).map_err(|e| {
+                Status::internal(format!("persist topology generation {generation}: {e}"))
+            })?;
+        }
+        topology.generation = generation;
+        topology.shards = shards;
+        drop(topology);
+        self.metrics.set_topology_generation(generation);
         *self
             .pinned
             .lock()
             .expect("coordinator binding lock poisoned") = None;
+        Ok(generation)
     }
 
     /// A client for one node address, dialled lazily and cached.
-    fn client(&self, address: &str) -> Result<TurboVecClient<Channel>, Status> {
+    fn channel(&self, address: &str) -> Result<Channel, Status> {
         let mut cache = self
             .channels
             .lock()
@@ -225,7 +426,9 @@ impl CoordinatorService {
                             format!("node address {address} is not a valid endpoint: {e}"),
                         )
                     })?
-                    .tcp_nodelay(true);
+                    .tcp_nodelay(true)
+                    .connect_timeout(Duration::from_secs(2))
+                    .timeout(Duration::from_secs(5));
                 // Lazy: the connection is made on the first call, so a
                 // coordinator starts with nodes still coming up and reports
                 // them through ListNodes rather than refusing to boot.
@@ -234,7 +437,17 @@ impl CoordinatorService {
                 channel
             }
         };
-        Ok(TurboVecClient::new(channel)
+        Ok(channel)
+    }
+
+    fn query_client(&self, address: &str) -> Result<TurboVecQueryClient<Channel>, Status> {
+        Ok(TurboVecQueryClient::new(self.channel(address)?)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES))
+    }
+
+    fn admin_client(&self, address: &str) -> Result<TurboVecAdminClient<Channel>, Status> {
+        Ok(TurboVecAdminClient::new(self.channel(address)?)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES))
     }
@@ -250,25 +463,24 @@ impl CoordinatorService {
         let event_capacity = (pinned.shards.len() * 4).max(16);
         let (event_tx, mut event_rx) = mpsc::channel(event_capacity);
         let mut outbound = Vec::with_capacity(pinned.shards.len());
+        let request_id = uuid::Uuid::new_v4().to_string();
 
         for (shard_rank, shard) in pinned.shards.iter().enumerate() {
-            let mut client = self.client(&shard.address)?;
-            let (request_tx, request_rx) = mpsc::channel(8);
-            request_tx
-                .send(StreamSearchRequest {
-                    payload: Some(crate::proto::stream_search_request::Payload::Start(
-                        StartStreamSearch {
-                            index_id: shard.index_id.clone(),
-                            vector: vector.clone(),
-                            initial_floor: None,
-                            request_id: uuid::Uuid::new_v4().to_string(),
-                        },
-                    )),
-                })
-                .await
-                .map_err(|_| Status::internal("cannot start shard request stream"))?;
+            let mut client = self.query_client(&shard.address)?;
+            let (request_tx, request_rx) = watch::channel(StreamSearchRequest {
+                payload: Some(crate::proto::stream_search_request::Payload::Start(
+                    StartStreamSearch {
+                        index_id: shard.index_id.clone(),
+                        vector: vector.clone(),
+                        initial_floor: None,
+                        request_id: request_id.clone(),
+                    },
+                )),
+            });
+            let mut shard_request = Request::new(WatchStream::new(request_rx));
+            shard_request.set_timeout(self.limits.query_timeout);
             let mut responses = client
-                .stream_search(ReceiverStream::new(request_rx))
+                .stream_search(shard_request)
                 .await
                 .map_err(|status| node_error(&shard.address, &status))?
                 .into_inner();
@@ -301,7 +513,10 @@ impl CoordinatorService {
                     }
                 }
             });
-            outbound.push(Some(request_tx));
+            outbound.push(Some(ShardControl {
+                sender: request_tx,
+                completed: false,
+            }));
         }
         drop(event_tx);
 
@@ -349,8 +564,6 @@ impl CoordinatorService {
                             let candidate = HeapCandidate {
                                 score,
                                 shard_rank,
-                                address: shard.address.clone(),
-                                index_id: shard.index_id.clone(),
                                 slot,
                                 label: labelled.then(|| batch.labels[rank]),
                             };
@@ -373,23 +586,14 @@ impl CoordinatorService {
                                     sender
                                         .as_ref()
                                         .expect("incomplete shard retains its request stream")
-                                        .send(StreamSearchRequest {
+                                        .sender
+                                        .send_replace(StreamSearchRequest {
                                             payload: Some(
                                                 crate::proto::stream_search_request::Payload::FloorUpdate(
                                                     crate::proto::FloorUpdate { floor },
                                                 ),
                                             ),
-                                        })
-                                        .await
-                                        .map_err(|_| {
-                                            errors::unavailable(
-                                                NODE_UNREACHABLE,
-                                                format!(
-                                                    "{} closed its floor-update stream",
-                                                    pinned.shards[rank].address
-                                                ),
-                                            )
-                                        })?;
+                                        });
                                 }
                             }
                         }
@@ -409,6 +613,10 @@ impl CoordinatorService {
                         }
                         completed[shard_rank] = true;
                         remaining -= 1;
+                        outbound[shard_rank]
+                            .as_mut()
+                            .expect("incomplete shard retains its request stream")
+                            .completed = true;
                         outbound[shard_rank] = None;
                     }
                     None => {
@@ -437,15 +645,27 @@ impl CoordinatorService {
 
         let mut candidates = heap.into_vec();
         candidates.sort();
+        tracing::info!(
+            request_id = %request_id,
+            topology_generation = pinned.generation,
+            shards = pinned.shards.len(),
+            k,
+            returned = candidates.len(),
+            final_floor = published_floor,
+            "distributed scan finished"
+        );
         Ok(CollectionQueryResult {
             neighbours: candidates
                 .into_iter()
-                .map(|candidate| Neighbour {
-                    score: candidate.score,
-                    label: candidate.label,
-                    address: candidate.address,
-                    index_id: candidate.index_id,
-                    slot: candidate.slot,
+                .map(|candidate| {
+                    let shard = &pinned.shards[candidate.shard_rank];
+                    Neighbour {
+                        score: candidate.score,
+                        label: candidate.label,
+                        address: shard.address.clone(),
+                        index_id: shard.index_id.clone(),
+                        slot: candidate.slot,
+                    }
                 })
                 .collect(),
         })
@@ -459,11 +679,10 @@ impl CoordinatorService {
     async fn probe_all(&self, table: &[ShardConfig]) -> Vec<Result<Probe, Status>> {
         let mut tasks = Vec::with_capacity(table.len());
         for shard in table {
-            let client = self.client(&shard.address);
-            let address = shard.address.clone();
-            let index_id = shard.index_id.clone();
+            let service = self.clone();
+            let shard = shard.clone();
             tasks.push(tokio::spawn(async move {
-                probe(client?, address, index_id).await
+                service.probe_for_search(&shard).await
             }));
         }
         let mut probes = Vec::with_capacity(tasks.len());
@@ -474,6 +693,47 @@ impl CoordinatorService {
             });
         }
         probes
+    }
+
+    async fn probe_for_search(&self, shard: &ShardConfig) -> Result<Probe, Status> {
+        let primary = probe(
+            self.query_client(&shard.address)?,
+            shard.address.clone(),
+            shard.index_id.clone(),
+        )
+        .await
+        .and_then(|probe| {
+            validate_required_generation(shard, &probe)?;
+            Ok(probe)
+        });
+        match primary {
+            Ok(probe) => Ok(probe),
+            Err(primary_error) => {
+                let Some(required) = shard.required_generation else {
+                    return Err(primary_error);
+                };
+                for address in &shard.replicas {
+                    let replica = probe(
+                        self.query_client(address)?,
+                        address.clone(),
+                        shard.index_id.clone(),
+                    )
+                    .await;
+                    if let Ok(replica) = replica {
+                        if replica.info.generation == required {
+                            tracing::warn!(
+                                primary = %shard.address,
+                                replica = %address,
+                                generation = required,
+                                "serving shard from replica"
+                            );
+                            return Ok(replica);
+                        }
+                    }
+                }
+                Err(primary_error)
+            }
+        }
     }
 
     /// The bound collection, establishing it first if it is not bound yet.
@@ -487,7 +747,7 @@ impl CoordinatorService {
             return Ok(pinned);
         }
 
-        let table = self.table();
+        let (generation, table) = self.topology();
         if table.is_empty() {
             return Err(errors::precondition(
                 EMPTY_COLLECTION,
@@ -499,7 +759,7 @@ impl CoordinatorService {
         for probe in probes {
             shards.push(probe?);
         }
-        let pinned = Arc::new(bind(shards)?);
+        let pinned = Arc::new(bind(generation, shards)?);
         // A concurrent caller may have bound the collection first. Both
         // bindings probed the same nodes and agree, so either will do.
         *self
@@ -517,50 +777,142 @@ impl CoordinatorService {
     /// working through the bound collection.
     async fn resolve(&self, shard: &ShardConfig) -> Result<Probe, Status> {
         probe(
-            self.client(&shard.address)?,
+            self.query_client(&shard.address)?,
             shard.address.clone(),
             shard.index_id.clone(),
         )
         .await
     }
 
-    /// Read a run of rows out of one shard as an encoded block.
-    async fn export(&self, source: &Probe, start: u64, count: u64) -> Result<RowBlock, Status> {
-        if count == 0 {
-            // Zero means "to the end of the index" on the wire, which is the
-            // useful default for exporting a whole shard but is not what a
-            // target that was allotted no rows should receive. An empty run is
-            // therefore built here rather than asked for. It still carries the
-            // source's geometry and pair, so importing it yields a
-            // well-formed empty shard of the collection rather than a shard
-            // that agrees with nothing.
-            return Ok(RowBlock {
-                dim: source.info.dim,
-                bit_width: source.info.bit_width,
-                rows: 0,
-                packed_codes: Vec::new(),
-                scales: Vec::new(),
-                tqplus_shift: source.calibration.tqplus_shift.clone(),
-                tqplus_scale: source.calibration.tqplus_scale.clone(),
-                labels: Vec::new(),
-            });
+    /// Pipe bounded encoded blocks from one or more sources into one target.
+    /// The target activates nothing unless the complete expected row count
+    /// arrives and every block agrees on shape and calibration.
+    async fn import_ranges(
+        &self,
+        target: &str,
+        expected_rows: u64,
+        plans: Vec<ExportPlan>,
+    ) -> Result<ImportRowsResponse, Status> {
+        let mut exports = Vec::with_capacity(plans.len());
+        for plan in plans {
+            exports.push((self.admin_client(&plan.source.address)?, plan));
         }
-        let mut client = self.client(&source.address)?;
-        Ok(client
-            .export_rows(ExportRowsRequest {
-                index_id: source.index_id.clone(),
-                start,
-                count,
-            })
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ImportRowsRequest {
+            payload: Some(crate::proto::import_rows_request::Payload::Start(
+                ImportRowsStart { expected_rows },
+            )),
+        })
+        .await
+        .map_err(|_| Status::cancelled("import stream closed before it started"))?;
+
+        let producer = tokio::spawn(async move {
+            for (mut client, plan) in exports {
+                if plan.count == 0 {
+                    tx.send(ImportRowsRequest {
+                        payload: Some(crate::proto::import_rows_request::Payload::Block(
+                            empty_block(&plan.source),
+                        )),
+                    })
+                    .await
+                    .map_err(|_| Status::cancelled("target closed the import stream"))?;
+                    continue;
+                }
+                let mut stream = client
+                    .export_rows(ExportRowsRequest {
+                        index_id: plan.source.index_id.clone(),
+                        start: plan.start,
+                        count: plan.count,
+                    })
+                    .await
+                    .map_err(|e| node_error(&plan.source.address, &e))?
+                    .into_inner();
+                while let Some(block) = stream
+                    .message()
+                    .await
+                    .map_err(|e| node_error(&plan.source.address, &e))?
+                {
+                    tx.send(ImportRowsRequest {
+                        payload: Some(crate::proto::import_rows_request::Payload::Block(block)),
+                    })
+                    .await
+                    .map_err(|_| Status::cancelled("target closed the import stream"))?;
+                }
+            }
+            Ok::<(), Status>(())
+        });
+
+        let mut target_client = self.admin_client(target)?;
+        let imported = target_client.import_rows(ReceiverStream::new(rx)).await;
+        let produced = producer
             .await
-            .map_err(|e| node_error(&source.address, &e))?
-            .into_inner())
+            .map_err(|e| Status::internal(format!("row transfer task failed: {e}")))?;
+        let imported = imported.map_err(|status| node_error(target, &status))?;
+        produced?;
+        Ok(imported.into_inner())
+    }
+
+    /// A durable topology may point only at durable shard generations. Flush
+    /// every future member before publishing the topology file so a restart
+    /// can never restore handles that disappeared with a node process.
+    async fn flush_before_durable_rebind(&self, shards: &[ShardRef]) -> Result<(), Status> {
+        if self.topology_path.is_none() {
+            return Ok(());
+        }
+        for shard in shards {
+            let mut client = self.admin_client(&shard.address)?;
+            client
+                .flush(FlushRequest {
+                    index_id: shard.index_id.clone(),
+                })
+                .await
+                .map_err(|e| node_error(&shard.address, &e))?;
+        }
+        Ok(())
+    }
+
+    async fn configs_for_topology(&self, shards: &[ShardRef]) -> Result<Vec<ShardConfig>, Status> {
+        let previous = self.table();
+        let mut configs = Vec::with_capacity(shards.len());
+        for shard in shards {
+            let mut client = self.query_client(&shard.address)?;
+            let info = client
+                .get_index_info(GetIndexInfoRequest {
+                    index_id: shard.index_id.clone(),
+                })
+                .await
+                .map_err(|error| node_error(&shard.address, &error))?
+                .into_inner();
+            let mut config = ShardConfig::with_index_generation(
+                &shard.address,
+                &shard.index_id,
+                (info.generation > 0).then_some(info.generation),
+            );
+            if let Some(old) = previous.iter().find(|old| old.address == config.address) {
+                config.replicas = old.replicas.clone();
+            }
+            configs.push(config);
+        }
+        Ok(configs)
+    }
+}
+
+fn empty_block(source: &Probe) -> RowBlock {
+    RowBlock {
+        dim: source.info.dim,
+        bit_width: source.info.bit_width,
+        rows: 0,
+        packed_codes: Vec::new(),
+        scales: Vec::new(),
+        tqplus_shift: source.calibration.tqplus_shift.clone(),
+        tqplus_scale: source.calibration.tqplus_scale.clone(),
+        labels: Vec::new(),
     }
 }
 
 /// Read one node's view of one shard: which index, its metadata, its pair.
 async fn probe(
-    mut client: TurboVecClient<Channel>,
+    mut client: TurboVecQueryClient<Channel>,
     address: String,
     index_id: Option<String>,
 ) -> Result<Probe, Status> {
@@ -618,7 +970,7 @@ async fn probe(
 /// The first shard sets what the rest are held to. That is arbitrary and it
 /// does not matter: the check is for agreement, and a disagreement is reported
 /// as the pair of shards it is between, not as one of them being wrong.
-fn bind(shards: Vec<Probe>) -> Result<Pinned, Status> {
+fn bind(generation: u64, shards: Vec<Probe>) -> Result<Pinned, Status> {
     let head = shards.first().ok_or_else(|| {
         errors::precondition(
             EMPTY_COLLECTION,
@@ -670,6 +1022,7 @@ fn bind(shards: Vec<Probe>) -> Result<Pinned, Status> {
     }
     let calibration = head.calibration.clone();
     Ok(Pinned {
+        generation,
         shards,
         dim: dim as usize,
         rows,
@@ -707,6 +1060,18 @@ fn shard_ref(address: &str, index_id: &str) -> ShardRef {
         address: address.to_string(),
         index_id: index_id.to_string(),
     }
+}
+
+fn validate_required_generation(config: &ShardConfig, probe: &Probe) -> Result<(), Status> {
+    if let Some(required) = config.required_generation {
+        if probe.info.generation != required {
+            return Err(Status::failed_precondition(format!(
+                "shard_generation_mismatch: {} serves generation {}, topology requires {required}",
+                probe.address, probe.info.generation
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Split `rows` across `targets`, or validate the counts the caller gave.
@@ -755,7 +1120,7 @@ impl Coordinator for CoordinatorService {
         &self,
         _request: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
-        let table = self.table();
+        let (generation, table) = self.topology();
         let probes = self.probe_all(&table).await;
 
         let mut statuses = Vec::with_capacity(probes.len());
@@ -798,7 +1163,7 @@ impl Coordinator for CoordinatorService {
                 0,
             )
         } else {
-            match bind(healthy) {
+            match bind(generation, healthy) {
                 Ok(pinned) => (true, String::new(), pinned.rows),
                 Err(e) => (false, e.message().to_string(), 0),
             }
@@ -808,6 +1173,7 @@ impl Coordinator for CoordinatorService {
             servable,
             error,
             rows,
+            topology_generation: generation,
         }))
     }
 
@@ -817,11 +1183,14 @@ impl Coordinator for CoordinatorService {
     ) -> Result<Response<CollectionSearchResponse>, Status> {
         let req = request.into_inner();
         let k = req.k as usize;
-        if k == 0 {
-            return Err(Status::invalid_argument("k must be at least 1"));
+        if k == 0 || k > self.limits.max_k {
+            return Err(Status::invalid_argument(format!(
+                "k must be between 1 and {}",
+                self.limits.max_k
+            )));
         }
         let pinned = self.collection().await?;
-        if req.queries.is_empty() || req.queries.len() % pinned.dim != 0 {
+        if req.queries.is_empty() || !req.queries.len().is_multiple_of(pinned.dim) {
             return Err(Status::invalid_argument(format!(
                 "query buffer length {} is not a positive multiple of the collection dim {}",
                 req.queries.len(),
@@ -829,129 +1198,63 @@ impl Coordinator for CoordinatorService {
             )));
         }
         let nq = req.queries.len() / pinned.dim;
-
-        // Complete searches use the collaborative streaming collector: the
-        // coordinator owns the only top-k heap and sends its rising k-th score
-        // back to every shard. The legacy unary path below remains solely for
-        // allow_partial until that response contract can identify a shard
-        // failure for a particular query in a batch without ambiguity.
-        if !req.allow_partial {
-            let mut results = Vec::with_capacity(nq);
-            for vector in req.queries.chunks_exact(pinned.dim) {
-                results.push(self.stream_query(&pinned, vector.to_vec(), k).await?);
-            }
-            return Ok(Response::new(CollectionSearchResponse {
-                results,
-                partial: false,
-                failures: Vec::new(),
-            }));
+        if nq > self.limits.max_queries_per_request {
+            return Err(Status::resource_exhausted(format!(
+                "request has {nq} queries; limit is {}",
+                self.limits.max_queries_per_request
+            )));
         }
 
-        // Every shard is asked for its own top-k. A shard can contribute at
-        // most k rows to a global top-k, so k per shard is exactly enough:
-        // asking for more would return rows that cannot place, asking for
-        // fewer could miss one that can.
-        let mut tasks = Vec::with_capacity(pinned.shards.len());
-        for shard in &pinned.shards {
-            let client = self.client(&shard.address);
-            let index_id = shard.index_id.clone();
-            let queries = req.queries.clone();
-            let k = req.k;
-            tasks.push(tokio::spawn(async move {
-                let mut client = client?;
-                client
-                    .search(SearchRequest {
-                        index_id,
-                        queries,
-                        k,
-                        allowlist: Vec::new(),
-                    })
-                    .await
-                    .map(|r| r.into_inner())
-            }));
-        }
-
-        let mut merged: Vec<Vec<Neighbour>> = vec![Vec::new(); nq];
-        let mut failures = Vec::new();
-        for (shard, task) in pinned.shards.iter().zip(tasks) {
-            let outcome = match task.await {
-                Ok(result) => result,
-                Err(e) => Err(Status::internal(format!("search task failed: {e}"))),
-            };
-            let response = match outcome {
-                Ok(response) => response,
-                Err(e) => {
-                    let failure = node_error(&shard.address, &e);
-                    if !req.allow_partial {
-                        return Err(failure);
-                    }
-                    failures.push(ShardFailure {
-                        shard: Some(shard_ref(&shard.address, &shard.index_id)),
-                        error: failure.message().to_string(),
-                    });
-                    continue;
-                }
-            };
-            if response.results.len() != nq {
-                // The node answers one result per query or it is not answering
-                // this request. Merging a short response would silently drop
-                // whichever queries it ran out on.
-                return Err(Status::internal(format!(
-                    "shard {} returned {} results for {nq} queries",
-                    shard.address,
-                    response.results.len()
-                )));
-            }
-            for (qi, result) in response.results.into_iter().enumerate() {
-                let QueryResult {
-                    scores,
-                    ids,
-                    labels,
-                } = result;
-                // A shard built by ImportRows carries an external id per row
-                // and reports it; one built by plain adds does not, and its
-                // rows are identified by node, index and slot instead.
-                let labelled = labels.len() == ids.len();
-                for (rank, (score, slot)) in scores.into_iter().zip(ids).enumerate() {
-                    merged[qi].push(Neighbour {
-                        score,
-                        label: labelled.then(|| labels[rank]),
-                        address: shard.address.clone(),
-                        index_id: shard.index_id.clone(),
-                        slot,
-                    });
-                }
-            }
-        }
-
-        if failures.len() == pinned.shards.len() {
-            return Err(errors::unavailable(
-                NODE_UNREACHABLE,
-                format!(
-                    "every one of the {} shards failed, so there is no result to be partial \
-                     about",
-                    pinned.shards.len()
-                ),
-            ));
-        }
-
-        let results = merged
-            .into_iter()
-            .map(|mut neighbours| {
-                // A total order over the scores, so the merge is deterministic
-                // without any comparison being able to fail. The sort is
-                // stable, so rows that tie keep shard order: a tie has no
-                // winner, and this at least makes it the same non-winner
-                // every time.
-                neighbours.sort_by(|a, b| b.score.total_cmp(&a.score));
-                neighbours.truncate(k);
-                CollectionQueryResult { neighbours }
-            })
+        // There is one distributed search algorithm: the coordinator owns the
+        // global heap, nodes stream above its live floor, and every node must
+        // certify completion. A degraded partial ranking is never returned.
+        let vectors: Vec<Vec<f32>> = req
+            .queries
+            .chunks_exact(pinned.dim)
+            .map(<[f32]>::to_vec)
             .collect();
+        let mut results: Vec<Option<CollectionQueryResult>> = (0..nq).map(|_| None).collect();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut next = 0usize;
+        while next < nq || !tasks.is_empty() {
+            while next < nq && tasks.len() < self.limits.max_concurrent_queries {
+                let service = self.clone();
+                let pinned = Arc::clone(&pinned);
+                let vector = vectors[next].clone();
+                let query_index = next;
+                let timeout = self.limits.query_timeout;
+                tasks.spawn(async move {
+                    let result =
+                        tokio::time::timeout(timeout, service.stream_query(&pinned, vector, k))
+                            .await
+                            .map_err(|_| {
+                                Status::deadline_exceeded("distributed search deadline exceeded")
+                            })?;
+                    Ok::<_, Status>((query_index, result?))
+                });
+                next += 1;
+            }
+            let result = tasks
+                .join_next()
+                .await
+                .expect("query task set is non-empty")
+                .map_err(|error| Status::internal(format!("query task failed: {error}")))?;
+            match result {
+                Ok((query_index, result)) => results[query_index] = Some(result),
+                Err(status) => {
+                    self.metrics.search_failed();
+                    return Err(status);
+                }
+            }
+        }
+        let results = results
+            .into_iter()
+            .map(|result| result.expect("every query task filled its result slot"))
+            .collect();
+        self.metrics.coordinator_search_finished();
         Ok(Response::new(CollectionSearchResponse {
             results,
-            partial: !failures.is_empty(),
-            failures,
+            topology_generation: pinned.generation,
         }))
     }
 
@@ -990,7 +1293,7 @@ impl Coordinator for CoordinatorService {
         let mut shards = Vec::with_capacity(table.len());
         for shard in &table {
             let probe = self.resolve(shard).await?;
-            let mut client = self.client(&probe.address)?;
+            let mut client = self.admin_client(&probe.address)?;
             let committed = client
                 .set_calibration(SetCalibrationRequest {
                     index_id: probe.index_id.clone(),
@@ -1020,16 +1323,14 @@ impl Coordinator for CoordinatorService {
 
         // Every shard now holds a handle that may be new, and the old binding
         // described the pair they held before.
-        self.rebind(
-            shards
-                .iter()
-                .map(|s| ShardConfig::with_index(&s.address, &s.index_id))
-                .collect(),
-        );
+        self.flush_before_durable_rebind(&shards).await?;
+        let configs = self.configs_for_topology(&shards).await?;
+        self.rebind(configs)?;
         let pinned = self.collection().await?;
         Ok(Response::new(FitCalibrationResponse {
             calibration: Some(pinned.calibration.clone()),
             shards,
+            topology_generation: pinned.generation,
         }))
     }
 
@@ -1044,36 +1345,34 @@ impl Coordinator for CoordinatorService {
         let source = self.resolve(&to_config(&source)).await?;
         let counts = plan_counts(source.info.len, req.targets.len(), &req.row_counts)?;
 
-        // One target at a time: a block is a full copy of its rows in the
-        // coordinator's memory, and doing them in sequence bounds that to the
-        // largest single shard rather than to the whole source.
+        // One target at a time. Every transfer is a bounded block stream and
+        // the target activates only after receiving its exact row count.
         let mut shards = Vec::with_capacity(req.targets.len());
         let mut start = 0u64;
         for (target, &count) in req.targets.iter().zip(counts.iter()) {
-            let block = self.export(&source, start, count).await?;
-            let target = ShardConfig::new(target.clone());
-            let mut client = self.client(&target.address)?;
-            let imported = client
-                .import_rows(ImportRowsRequest {
-                    blocks: vec![block],
-                })
-                .await
-                .map_err(|e| node_error(&target.address, &e))?
-                .into_inner();
-            shards.push(shard_ref(&target.address, &imported.index_id));
+            let imported = self
+                .import_ranges(
+                    target,
+                    count,
+                    vec![ExportPlan {
+                        source: source.clone(),
+                        start,
+                        count,
+                    }],
+                )
+                .await?;
+            shards.push(shard_ref(target, &imported.index_id));
             start += count;
         }
 
-        self.rebind(
-            shards
-                .iter()
-                .map(|s| ShardConfig::with_index(&s.address, &s.index_id))
-                .collect(),
-        );
+        self.flush_before_durable_rebind(&shards).await?;
+        let configs = self.configs_for_topology(&shards).await?;
+        let topology_generation = self.rebind(configs)?;
         Ok(Response::new(SplitResponse {
             shards,
             rows: counts,
             calibration: Some(source.calibration),
+            topology_generation,
         }))
     }
 
@@ -1104,29 +1403,33 @@ impl Coordinator for CoordinatorService {
         for source in &sources {
             probes.push(self.resolve(source).await?);
         }
-        let pinned = bind(probes.clone())?;
+        let pinned = bind(self.topology().0, probes.clone())?;
 
-        let mut blocks = Vec::with_capacity(probes.len());
-        for probe in &probes {
-            blocks.push(self.export(probe, 0, probe.info.len).await?);
-        }
         let target = ShardConfig::new(req.target);
-        let mut client = self.client(&target.address)?;
-        let imported = client
-            .import_rows(ImportRowsRequest { blocks })
-            .await
-            .map_err(|e| node_error(&target.address, &e))?
-            .into_inner();
+        let plans = probes
+            .into_iter()
+            .map(|source| ExportPlan {
+                count: source.info.len,
+                source,
+                start: 0,
+            })
+            .collect();
+        let imported = self
+            .import_ranges(&target.address, pinned.rows, plans)
+            .await?;
         let shard = shard_ref(&target.address, &imported.index_id);
 
-        self.rebind(vec![ShardConfig::with_index(
-            &shard.address,
-            &shard.index_id,
-        )]);
+        self.flush_before_durable_rebind(std::slice::from_ref(&shard))
+            .await?;
+        let configs = self
+            .configs_for_topology(std::slice::from_ref(&shard))
+            .await?;
+        let topology_generation = self.rebind(configs)?;
         Ok(Response::new(JoinResponse {
             rows: pinned.rows,
             calibration: Some(pinned.calibration),
             shard: Some(shard),
+            topology_generation,
         }))
     }
 }

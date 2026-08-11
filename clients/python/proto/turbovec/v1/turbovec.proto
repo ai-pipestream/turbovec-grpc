@@ -1,6 +1,6 @@
 // gRPC contract for the turbovec vector index.
 //
-// The service is handle-based: create or load an index, receive an
+// The service is handle-based: create or restore an index, receive an
 // `index_id`, then add vectors and run searches against that id. Handles are
 // independent, so many clients (or one client with many indexes) can search
 // concurrently. Searches never block one another; only the mutating calls
@@ -16,6 +16,11 @@ syntax = "proto3";
 
 package turbovec.v1;
 
+option go_package = "turbovec-go-client/gen/turbovec/v1;turbovecv1";
+option java_package = "turbovec.v1";
+option java_multiple_files = true;
+option java_outer_classname = "TurboVecProto";
+
 // CalibrationState mirrors turbovec::CalibrationState: whether a TQ+
 // calibration pair has been committed to an index.
 enum CalibrationState {
@@ -27,7 +32,7 @@ enum CalibrationState {
   CALIBRATION_STATE_UNCALIBRATED = 1;
 
   // A fitted pair is committed. Every add encodes under it, and it
-  // travels with the index through Snapshot/Load.
+  // travels with the index through durable generations.
   CALIBRATION_STATE_CALIBRATED = 2;
 }
 
@@ -48,6 +53,7 @@ enum IndexKind {
 
 // TurboVec is the vector index service.
 service TurboVec {
+  option deprecated = true;
   // Creates an empty index and returns its handle. A non-lazy index locks
   // its dim now; a lazy index leaves dim unbound until the first Add.
   rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
@@ -98,11 +104,10 @@ service TurboVec {
   // POSITIONAL indexes only.
   rpc StreamSearch(stream StreamSearchRequest) returns (stream StreamSearchResponse);
 
-  // Writes an index to a server-local path in turbovec's own format.
-  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
-
-  // Loads an index from a server-local path and returns a new handle.
-  rpc Load(LoadRequest) returns (LoadResponse);
+  // Persists one index and its stable row labels as a new atomic generation
+  // below TURBOVEC_DATA_DIR. Startup restores exactly the generation named by
+  // the shard's CURRENT pointer.
+  rpc Flush(FlushRequest) returns (FlushResponse);
 
   // Commits a TQ+ calibration pair fitted elsewhere, so several indexes
   // built on different servers encode into one shared coordinate system
@@ -125,13 +130,37 @@ service TurboVec {
   // exactly the form the index holds them. Pairs with ImportRows to move
   // rows between servers without decoding, re-encoding, or rescoring.
   // POSITIONAL indexes only, for the same reason GetCalibration is.
-  rpc ExportRows(ExportRowsRequest) returns (RowBlock);
+  rpc ExportRows(ExportRowsRequest) returns (stream RowBlock);
 
   // Builds a new POSITIONAL index from one or more exported row blocks,
   // concatenated in the order given. Every block must agree on dim, bit
   // width, and calibration pair; a disagreement is refused by name
   // rather than resolved.
-  rpc ImportRows(ImportRowsRequest) returns (ImportRowsResponse);
+  rpc ImportRows(stream ImportRowsRequest) returns (ImportRowsResponse);
+}
+
+// TurboVecQuery is the data-plane surface exposed to search clients and the
+// distributed coordinator's query path.
+service TurboVecQuery {
+  rpc GetIndexInfo(GetIndexInfoRequest) returns (IndexInfo);
+  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc SearchStream(SearchRequest) returns (stream QueryResult);
+  rpc StreamSearch(stream StreamSearchRequest) returns (stream StreamSearchResponse);
+  rpc GetCalibration(GetCalibrationRequest) returns (Calibration);
+}
+
+// TurboVecAdmin is the control-plane surface. Deployments can authorize this
+// service independently from TurboVecQuery at a proxy or service mesh.
+service TurboVecAdmin {
+  rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
+  rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
+  rpc Add(stream AddRequest) returns (AddResponse);
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+  rpc Flush(FlushRequest) returns (FlushResponse);
+  rpc SetCalibration(SetCalibrationRequest) returns (Calibration);
+  rpc ExportRows(ExportRowsRequest) returns (stream RowBlock);
+  rpc ImportRows(stream ImportRowsRequest) returns (ImportRowsResponse);
 }
 
 // IndexInfo is the metadata snapshot for one open index.
@@ -158,6 +187,10 @@ message IndexInfo {
   // A labelled index reports those ids in `QueryResult.labels`, and refuses
   // Add: appending rows would leave the tail of the index unlabelled.
   bool labelled = 7;
+
+  // Durable generation below TURBOVEC_DATA_DIR. Zero means this live index
+  // has not been flushed yet.
+  uint64 generation = 8;
 }
 
 // CreateIndexRequest holds the settings for a new index.
@@ -187,7 +220,7 @@ message CreateIndexResponse {
 
 // DropIndexRequest names the index to release.
 message DropIndexRequest {
-  // Handle returned by CreateIndex or Load.
+  // Stable handle returned by CreateIndex.
   string index_id = 1;
 }
 
@@ -199,7 +232,7 @@ message DropIndexResponse {
 
 // GetIndexInfoRequest names the index whose metadata is requested.
 message GetIndexInfoRequest {
-  // Handle returned by CreateIndex or Load.
+  // Stable handle returned by CreateIndex.
   string index_id = 1;
 }
 
@@ -229,6 +262,17 @@ message AddRequest {
   // External ids for the vectors in this frame, one per row. Required for an
   // ID_MAP index, and must be empty for a POSITIONAL index.
   repeated uint64 ids = 4;
+
+  // Stable caller-generated id for retry-safe ingest. When set, the first
+  // frame must also set expected_len and expected_rows, and the node must use
+  // durable storage.
+  string operation_id = 5;
+
+  // Index length the caller observed before this operation.
+  optional uint64 expected_len = 6;
+
+  // Exact row count across the complete stream.
+  uint64 expected_rows = 7;
 }
 
 // AddResponse reports the result of an Add stream.
@@ -238,6 +282,15 @@ message AddResponse {
 
   // Total number of vectors in the index after the Add.
   uint64 len = 2;
+
+  // Durable generation containing this operation, or zero for a non-durable
+  // compatibility ingest without operation_id.
+  uint64 generation = 3;
+
+  // True when this response replayed an already committed operation.
+  bool replayed = 4;
+
+  string operation_id = 5;
 }
 
 // RemoveRequest names one vector to delete by external id.
@@ -375,37 +428,15 @@ message StreamSearchSummary {
   uint64 floor_raises_applied = 4;
 }
 
-// SnapshotRequest asks the server to write an index to a local path.
-message SnapshotRequest {
-  // Handle to write.
+// FlushRequest names one live index to persist.
+message FlushRequest {
   string index_id = 1;
-
-  // Server-local destination path.
-  string path = 2;
 }
 
-// SnapshotResponse acknowledges the write.
-message SnapshotResponse {
-  // Path the index was written to.
-  string path = 1;
-}
-
-// LoadRequest asks the server to load an index from a local path.
-message LoadRequest {
-  // Server-local source path.
-  string path = 1;
-
-  // Storage model of the file being loaded. Must match how it was written.
-  IndexKind kind = 2;
-}
-
-// LoadResponse returns the handle and metadata for the loaded index.
-message LoadResponse {
-  // Handle for the loaded index.
+// FlushResponse identifies the newly activated durable generation.
+message FlushResponse {
   string index_id = 1;
-
-  // Metadata for the loaded index.
-  IndexInfo info = 2;
+  uint64 generation = 2;
 }
 
 // Calibration is one TQ+ calibration pair, in full.
@@ -498,16 +529,22 @@ message ExportRowsRequest {
   uint64 count = 3;
 }
 
-// ImportRowsRequest carries the blocks that make up a new index.
+// ImportRowsStart opens an atomic import.
+message ImportRowsStart {
+  // Exact number of rows the complete stream must contain. The server does
+  // not activate an index unless this count is met exactly.
+  uint64 expected_rows = 1;
+}
+
+// ImportRowsRequest is one frame of an atomic import stream.
 message ImportRowsRequest {
-  // Blocks to concatenate, in the order given. At least one is required.
-  // Row order within the new index is block order, then row order inside
-  // each block, so the caller controls the resulting slot numbering.
-  //
-  // Blocks travel in one message rather than a stream, so a very large
-  // import is bounded by the server's frame limit; split it into several
-  // ImportRows calls and Join the results if it does not fit.
-  repeated RowBlock blocks = 1;
+  oneof payload {
+    // Must be the first and only start frame.
+    ImportRowsStart start = 1;
+
+    // One bounded encoded row block. Blocks are concatenated in stream order.
+    RowBlock block = 2;
+  }
 }
 
 // ImportRowsResponse returns the handle and metadata for the new index.

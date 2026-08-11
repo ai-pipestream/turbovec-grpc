@@ -2,7 +2,7 @@
 name = "turbovec-grpc"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.89"
 description = "A gRPC server for the turbovec vector index"
 license = "MIT"
 repository = "https://github.com/ai-pipestream/turbovec-grpc"
@@ -21,11 +21,16 @@ path = "src/coordinator_main.rs"
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s13" }
 tonic = "0.12"
 prost = "0.13"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tonic-health = "0.12"
 tonic-reflection = "0.12"
 uuid = { version = "1", features = ["v4"] }
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [build-dependencies]
 tonic-build = "0.12"

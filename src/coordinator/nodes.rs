@@ -6,16 +6,14 @@
 //! discovery, no gossip and no membership protocol: an operator says which
 //! nodes hold the collection, and the coordinator holds them to it.
 //!
-//! The table is not persisted. A coordinator restart reads the configured
-//! table again, so a collection that was reshaped by Split or Join needs its
-//! configuration updated to match, or the restart serves the pre-split shape.
-//! `ListNodes` reports the live table, which is how you check.
+//! When `TURBOVEC_COORD_STATE` is configured, the active table and its
+//! generation are persisted atomically. A restart loads that state instead of
+//! reverting a collection reshaped by Split or Join.
 //!
 //! Configuration is one entry per shard, entries separated by commas or
 //! newlines, so the same syntax works in an environment variable and in a
-//! file. Each entry is a node address, optionally followed by whitespace and
-//! the index handle on that node. A `#` starts a comment that runs to the end
-//! of the entry.
+//! file. Each entry is a primary and optional `|`-separated replicas, followed
+//! by an optional index handle and durable generation. A `#` starts a comment.
 //!
 //! ```text
 //! # two shards, one with an explicit handle
@@ -23,8 +21,16 @@
 //! 127.0.0.1:50052         # the node's only open index
 //! ```
 
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+const TOPOLOGY_VERSION: u32 = 1;
+
 /// One configured shard: a node address, and which index on it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardConfig {
     /// Address the coordinator dials, always carrying a scheme.
     pub address: String,
@@ -32,6 +38,14 @@ pub struct ShardConfig {
     /// Index handle on that node, or `None` for "the only index it has open",
     /// which the coordinator resolves when it binds the collection.
     pub index_id: Option<String>,
+
+    /// Read-only failover addresses holding the same stable index id.
+    #[serde(default)]
+    pub replicas: Vec<String>,
+
+    /// Durable generation every replica must serve before it is eligible.
+    #[serde(default)]
+    pub required_generation: Option<u64>,
 }
 
 impl ShardConfig {
@@ -40,6 +54,8 @@ impl ShardConfig {
         Self {
             address: with_scheme(address.into()),
             index_id: None,
+            replicas: Vec::new(),
+            required_generation: None,
         }
     }
 
@@ -48,6 +64,19 @@ impl ShardConfig {
         Self {
             address: with_scheme(address.into()),
             index_id: Some(index_id.into()),
+            replicas: Vec::new(),
+            required_generation: None,
+        }
+    }
+
+    pub fn with_index_generation(
+        address: impl Into<String>,
+        index_id: impl Into<String>,
+        generation: Option<u64>,
+    ) -> Self {
+        Self {
+            required_generation: generation.filter(|value| *value > 0),
+            ..Self::with_index(address, index_id)
         }
     }
 }
@@ -60,6 +89,13 @@ impl ShardConfig {
 pub struct NodeTable {
     /// Shards, in configuration order.
     pub shards: Vec<ShardConfig>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedTopology {
+    version: u32,
+    generation: u64,
+    shards: Vec<ShardConfig>,
 }
 
 impl NodeTable {
@@ -84,18 +120,38 @@ impl NodeTable {
             }
             let mut fields = entry.split_ascii_whitespace();
             // `entry` is non-empty after trimming, so it has a first field.
-            let address = fields.next().expect("non-empty entry has a first field");
+            let addresses = fields.next().expect("non-empty entry has a first field");
             let index_id = fields.next();
+            let generation = fields
+                .next()
+                .map(|value| {
+                    value.parse::<u64>().map_err(|e| {
+                        format!("shard at position {position}: invalid generation {value:?}: {e}")
+                    })
+                })
+                .transpose()?;
             if let Some(extra) = fields.next() {
                 return Err(format!(
-                    "shard at position {position}: expected an address and an optional index \
-                     handle, found a third field {extra:?}"
+                    "shard at position {position}: expected addresses, an optional index handle, \
+                     and an optional generation; found an extra field {extra:?}"
                 ));
             }
-            shards.push(match index_id {
-                Some(id) => ShardConfig::with_index(address, id),
-                None => ShardConfig::new(address),
-            });
+            let mut addresses = addresses.split('|');
+            let primary = addresses.next().expect("address field is non-empty");
+            let replicas: Vec<String> = addresses
+                .map(|value| with_scheme(value.to_string()))
+                .collect();
+            let mut shard = match index_id {
+                Some(id) => ShardConfig::with_index_generation(primary, id, generation),
+                None if generation.is_none() => ShardConfig::new(primary),
+                None => {
+                    return Err(format!(
+                        "shard at position {position}: generation requires an index handle"
+                    ))
+                }
+            };
+            shard.replicas = replicas;
+            shards.push(shard);
         }
         if shards.is_empty() {
             return Err("no shards configured: the node table is empty".to_string());
@@ -112,6 +168,85 @@ impl NodeTable {
     pub fn is_empty(&self) -> bool {
         self.shards.is_empty()
     }
+}
+
+/// Load an existing topology state file, or atomically seed it from startup
+/// configuration at generation 1.
+pub fn load_or_initialize(path: &Path, initial: &NodeTable) -> Result<(u64, NodeTable), String> {
+    if path.exists() {
+        let bytes =
+            fs::read(path).map_err(|e| format!("read topology state {}: {e}", path.display()))?;
+        let persisted: PersistedTopology = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("decode topology state {}: {e}", path.display()))?;
+        if persisted.version != TOPOLOGY_VERSION {
+            return Err(format!(
+                "topology state {} has version {}, expected {TOPOLOGY_VERSION}",
+                path.display(),
+                persisted.version
+            ));
+        }
+        if persisted.generation == 0 || persisted.shards.is_empty() {
+            return Err(format!(
+                "topology state {} has generation {} and {} shards",
+                path.display(),
+                persisted.generation,
+                persisted.shards.len()
+            ));
+        }
+        return Ok((persisted.generation, NodeTable::new(persisted.shards)));
+    }
+    if initial.is_empty() {
+        return Err("cannot initialize an empty topology".to_string());
+    }
+    persist_topology(path, 1, &initial.shards)?;
+    Ok((1, initial.clone()))
+}
+
+/// Atomically replace a topology state file with one new generation.
+pub fn persist_topology(
+    path: &Path,
+    generation: u64,
+    shards: &[ShardConfig],
+) -> Result<(), String> {
+    if generation == 0 || shards.is_empty() {
+        return Err(format!(
+            "refusing topology generation {generation} with {} shards",
+            shards.len()
+        ));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("create topology directory {}: {e}", parent.display()))?;
+    let bytes = serde_json::to_vec_pretty(&PersistedTopology {
+        version: TOPOLOGY_VERSION,
+        generation,
+        shards: shards.to_vec(),
+    })
+    .map_err(|e| format!("encode topology generation {generation}: {e}"))?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("topology"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = File::create(&temp)
+            .map_err(|e| format!("create topology temp {}: {e}", temp.display()))?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("write topology temp {}: {e}", temp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync topology temp {}: {e}", temp.display()))?;
+        fs::rename(&temp, path)
+            .map_err(|e| format!("activate topology state {}: {e}", path.display()))?;
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("sync topology directory {}: {e}", parent.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
 }
 
 /// Split configuration text into entries on commas and newlines.
@@ -181,5 +316,25 @@ mod tests {
     fn rejects_an_extra_field_and_an_empty_table() {
         assert!(NodeTable::parse("127.0.0.1:1 a b").is_err());
         assert!(NodeTable::parse("   \n # nothing here\n").is_err());
+    }
+
+    #[test]
+    fn persisted_topology_survives_restart_and_advances_atomically() {
+        let root = std::env::temp_dir().join(format!("turbovec-topology-{}", uuid::Uuid::new_v4()));
+        let path = root.join("topology.json");
+        let initial = NodeTable::new(vec![ShardConfig::with_index("node-a:1", "shard-a")]);
+        let (generation, loaded) = load_or_initialize(&path, &initial).unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(loaded, initial);
+
+        let next = vec![
+            ShardConfig::with_index("node-b:2", "shard-b"),
+            ShardConfig::with_index("node-c:3", "shard-c"),
+        ];
+        persist_topology(&path, 2, &next).unwrap();
+        let (generation, loaded) = load_or_initialize(&path, &initial).unwrap();
+        assert_eq!(generation, 2);
+        assert_eq!(loaded.shards, next);
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -20,9 +20,11 @@
 //! positional-only, because they need `TurboQuantIndex`'s raw-parts accessors
 //! and `IdMapIndex` does not forward them.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Iter;
 use tonic::{Request, Response, Status, Streaming};
@@ -32,34 +34,135 @@ use crate::errors::{
     self, INDEX_NOT_EMPTY, INVALID_CALIBRATION, LABELLED_INDEX_IMMUTABLE,
     POSITIONAL_INDEX_REQUIRED, ROW_COUNT_MISMATCH,
 };
+use crate::observability::Metrics;
+use crate::proto::turbo_vec_admin_server::{TurboVecAdmin, TurboVecAdminServer};
+use crate::proto::turbo_vec_query_server::{TurboVecQuery, TurboVecQueryServer};
 use crate::proto::turbo_vec_server::{TurboVec, TurboVecServer};
 use crate::proto::{
     AddRequest, AddResponse, Calibration, CreateIndexRequest, CreateIndexResponse,
-    DropIndexRequest, DropIndexResponse, ExportRowsRequest, GetCalibrationRequest,
-    GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse, IndexInfo, IndexKind,
-    ListIndexesRequest, ListIndexesResponse, LoadRequest, LoadResponse, QueryResult, RemoveRequest,
-    RemoveResponse, RowBlock, SearchRequest, SearchResponse, SetCalibrationRequest,
-    SnapshotRequest, SnapshotResponse, StreamSearchBatch, StreamSearchRequest,
-    StreamSearchResponse, StreamSearchSummary,
+    DropIndexRequest, DropIndexResponse, ExportRowsRequest, FlushRequest, FlushResponse,
+    GetCalibrationRequest, GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse, IndexInfo,
+    IndexKind, ListIndexesRequest, ListIndexesResponse, QueryResult, RemoveRequest, RemoveResponse,
+    RowBlock, SearchRequest, SearchResponse, SetCalibrationRequest, StreamSearchBatch,
+    StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
 };
-use crate::store::{Handle, Index, IndexStore, Labels};
+use crate::store::{Handle, Index, IndexStore, IngestRecord, Labels};
+
+const MAX_EXPORT_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+/// Resource limits enforced before CPU or heap work begins.
+#[derive(Clone, Debug)]
+pub struct ServiceLimits {
+    pub max_k: usize,
+    pub max_queries_per_request: usize,
+    pub max_vector_coordinates_per_frame: usize,
+    pub max_concurrent_scans: usize,
+}
+
+impl Default for ServiceLimits {
+    fn default() -> Self {
+        Self {
+            max_k: 1_000,
+            max_queries_per_request: 64,
+            max_vector_coordinates_per_frame: 4_000_000,
+            max_concurrent_scans: std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get),
+        }
+    }
+}
+
+impl ServiceLimits {
+    pub fn from_env() -> Result<Self, String> {
+        let defaults = Self::default();
+        Ok(Self {
+            max_k: crate::config::positive_usize("TURBOVEC_MAX_K", defaults.max_k)?,
+            max_queries_per_request: crate::config::positive_usize(
+                "TURBOVEC_MAX_QUERIES",
+                defaults.max_queries_per_request,
+            )?,
+            max_vector_coordinates_per_frame: crate::config::positive_usize(
+                "TURBOVEC_MAX_FRAME_COORDINATES",
+                defaults.max_vector_coordinates_per_frame,
+            )?,
+            max_concurrent_scans: crate::config::positive_usize(
+                "TURBOVEC_MAX_CONCURRENT_SCANS",
+                defaults.max_concurrent_scans,
+            )?,
+        })
+    }
+}
 
 /// gRPC implementation of `turbovec.v1.TurboVec`.
+#[derive(Clone)]
 pub struct TurboVecService {
     store: Arc<IndexStore>,
+    limits: ServiceLimits,
+    scan_slots: Arc<Semaphore>,
+    metrics: Metrics,
+    mutations: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl TurboVecService {
     /// Create the service around an index registry.
     pub fn new(store: IndexStore) -> Self {
+        Self::from_shared(Arc::new(store))
+    }
+
+    /// Create the service around a shared registry, allowing the binary to
+    /// flush the same store after graceful server shutdown.
+    pub fn from_shared(store: Arc<IndexStore>) -> Self {
+        Self::with_limits(store, ServiceLimits::default())
+    }
+
+    pub fn with_limits(store: Arc<IndexStore>, limits: ServiceLimits) -> Self {
+        Self::with_limits_and_metrics(store, limits, Metrics::default())
+    }
+
+    pub fn with_limits_and_metrics(
+        store: Arc<IndexStore>,
+        limits: ServiceLimits,
+        metrics: Metrics,
+    ) -> Self {
+        assert!(limits.max_k > 0, "max_k must be positive");
+        assert!(
+            limits.max_queries_per_request > 0,
+            "max_queries_per_request must be positive"
+        );
+        assert!(
+            limits.max_vector_coordinates_per_frame > 0,
+            "max_vector_coordinates_per_frame must be positive"
+        );
+        assert!(
+            limits.max_concurrent_scans > 0,
+            "max_concurrent_scans must be positive"
+        );
+        let scan_slots = Arc::new(Semaphore::new(limits.max_concurrent_scans));
         Self {
-            store: Arc::new(store),
+            store,
+            limits,
+            scan_slots,
+            metrics,
+            mutations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Wrap into the generated tonic service.
     pub fn into_server(self) -> TurboVecServer<Self> {
         TurboVecServer::new(self)
+    }
+
+    pub fn into_query_server(self) -> TurboVecQueryServer<Self> {
+        TurboVecQueryServer::new(self)
+    }
+
+    pub fn into_admin_server(self) -> TurboVecAdminServer<Self> {
+        TurboVecAdminServer::new(self)
+    }
+
+    pub fn ready(&self) -> bool {
+        self.store.handles().iter().all(|(id, handle)| {
+            handle.read().is_ok() && self.store.generation(id).is_some_and(|value| value > 0)
+        }) || self.store.data_root().is_none()
     }
 
     /// Resolve a handle or fail the RPC with `NOT_FOUND`.
@@ -72,12 +175,155 @@ impl TurboVecService {
     /// Build the metadata message for one open index, reading its label table
     /// out of the registry.
     fn info(&self, id: &str, index: &Index) -> IndexInfo {
-        index_info(id, index, self.store.labels(id).is_some())
+        index_info(
+            id,
+            index,
+            self.store.labels(id).is_some(),
+            self.store.generation(id).unwrap_or(0),
+        )
+    }
+
+    fn validate_k(&self, k: usize) -> Result<(), Status> {
+        if k == 0 || k > self.limits.max_k {
+            return Err(Status::invalid_argument(format!(
+                "k must be between 1 and {}",
+                self.limits.max_k
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_vector_frame(&self, coordinates: usize) -> Result<(), Status> {
+        if coordinates > self.limits.max_vector_coordinates_per_frame {
+            return Err(Status::resource_exhausted(format!(
+                "vector frame has {coordinates} coordinates; limit is {}",
+                self.limits.max_vector_coordinates_per_frame
+            )));
+        }
+        Ok(())
+    }
+
+    fn mutation_lock(&self, index_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.mutations.lock().expect("mutation lock map poisoned");
+        Arc::clone(
+            locks
+                .entry(index_id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+}
+
+#[tonic::async_trait]
+impl TurboVecQuery for TurboVecService {
+    type SearchStreamStream = <Self as TurboVec>::SearchStreamStream;
+    type StreamSearchStream = <Self as TurboVec>::StreamSearchStream;
+
+    async fn get_index_info(
+        &self,
+        request: Request<GetIndexInfoRequest>,
+    ) -> Result<Response<IndexInfo>, Status> {
+        <Self as TurboVec>::get_index_info(self, request).await
+    }
+
+    async fn list_indexes(
+        &self,
+        request: Request<ListIndexesRequest>,
+    ) -> Result<Response<ListIndexesResponse>, Status> {
+        <Self as TurboVec>::list_indexes(self, request).await
+    }
+
+    async fn search(
+        &self,
+        request: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        <Self as TurboVec>::search(self, request).await
+    }
+
+    async fn search_stream(
+        &self,
+        request: Request<SearchRequest>,
+    ) -> Result<Response<Self::SearchStreamStream>, Status> {
+        <Self as TurboVec>::search_stream(self, request).await
+    }
+
+    async fn stream_search(
+        &self,
+        request: Request<Streaming<StreamSearchRequest>>,
+    ) -> Result<Response<Self::StreamSearchStream>, Status> {
+        <Self as TurboVec>::stream_search(self, request).await
+    }
+
+    async fn get_calibration(
+        &self,
+        request: Request<GetCalibrationRequest>,
+    ) -> Result<Response<Calibration>, Status> {
+        <Self as TurboVec>::get_calibration(self, request).await
+    }
+}
+
+#[tonic::async_trait]
+impl TurboVecAdmin for TurboVecService {
+    type ExportRowsStream = <Self as TurboVec>::ExportRowsStream;
+
+    async fn create_index(
+        &self,
+        request: Request<CreateIndexRequest>,
+    ) -> Result<Response<CreateIndexResponse>, Status> {
+        <Self as TurboVec>::create_index(self, request).await
+    }
+
+    async fn drop_index(
+        &self,
+        request: Request<DropIndexRequest>,
+    ) -> Result<Response<DropIndexResponse>, Status> {
+        <Self as TurboVec>::drop_index(self, request).await
+    }
+
+    async fn add(
+        &self,
+        request: Request<Streaming<AddRequest>>,
+    ) -> Result<Response<AddResponse>, Status> {
+        <Self as TurboVec>::add(self, request).await
+    }
+
+    async fn remove(
+        &self,
+        request: Request<RemoveRequest>,
+    ) -> Result<Response<RemoveResponse>, Status> {
+        <Self as TurboVec>::remove(self, request).await
+    }
+
+    async fn flush(
+        &self,
+        request: Request<FlushRequest>,
+    ) -> Result<Response<FlushResponse>, Status> {
+        <Self as TurboVec>::flush(self, request).await
+    }
+
+    async fn set_calibration(
+        &self,
+        request: Request<SetCalibrationRequest>,
+    ) -> Result<Response<Calibration>, Status> {
+        <Self as TurboVec>::set_calibration(self, request).await
+    }
+
+    async fn export_rows(
+        &self,
+        request: Request<ExportRowsRequest>,
+    ) -> Result<Response<Self::ExportRowsStream>, Status> {
+        <Self as TurboVec>::export_rows(self, request).await
+    }
+
+    async fn import_rows(
+        &self,
+        request: Request<Streaming<ImportRowsRequest>>,
+    ) -> Result<Response<ImportRowsResponse>, Status> {
+        <Self as TurboVec>::import_rows(self, request).await
     }
 }
 
 /// Build the metadata message for one open index.
-fn index_info(id: &str, index: &Index, labelled: bool) -> IndexInfo {
+fn index_info(id: &str, index: &Index, labelled: bool, generation: u64) -> IndexInfo {
     IndexInfo {
         index_id: id.to_string(),
         kind: index.kind() as i32,
@@ -86,6 +332,7 @@ fn index_info(id: &str, index: &Index, labelled: bool) -> IndexInfo {
         len: index.len() as u64,
         calibration_state: calibration_state(index.calibration_state()) as i32,
         labelled,
+        generation,
     }
 }
 
@@ -282,7 +529,7 @@ fn search_prepared(
 /// Validate a query buffer against a bound `dim`: non-empty, a whole multiple
 /// of `dim`, and every coordinate finite and in range for the SIMD kernel.
 fn validate_queries(queries: &[f32], dim: usize) -> Result<(), Status> {
-    if queries.is_empty() || queries.len() % dim != 0 {
+    if queries.is_empty() || !queries.len().is_multiple_of(dim) {
         return Err(Status::invalid_argument(format!(
             "query buffer length {} is not a positive multiple of dim {dim}",
             queries.len()
@@ -377,7 +624,12 @@ impl TurboVec for TurboVecService {
         &self,
         request: Request<DropIndexRequest>,
     ) -> Result<Response<DropIndexResponse>, Status> {
-        let dropped = self.store.remove(&request.into_inner().index_id);
+        let index_id = request.into_inner().index_id;
+        let store = Arc::clone(&self.store);
+        let dropped = tokio::task::spawn_blocking(move || store.delete(&index_id))
+            .await
+            .map_err(join_err)?
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(DropIndexResponse { dropped }))
     }
 
@@ -412,11 +664,15 @@ impl TurboVec for TurboVecService {
         request: Request<Streaming<AddRequest>>,
     ) -> Result<Response<AddResponse>, Status> {
         let mut stream = request.into_inner();
-        let first = stream
+        let mut combined = stream
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("empty add stream: no frames received"))?;
-        let index_id = first.index_id.clone();
+        self.validate_vector_frame(combined.vectors.len())?;
+        let index_id = combined.index_id.clone();
+        let operation_id = combined.operation_id.clone();
+        let expected_len = combined.expected_len;
+        let expected_rows = combined.expected_rows;
         let handle = self.handle(&index_id)?;
         if self.store.labels(&index_id).is_some() {
             // The label table was built with one entry per row at import and
@@ -432,25 +688,147 @@ impl TurboVec for TurboVecService {
             ));
         }
 
-        // The first frame carries the index_id; process it, then take the rest
-        // of the stream, holding every later frame to the same id.
-        let mut added = add_chunk(&handle, first).await?;
+        // Validate and stage the complete bounded operation before mutating the
+        // index. A broken stream therefore commits no prefix.
         while let Some(chunk) = stream.message().await? {
             if !chunk.index_id.is_empty() && chunk.index_id != index_id {
                 return Err(Status::invalid_argument(
                     "every add frame must carry the same index_id",
                 ));
             }
-            added += add_chunk(&handle, chunk).await?;
+            if chunk.dim != combined.dim
+                || (!chunk.operation_id.is_empty() && chunk.operation_id != operation_id)
+                || chunk
+                    .expected_len
+                    .is_some_and(|value| Some(value) != expected_len)
+                || (chunk.expected_rows != 0 && chunk.expected_rows != expected_rows)
+            {
+                return Err(Status::invalid_argument(
+                    "every add frame must repeat the same operation metadata",
+                ));
+            }
+            let next_coordinates = combined
+                .vectors
+                .len()
+                .checked_add(chunk.vectors.len())
+                .ok_or_else(|| Status::resource_exhausted("add operation is too large"))?;
+            self.validate_vector_frame(next_coordinates)?;
+            combined.vectors.extend(chunk.vectors);
+            combined.ids.extend(chunk.ids);
         }
 
-        let len = {
+        let dim = combined.dim as usize;
+        if dim == 0 || !combined.vectors.len().is_multiple_of(dim) {
+            return Err(Status::invalid_argument(format!(
+                "vector buffer length {} is not a positive multiple of dim {dim}",
+                combined.vectors.len()
+            )));
+        }
+        let rows = (combined.vectors.len() / dim) as u64;
+        if !operation_id.is_empty() {
+            if self.store.data_root().is_none() {
+                return Err(Status::failed_precondition(
+                    "retry-safe ingest requires TURBOVEC_DATA_DIR",
+                ));
+            }
+            if expected_len.is_none() || expected_rows != rows {
+                return Err(Status::invalid_argument(format!(
+                    "operation {operation_id} must declare expected_len and exactly {rows} expected_rows"
+                )));
+            }
+        } else if expected_len.is_some() || expected_rows != 0 {
+            return Err(Status::invalid_argument(
+                "expected_len and expected_rows require operation_id",
+            ));
+        }
+
+        let mutation = self.mutation_lock(&index_id);
+        let _mutation_guard = mutation.lock_owned().await;
+        let current_len = {
             let guard = handle
                 .read()
                 .map_err(|_| Status::internal("index lock poisoned"))?;
             guard.len() as u64
         };
-        Ok(Response::new(AddResponse { added, len }))
+        if !operation_id.is_empty() {
+            if let Some(record) = self.store.ingest_record(&index_id) {
+                if record.operation_id == operation_id {
+                    if record.expected_len != expected_len.expect("checked above")
+                        || record.rows != rows
+                        || record.len != current_len
+                    {
+                        return Err(Status::failed_precondition(
+                            "operation_id was already used with different ingest metadata",
+                        ));
+                    }
+                    if self.store.generation(&index_id) == Some(record.generation) {
+                        return Ok(Response::new(AddResponse {
+                            added: rows,
+                            len: record.len,
+                            generation: record.generation,
+                            replayed: true,
+                            operation_id,
+                        }));
+                    }
+                    let store = Arc::clone(&self.store);
+                    let persisted_id = index_id.clone();
+                    let generation =
+                        tokio::task::spawn_blocking(move || store.persist(&persisted_id))
+                            .await
+                            .map_err(join_err)?
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                    return Ok(Response::new(AddResponse {
+                        added: rows,
+                        len: record.len,
+                        generation,
+                        replayed: true,
+                        operation_id,
+                    }));
+                }
+            }
+            let expected = expected_len.expect("checked above");
+            if current_len != expected {
+                return Err(Status::aborted(format!(
+                    "ingest generation conflict: expected len {expected}, current len is {current_len}"
+                )));
+            }
+        }
+
+        let added = add_chunk(&handle, combined).await?;
+        let len = current_len + added;
+        let generation = if operation_id.is_empty() {
+            0
+        } else {
+            self.store.set_ingest_record(
+                &index_id,
+                IngestRecord {
+                    operation_id: operation_id.clone(),
+                    expected_len: expected_len.expect("checked above"),
+                    rows,
+                    len,
+                    generation: self
+                        .store
+                        .generation(&index_id)
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or_else(|| Status::internal("generation counter overflow"))?,
+                },
+            );
+            let store = Arc::clone(&self.store);
+            let persisted_id = index_id.clone();
+            tokio::task::spawn_blocking(move || store.persist(&persisted_id))
+                .await
+                .map_err(join_err)?
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+        self.metrics.rows_ingested(added);
+        Ok(Response::new(AddResponse {
+            added,
+            len,
+            generation,
+            replayed: false,
+            operation_id,
+        }))
     }
 
     async fn remove(
@@ -483,10 +861,17 @@ impl TurboVec for TurboVecService {
         let handle = self.handle(&req.index_id)?;
         let labels = self.store.labels(&req.index_id);
         let k = req.k as usize;
-        if k == 0 {
-            return Err(Status::invalid_argument("k must be at least 1"));
-        }
+        self.validate_k(k)?;
+        self.validate_vector_frame(req.queries.len())?;
+        let permit = Arc::clone(&self.scan_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("search admission is shutting down"))?;
+        let active_scan = self.metrics.scan_started();
+        let max_queries = self.limits.max_queries_per_request;
         let results = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _active_scan = active_scan;
             let guard = handle
                 .read()
                 .map_err(|_| Status::internal("index lock poisoned"))?;
@@ -498,6 +883,12 @@ impl TurboVec for TurboVecService {
                 ));
             };
             validate_queries(&req.queries, dim)?;
+            let queries = req.queries.len() / dim;
+            if queries > max_queries {
+                return Err(Status::resource_exhausted(format!(
+                    "request has {queries} queries; limit is {max_queries}"
+                )));
+            }
             let filter = prepare_filter(&guard, &req.allowlist)?;
             Ok::<_, Status>(search_prepared(
                 &guard,
@@ -510,6 +901,13 @@ impl TurboVec for TurboVecService {
         })
         .await
         .map_err(join_err)??;
+        self.metrics.node_search_finished(
+            results
+                .iter()
+                .map(|result| result.scores.len() as u64)
+                .sum(),
+            0,
+        );
         Ok(Response::new(SearchResponse { results }))
     }
 
@@ -526,7 +924,7 @@ impl TurboVec for TurboVecService {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<Self::SearchStreamStream>, Status> {
-        let response = self.search(request).await?;
+        let response = <Self as TurboVec>::search(self, request).await?;
         let items: Vec<Result<QueryResult, Status>> =
             response.into_inner().results.into_iter().map(Ok).collect();
         Ok(Response::new(tokio_stream::iter(items)))
@@ -557,6 +955,7 @@ impl TurboVec for TurboVecService {
         };
         let handle = self.handle(&start.index_id)?;
         let labels = self.store.labels(&start.index_id);
+        self.validate_vector_frame(start.vector.len())?;
         let initial_floor = start.initial_floor.unwrap_or(f32::NEG_INFINITY);
         if initial_floor.is_nan() {
             return Err(Status::invalid_argument("initial_floor must not be NaN"));
@@ -610,11 +1009,20 @@ impl TurboVec for TurboVecService {
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let request_id = start.request_id.clone();
+        let permit = Arc::clone(&self.scan_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("search admission is shutting down"))?;
+        let active_scan = self.metrics.scan_started();
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             let scan_tx = tx.clone();
             let scan_floor = Arc::clone(&floor);
             let scan_stop = Arc::clone(&stop);
             let outcome = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let _active_scan = active_scan;
                 let guard = handle
                     .read()
                     .map_err(|_| Status::internal("index lock poisoned"))?;
@@ -640,55 +1048,77 @@ impl TurboVec for TurboVecService {
                 let mut floor_now = initial_floor;
                 let mut floor_raises = 0u64;
                 let summary = inner
-                    .try_search_streaming(&start.vector, options, |batch| {
-                        let slots: Vec<u64> = batch
-                            .slots
-                            .iter()
-                            .map(|&slot| {
-                                u64::try_from(slot)
-                                    .expect("streaming search emits only live non-negative slots")
-                            })
-                            .collect();
-                        let labels = labels.as_ref().map_or_else(Vec::new, |table| {
-                            slots
+                    .try_search_streaming_controlled(
+                        &start.vector,
+                        options,
+                        |batch| {
+                            let slots: Vec<u64> = batch
+                                .slots
                                 .iter()
                                 .map(|&slot| {
-                                    *table
-                                        .get(slot as usize)
-                                        .expect("label table covers every slot of its index")
+                                    u64::try_from(slot).expect(
+                                        "streaming search emits only live non-negative slots",
+                                    )
                                 })
-                                .collect()
-                        });
-                        let response = StreamSearchResponse {
-                            payload: Some(crate::proto::stream_search_response::Payload::Batch(
-                                StreamSearchBatch {
-                                    scores: batch.scores.to_vec(),
-                                    slots,
-                                    labels,
-                                },
-                            )),
-                        };
-                        if scan_tx.blocking_send(Ok(response)).is_err()
-                            || scan_stop.load(Ordering::Acquire)
-                        {
-                            return StreamControl::Stop;
-                        }
-                        let candidate = f32::from_bits(scan_floor.load(Ordering::Acquire));
-                        if candidate > floor_now {
-                            floor_now = candidate;
-                            floor_raises += 1;
-                            StreamControl::RaiseFloor(candidate)
-                        } else {
-                            StreamControl::Continue
-                        }
-                    })
+                                .collect();
+                            let labels = labels.as_ref().map_or_else(Vec::new, |table| {
+                                slots
+                                    .iter()
+                                    .map(|&slot| {
+                                        *table
+                                            .get(slot as usize)
+                                            .expect("label table covers every slot of its index")
+                                    })
+                                    .collect()
+                            });
+                            let response = StreamSearchResponse {
+                                payload: Some(
+                                    crate::proto::stream_search_response::Payload::Batch(
+                                        StreamSearchBatch {
+                                            scores: batch.scores.to_vec(),
+                                            slots,
+                                            labels,
+                                        },
+                                    ),
+                                ),
+                            };
+                            if scan_tx.blocking_send(Ok(response)).is_err() {
+                                StreamControl::Stop
+                            } else {
+                                StreamControl::Continue
+                            }
+                        },
+                        || {
+                            if scan_stop.load(Ordering::Acquire) {
+                                return StreamControl::Stop;
+                            }
+                            let candidate = f32::from_bits(scan_floor.load(Ordering::Acquire));
+                            if candidate > floor_now {
+                                floor_now = candidate;
+                                floor_raises += 1;
+                                StreamControl::RaiseFloor(candidate)
+                            } else {
+                                StreamControl::Continue
+                            }
+                        },
+                    )
                     .map_err(|e| Status::invalid_argument(e.to_string()))?;
-                Ok::<_, Status>(StreamSearchSummary {
+                let summary = StreamSearchSummary {
                     completed: summary.completed,
                     emitted: summary.emitted as u64,
                     blocks_scanned: summary.blocks_scanned as u64,
                     floor_raises_applied: floor_raises,
-                })
+                };
+                tracing::info!(
+                    request_id = %request_id,
+                    index_id = %start.index_id,
+                    completed = summary.completed,
+                    emitted = summary.emitted,
+                    blocks_scanned = summary.blocks_scanned,
+                    floor_raises = summary.floor_raises_applied,
+                    "shard scan finished"
+                );
+                Ok::<_, Status>(summary)
             })
             .await
             .map_err(join_err);
@@ -703,6 +1133,7 @@ impl TurboVec for TurboVecService {
             }
             match outcome {
                 Ok(Ok(summary)) => {
+                    metrics.node_search_finished(summary.emitted, summary.blocks_scanned);
                     let _ = tx
                         .send(Ok(StreamSearchResponse {
                             payload: Some(crate::proto::stream_search_response::Payload::Summary(
@@ -712,6 +1143,7 @@ impl TurboVec for TurboVecService {
                         .await;
                 }
                 Ok(Err(status)) | Err(status) => {
+                    metrics.search_failed();
                     let _ = tx.send(Err(status)).await;
                 }
             }
@@ -720,57 +1152,23 @@ impl TurboVec for TurboVecService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn snapshot(
+    async fn flush(
         &self,
-        request: Request<SnapshotRequest>,
-    ) -> Result<Response<SnapshotResponse>, Status> {
-        let req = request.into_inner();
-        let handle = self.handle(&req.index_id)?;
-        let path = req.path;
-        let written = path.clone();
-        tokio::task::spawn_blocking(move || {
-            let guard = handle
-                .read()
-                .map_err(|_| Status::internal("index lock poisoned"))?;
-            let result = match &*guard {
-                Index::Positional(inner) => inner.write(&path),
-                Index::IdMap(inner) => inner.write(&path),
-            };
-            result.map_err(|e| Status::internal(format!("snapshot write failed: {e}")))
-        })
-        .await
-        .map_err(join_err)??;
-        Ok(Response::new(SnapshotResponse { path: written }))
-    }
-
-    async fn load(&self, request: Request<LoadRequest>) -> Result<Response<LoadResponse>, Status> {
-        let req = request.into_inner();
-        let kind = IndexKind::try_from(req.kind)
-            .map_err(|_| Status::invalid_argument("unknown index kind"))?;
-        let path = req.path;
-        let index = tokio::task::spawn_blocking(move || match kind {
-            IndexKind::Positional => TurboQuantIndex::load(&path)
-                .map(Index::Positional)
-                .map_err(|e| Status::internal(format!("load failed: {e}"))),
-            IndexKind::IdMap => IdMapIndex::load(&path)
-                .map(Index::IdMap)
-                .map_err(|e| Status::internal(format!("load failed: {e}"))),
-            IndexKind::Unspecified => Err(Status::invalid_argument("index kind is required")),
-        })
-        .await
-        .map_err(join_err)??;
-
-        let id = self.store.insert(index);
-        let handle = self.handle(&id)?;
-        let info = {
-            let guard = handle
-                .read()
-                .map_err(|_| Status::internal("index lock poisoned"))?;
-            self.info(&id, &guard)
-        };
-        Ok(Response::new(LoadResponse {
-            index_id: id,
-            info: Some(info),
+        request: Request<FlushRequest>,
+    ) -> Result<Response<FlushResponse>, Status> {
+        let index_id = request.into_inner().index_id;
+        // Resolve first so an unknown id stays NOT_FOUND rather than being
+        // folded into an internal persistence error.
+        self.handle(&index_id)?;
+        let store = Arc::clone(&self.store);
+        let persisted_id = index_id.clone();
+        let generation = tokio::task::spawn_blocking(move || store.persist(&persisted_id))
+            .await
+            .map_err(join_err)?
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        Ok(Response::new(FlushResponse {
+            index_id,
+            generation,
         }))
     }
 
@@ -854,31 +1252,97 @@ impl TurboVec for TurboVecService {
         )?)))
     }
 
+    type ExportRowsStream = ReceiverStream<Result<RowBlock, Status>>;
+
     async fn export_rows(
         &self,
         request: Request<ExportRowsRequest>,
-    ) -> Result<Response<RowBlock>, Status> {
+    ) -> Result<Response<Self::ExportRowsStream>, Status> {
         let req = request.into_inner();
         let handle = self.handle(&req.index_id)?;
         let labels = self.store.labels(&req.index_id);
-        let block = tokio::task::spawn_blocking(move || {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tokio::task::spawn_blocking(move || {
             let guard = handle
                 .read()
-                .map_err(|_| Status::internal("index lock poisoned"))?;
-            let index = positional(&guard, "ExportRows")?;
-            export_block(index, labels.as_ref(), req.start, req.count)
-        })
-        .await
-        .map_err(join_err)??;
-        Ok(Response::new(block))
+                .map_err(|_| Status::internal("index lock poisoned"));
+            let result = guard.and_then(|guard| {
+                let index = positional(&guard, "ExportRows")?;
+                let (start, rows) = export_range(index, req.start, req.count)?;
+                let dim = index.dim_opt().ok_or_else(|| {
+                    errors::precondition(
+                        ROW_COUNT_MISMATCH,
+                        "ExportRows needs an index with a bound dim; this one has never held a row",
+                    )
+                })?;
+                let bytes_per_row = index.bit_width() * (dim / 8) + 12;
+                let calibration_bytes = dim.saturating_mul(8);
+                let row_budget = MAX_EXPORT_FRAME_BYTES.saturating_sub(calibration_bytes);
+                let rows_per_frame = (row_budget / bytes_per_row.max(1)).max(1);
+
+                if rows == 0 {
+                    let block = export_block(index, labels.as_ref(), start as u64, 0)?;
+                    tx.blocking_send(Ok(block))
+                        .map_err(|_| Status::cancelled("export receiver closed"))?;
+                    return Ok(());
+                }
+                let mut offset = 0usize;
+                while offset < rows {
+                    let count = rows_per_frame.min(rows - offset);
+                    let block = export_block(
+                        index,
+                        labels.as_ref(),
+                        (start + offset) as u64,
+                        count as u64,
+                    )?;
+                    tx.blocking_send(Ok(block))
+                        .map_err(|_| Status::cancelled("export receiver closed"))?;
+                    offset += count;
+                }
+                Ok(())
+            });
+            if let Err(status) = result {
+                let _ = tx.blocking_send(Err(status));
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn import_rows(
         &self,
-        request: Request<ImportRowsRequest>,
+        request: Request<Streaming<ImportRowsRequest>>,
     ) -> Result<Response<ImportRowsResponse>, Status> {
-        let blocks = request.into_inner().blocks;
-        let (index, labels) = tokio::task::spawn_blocking(move || import_blocks(&blocks))
+        let mut stream = request.into_inner();
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty import stream"))?;
+        let expected_rows = match first.payload {
+            Some(crate::proto::import_rows_request::Payload::Start(start)) => {
+                usize::try_from(start.expected_rows).map_err(|_| {
+                    errors::invalid(ROW_COUNT_MISMATCH, "expected row count is out of range")
+                })?
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first import frame must be ImportRowsStart",
+                ))
+            }
+        };
+        let mut builder = ImportBuilder::new(expected_rows);
+        while let Some(frame) = stream.message().await? {
+            match frame.payload {
+                Some(crate::proto::import_rows_request::Payload::Block(block)) => {
+                    builder.push(block)?;
+                }
+                Some(crate::proto::import_rows_request::Payload::Start(_)) | None => {
+                    return Err(Status::invalid_argument(
+                        "ImportRowsStart must appear exactly once and first",
+                    ))
+                }
+            }
+        }
+        let (index, labels) = tokio::task::spawn_blocking(move || builder.finish())
             .await
             .map_err(join_err)??;
 
@@ -897,17 +1361,7 @@ impl TurboVec for TurboVecService {
     }
 }
 
-/// Copy `count` rows starting at `start` out of `index` into a [`RowBlock`].
-///
-/// The copy is a byte-range slice of the packed codes: rows are contiguous in
-/// the packed layout, `bit_width * dim / 8` bytes each, so nothing is decoded
-/// and no code changes. `count` of zero means "to the end".
-fn export_block(
-    index: &TurboQuantIndex,
-    labels: Option<&Labels>,
-    start: u64,
-    count: u64,
-) -> Result<RowBlock, Status> {
+fn export_range(index: &TurboQuantIndex, start: u64, count: u64) -> Result<(usize, usize), Status> {
     let len = index.len();
     let start = usize::try_from(start).map_err(|_| {
         errors::invalid(ROW_COUNT_MISMATCH, format!("start {start} is out of range"))
@@ -922,15 +1376,30 @@ fn export_block(
         ));
     }
     let rows = if count == 0 { len - start } else { count };
-    if start + rows > len {
+    let end = start
+        .checked_add(rows)
+        .ok_or_else(|| errors::invalid(ROW_COUNT_MISMATCH, "export range overflowed"))?;
+    if end > len {
         return Err(errors::invalid(
             ROW_COUNT_MISMATCH,
-            format!(
-                "rows {start}..{} run past an index holding {len} rows",
-                start + rows
-            ),
+            format!("rows {start}..{} run past an index holding {len} rows", end),
         ));
     }
+    Ok((start, rows))
+}
+
+/// Copy `count` rows starting at `start` out of `index` into a [`RowBlock`].
+///
+/// The copy is a byte-range slice of the packed codes: rows are contiguous in
+/// the packed layout, `bit_width * dim / 8` bytes each, so nothing is decoded
+/// and no code changes. `count` of zero means "to the end".
+fn export_block(
+    index: &TurboQuantIndex,
+    labels: Option<&Labels>,
+    start: u64,
+    count: u64,
+) -> Result<RowBlock, Status> {
+    let (start, rows) = export_range(index, start, count)?;
 
     // An empty index has no bound dim to describe the export with, and a
     // zero-row block from a populated one still carries the geometry, so the
@@ -962,55 +1431,64 @@ fn export_block(
     })
 }
 
-/// Concatenate `blocks` into one positional index and its label table.
-///
-/// Every block must agree on dim, bit width and calibration pair. The first
-/// block sets what the rest are held to, and a disagreement is named rather
-/// than reconciled: two blocks encoded under different pairs describe rows in
-/// different coordinate systems, and concatenating their codes would produce
-/// an index whose scores mean two different things.
-fn import_blocks(blocks: &[RowBlock]) -> Result<(TurboQuantIndex, Vec<u64>), Status> {
-    let Some(head) = blocks.first() else {
-        return Err(errors::invalid(
-            ROW_COUNT_MISMATCH,
-            "ImportRows needs at least one row block",
-        ));
-    };
-    let dim = head.dim as usize;
-    let bit_width = head.bit_width as usize;
+/// Incrementally assembles one imported index without retaining transport
+/// frames. The finished index is inserted into the registry only after every
+/// frame validates and the declared row count is met exactly.
+struct ImportBuilder {
+    expected_rows: usize,
+    head: Option<RowBlock>,
+    blocks: usize,
+    rows: usize,
+    packed: Vec<u8>,
+    scales: Vec<f32>,
+    labels: Vec<u64>,
+}
 
-    let mut rows = 0usize;
-    let mut packed = Vec::new();
-    let mut scales = Vec::new();
-    let mut labels = Vec::new();
-    for (bi, block) in blocks.iter().enumerate() {
-        if block.dim != head.dim {
-            return Err(errors::precondition(
-                crate::errors::DIMENSION_MISMATCH,
-                format!(
-                    "block 0 carries dim {} and block {bi} carries dim {}",
-                    head.dim, block.dim
-                ),
-            ));
+impl ImportBuilder {
+    fn new(expected_rows: usize) -> Self {
+        Self {
+            expected_rows,
+            head: None,
+            blocks: 0,
+            rows: 0,
+            packed: Vec::new(),
+            scales: Vec::new(),
+            labels: Vec::new(),
         }
-        if block.bit_width != head.bit_width {
-            return Err(errors::precondition(
-                crate::errors::BIT_WIDTH_MISMATCH,
-                format!(
-                    "block 0 is {}-bit and block {bi} is {}-bit",
-                    head.bit_width, block.bit_width
-                ),
-            ));
+    }
+
+    fn push(&mut self, block: RowBlock) -> Result<(), Status> {
+        let bi = self.blocks;
+        if let Some(head) = &self.head {
+            if block.dim != head.dim {
+                return Err(errors::precondition(
+                    crate::errors::DIMENSION_MISMATCH,
+                    format!(
+                        "block 0 carries dim {} and block {bi} carries dim {}",
+                        head.dim, block.dim
+                    ),
+                ));
+            }
+            if block.bit_width != head.bit_width {
+                return Err(errors::precondition(
+                    crate::errors::BIT_WIDTH_MISMATCH,
+                    format!(
+                        "block 0 is {}-bit and block {bi} is {}-bit",
+                        head.bit_width, block.bit_width
+                    ),
+                ));
+            }
+            if let Some(detail) = calibration_difference(
+                (&head.tqplus_shift, &head.tqplus_scale),
+                (&block.tqplus_shift, &block.tqplus_scale),
+            ) {
+                return Err(errors::precondition(
+                    crate::errors::MIXED_CALIBRATION,
+                    format!("block 0 and block {bi} were encoded under different pairs: {detail}"),
+                ));
+            }
         }
-        if let Some(detail) = calibration_difference(
-            (&head.tqplus_shift, &head.tqplus_scale),
-            (&block.tqplus_shift, &block.tqplus_scale),
-        ) {
-            return Err(errors::precondition(
-                crate::errors::MIXED_CALIBRATION,
-                format!("block 0 and block {bi} were encoded under different pairs: {detail}"),
-            ));
-        }
+
         let block_rows = usize::try_from(block.rows).map_err(|_| {
             errors::invalid(
                 ROW_COUNT_MISMATCH,
@@ -1030,28 +1508,70 @@ fn import_blocks(blocks: &[RowBlock]) -> Result<(TurboQuantIndex, Vec<u64>), Sta
                 ),
             ));
         }
-        rows += block_rows;
-        packed.extend_from_slice(&block.packed_codes);
-        scales.extend_from_slice(&block.scales);
-        labels.extend_from_slice(&block.labels);
+        let next_rows = self
+            .rows
+            .checked_add(block_rows)
+            .ok_or_else(|| errors::invalid(ROW_COUNT_MISMATCH, "import row count overflowed"))?;
+        if next_rows > self.expected_rows {
+            return Err(errors::invalid(
+                ROW_COUNT_MISMATCH,
+                format!(
+                    "import declared {} rows but received at least {next_rows}",
+                    self.expected_rows
+                ),
+            ));
+        }
+
+        if self.head.is_none() {
+            self.head = Some(RowBlock {
+                dim: block.dim,
+                bit_width: block.bit_width,
+                rows: 0,
+                packed_codes: Vec::new(),
+                scales: Vec::new(),
+                tqplus_shift: block.tqplus_shift.clone(),
+                tqplus_scale: block.tqplus_scale.clone(),
+                labels: Vec::new(),
+            });
+        }
+        self.rows = next_rows;
+        self.blocks += 1;
+        self.packed.extend(block.packed_codes);
+        self.scales.extend(block.scales);
+        self.labels.extend(block.labels);
+        Ok(())
     }
 
-    // `from_parts` checks the rest: that the packed length matches the row
-    // count and geometry, that dim and bit width are ones the encoder has a
-    // layout for, and that every scale and calibration coordinate is a value
-    // the kernel can use. Those checks are the loader's, so an index built
-    // here is one that would have survived a write and a load.
-    let index = TurboQuantIndex::from_parts(
-        Some(dim),
-        bit_width,
-        rows,
-        packed,
-        scales,
-        head.tqplus_shift.clone(),
-        head.tqplus_scale.clone(),
-    )
-    .map_err(|e| Status::invalid_argument(format!("row blocks do not form an index: {e}")))?;
-    Ok((index, labels))
+    fn finish(self) -> Result<(TurboQuantIndex, Vec<u64>), Status> {
+        let Some(head) = self.head else {
+            return Err(errors::invalid(
+                ROW_COUNT_MISMATCH,
+                "ImportRows needs at least one row block",
+            ));
+        };
+        if self.rows != self.expected_rows {
+            return Err(errors::invalid(
+                ROW_COUNT_MISMATCH,
+                format!(
+                    "import declared {} rows but received {}",
+                    self.expected_rows, self.rows
+                ),
+            ));
+        }
+        let dim = head.dim as usize;
+        let bit_width = head.bit_width as usize;
+        let index = TurboQuantIndex::from_parts(
+            Some(dim),
+            bit_width,
+            self.rows,
+            self.packed,
+            self.scales,
+            head.tqplus_shift,
+            head.tqplus_scale,
+        )
+        .map_err(|e| Status::invalid_argument(format!("row blocks do not form an index: {e}")))?;
+        Ok((index, self.labels))
+    }
 }
 
 /// Compare two calibration pairs coordinate by coordinate, returning a
@@ -1103,7 +1623,7 @@ async fn add_chunk(handle: &Handle, chunk: AddRequest) -> Result<u64, Status> {
     let handle = Arc::clone(handle);
     tokio::task::spawn_blocking(move || {
         let dim = chunk.dim as usize;
-        if dim == 0 || chunk.vectors.len() % dim != 0 {
+        if dim == 0 || !chunk.vectors.len().is_multiple_of(dim) {
             return Err(Status::invalid_argument(format!(
                 "vector buffer length {} is not a positive multiple of dim {dim}",
                 chunk.vectors.len()
