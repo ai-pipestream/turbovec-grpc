@@ -184,7 +184,7 @@ fn search_prepared(
 /// Validate a query buffer against a bound `dim`: non-empty, a whole multiple
 /// of `dim`, and every coordinate finite and in range for the SIMD kernel.
 fn validate_queries(queries: &[f32], dim: usize) -> Result<(), Status> {
-    if queries.is_empty() || queries.len() % dim != 0 {
+    if queries.is_empty() || !queries.len().is_multiple_of(dim) {
         return Err(Status::invalid_argument(format!(
             "query buffer length {} is not a positive multiple of dim {dim}",
             queries.len()
@@ -450,7 +450,7 @@ async fn add_chunk(handle: &Handle, chunk: AddRequest) -> Result<u64, Status> {
     let handle = Arc::clone(handle);
     tokio::task::spawn_blocking(move || {
         let dim = chunk.dim as usize;
-        if dim == 0 || chunk.vectors.len() % dim != 0 {
+        if dim == 0 || !chunk.vectors.len().is_multiple_of(dim) {
             return Err(Status::invalid_argument(format!(
                 "vector buffer length {} is not a positive multiple of dim {dim}",
                 chunk.vectors.len()

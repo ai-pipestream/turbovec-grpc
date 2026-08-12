@@ -18,6 +18,11 @@
 //! The wire contract lives in `proto/turbovec/v1/turbovec.proto` and is
 //! compiled at build time; see [`proto`].
 
+// Every fallible path ends at a tonic RPC whose generated signature returns
+// `tonic::Status`. The boundary type is not ours to box, so boxing internally
+// would only add indirection before unboxing it again at the RPC boundary.
+#![allow(clippy::result_large_err)]
+
 /// Generated protobuf types, client, and server for the `turbovec.v1`
 /// package.
 ///
