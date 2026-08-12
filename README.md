@@ -19,9 +19,10 @@ every shard certifies completion. There is no partial-result mode.
 
 ## Scope
 
-This project owns vector search only. It does not own a document store, BM25,
-text analysis, model serving, or corpus ingestion pipeline. Those concerns stay
-in separate services or in the larger `turbovec-search` project.
+This project owns vector search and the protobuf-first schema layer that feeds
+it. It does not own a document store, BM25, text analysis, model serving, or a
+corpus ingestion pipeline. Those concerns stay in separate services or in the
+larger `turbovec-search` project.
 
 ## Build and test
 
@@ -51,12 +52,13 @@ cargo run --release --locked --bin turbovec-grpc
 For a local disposable demo, set `TURBOVEC_ALLOW_EPHEMERAL=true` instead of a
 data directory.
 
-Node methods are separated into two gRPC services:
+Node methods are separated into three gRPC services:
 
 | Service | Methods |
 |---|---|
 | `TurboVecQuery` | metadata, calibration read, `Search`, `SearchStream`, `StreamSearch` |
 | `TurboVecAdmin` | create/delete, retry-safe `Add`, remove, calibration write, `Flush`, streaming row export/import |
+| `Documents` | `PlanSchema`, `BindSchema`, `GetSchema`, streaming `AddDocuments` |
 
 `Snapshot` and `Load` server-path RPCs do not exist. `Flush` writes an atomic,
 checksummed generation below `TURBOVEC_DATA_DIR`, including stable row labels
@@ -66,6 +68,40 @@ Retry-safe ingest sets `operation_id`, `expected_len`, and `expected_rows` on
 the first `Add` frame. The bounded operation is validated before mutation and
 flushed before success. A retry after a lost response or restart is replayed
 without duplicating rows.
+
+## Protobuf-first documents
+
+The `Documents` service indexes the protobuf messages producers already emit,
+with no JSON and no hand-maintained field mapping. The contract is
+[`schema.proto`](proto/turbovec/v1/schema.proto):
+
+1. `PlanSchema` takes a serialized `google.protobuf.FileDescriptorSet`
+   (compiled with `--include_imports`) plus a message type name and returns
+   the derived indexing plan: dotted field paths, resolved kinds, and a
+   SHA-256 fingerprint over the plan's canonical encoding. Two indexes agree
+   on their schema exactly when their fingerprints agree.
+2. `BindSchema` creates an id-mapped index shaped by that plan. `Flush`
+   persists the bound schema with the shard generation; restart re-derives
+   the plan and refuses to serve on a fingerprint mismatch.
+3. `AddDocuments` streams serialized messages of the bound type. The node
+   decodes each document against the bound descriptor and indexes its
+   `(id, vector)` pair. A broken or invalid stream commits no prefix.
+
+Fields may carry explicit hints as descriptor options using the
+`ai.pipestream.proto.index.hints.v1` extension (vendored byte-identically
+from [protomolt](https://github.com/ai-pipestream/protomolt), which owns the
+vocabulary): a proto annotated for protomolt's indexers works here without
+modification. Unhinted fields are inferred from the descriptor. Ambiguity is
+an error naming the fix, never a guess: the vector field is either the one
+hinted `INDEX_FIELD_TYPE_VECTOR` or the only vector-shaped repeated float
+field, and the document id is either the field hinted `BLOCK_ROLE_DOC_ID` or
+a singular top-level field named `id`.
+
+Integer ids are used verbatim (zero is refused, because proto3 cannot
+distinguish it from unset). String ids reduce to the first 8 bytes of
+SHA-256 over their UTF-8 bytes, big-endian — part of the wire contract, so
+any client can predict the labels its documents will carry in search
+results.
 
 ## Run the coordinator
 

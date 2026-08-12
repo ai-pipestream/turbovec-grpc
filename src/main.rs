@@ -19,10 +19,11 @@ use std::time::Duration;
 
 use tonic::transport::Server;
 use turbovec_grpc::proto::coordinator_client::CoordinatorClient;
-use turbovec_grpc::proto::RegisterNodeRequest;
+use turbovec_grpc::proto::documents_server::DocumentsServer;
 use turbovec_grpc::proto::turbo_vec_admin_server::TurboVecAdminServer;
 use turbovec_grpc::proto::turbo_vec_query_server::TurboVecQueryServer;
-use turbovec_grpc::{proto, IndexStore, Metrics, ServiceLimits, TurboVecService};
+use turbovec_grpc::proto::RegisterNodeRequest;
+use turbovec_grpc::{proto, DocumentsService, IndexStore, Metrics, ServiceLimits, TurboVecService};
 
 /// Default listen address when `TURBOVEC_GRPC_ADDR` is not set.
 const DEFAULT_ADDR: &str = "0.0.0.0:50051";
@@ -75,6 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_admin_server()
         .max_decoding_message_size(max_message_bytes)
         .max_encoding_message_size(max_message_bytes);
+    let documents_service = DocumentsService::new(Arc::clone(&store), ServiceLimits::from_env()?)
+        .into_server()
+        .max_decoding_message_size(max_message_bytes)
+        .max_encoding_message_size(max_message_bytes);
 
     // Standard gRPC health checking (grpc.health.v1), so orchestrators and
     // load balancers can probe liveness/readiness without calling the API.
@@ -86,12 +91,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         health_reporter
             .set_serving::<TurboVecAdminServer<TurboVecService>>()
             .await;
+        health_reporter
+            .set_serving::<DocumentsServer<DocumentsService>>()
+            .await;
     } else {
         health_reporter
             .set_not_serving::<TurboVecQueryServer<TurboVecService>>()
             .await;
         health_reporter
             .set_not_serving::<TurboVecAdminServer<TurboVecService>>()
+            .await;
+        health_reporter
+            .set_not_serving::<DocumentsServer<DocumentsService>>()
             .await;
     }
     tokio::spawn(async move {
@@ -105,12 +116,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 health_reporter
                     .set_serving::<TurboVecAdminServer<TurboVecService>>()
                     .await;
+                health_reporter
+                    .set_serving::<DocumentsServer<DocumentsService>>()
+                    .await;
             } else {
                 health_reporter
                     .set_not_serving::<TurboVecQueryServer<TurboVecService>>()
                     .await;
                 health_reporter
                     .set_not_serving::<TurboVecAdminServer<TurboVecService>>()
+                    .await;
+                health_reporter
+                    .set_not_serving::<DocumentsServer<DocumentsService>>()
                     .await;
             }
         }
@@ -145,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .trace_fn(|request| tracing::info_span!("grpc", method = %request.uri().path()))
         .add_service(query_service)
         .add_service(admin_service)
+        .add_service(documents_service)
         .add_service(health_service)
         .add_service(reflection)
         .serve_with_shutdown(addr, turbovec_grpc::shutdown_signal())

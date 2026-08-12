@@ -323,7 +323,7 @@ impl TurboVecAdmin for TurboVecService {
 }
 
 /// Build the metadata message for one open index.
-fn index_info(id: &str, index: &Index, labelled: bool, generation: u64) -> IndexInfo {
+pub(crate) fn index_info(id: &str, index: &Index, labelled: bool, generation: u64) -> IndexInfo {
     IndexInfo {
         index_id: id.to_string(),
         kind: index.kind() as i32,

@@ -40,15 +40,31 @@ pub mod proto {
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("turbovec_v1");
 }
 
+/// Generated types for the vendored `ai.pipestream.proto.index.hints.v1`
+/// indexing-hint options (owned by protomolt; the vendored copy under
+/// `proto/ai/pipestream/` must stay byte-identical to the source).
+///
+/// prost does not generate the `extend google.protobuf.FieldOptions` block
+/// itself; [`schema`] reads the extension off client descriptors dynamically
+/// and decodes its payload into these typed structs.
+pub mod hints {
+    #![allow(clippy::all)]
+    tonic::include_proto!("ai.pipestream.proto.index.hints.v1");
+}
+
 pub mod config;
 pub mod coordinator;
+pub mod documents;
 pub mod errors;
 pub mod observability;
+pub mod schema;
 pub mod service;
 pub mod store;
 
 pub use coordinator::{CoordinatorLimits, CoordinatorService, NodeTable, ShardConfig};
+pub use documents::DocumentsService;
 pub use observability::Metrics;
+pub use schema::BoundSchema;
 pub use service::{ServiceLimits, TurboVecService};
 pub use store::{Index, IndexStore};
 

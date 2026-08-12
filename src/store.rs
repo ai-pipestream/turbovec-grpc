@@ -18,12 +18,14 @@ use serde::{Deserialize, Serialize};
 use turbovec::{CalibrationState, IdMapIndex, TurboQuantIndex};
 
 use crate::proto::IndexKind;
+use crate::schema::BoundSchema;
 
 const MANIFEST_VERSION: u32 = 1;
 const CURRENT_FILE: &str = "CURRENT";
 const MANIFEST_FILE: &str = "manifest.json";
 const INDEX_FILE: &str = "index.tv";
 const LABELS_FILE: &str = "labels.le64";
+const SCHEMA_FILE: &str = "schema.fds";
 
 /// One open index, of either storage model.
 pub enum Index {
@@ -115,6 +117,17 @@ impl fmt::Display for PersistenceError {
 
 impl std::error::Error for PersistenceError {}
 
+/// Manifest entry for a bound schema. The descriptor set itself lives in
+/// `schema.fds` beside the index, verbatim as the client registered it;
+/// the manifest carries what restore needs to validate it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SchemaManifest {
+    message_type: String,
+    fingerprint: String,
+    descriptor_bytes: u64,
+    descriptor_crc32: u32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ShardManifest {
     version: u32,
@@ -134,6 +147,8 @@ struct ShardManifest {
     labels_crc32: u32,
     #[serde(default)]
     last_ingest: Option<IngestRecord>,
+    #[serde(default)]
+    schema: Option<SchemaManifest>,
 }
 
 /// Thread-safe registry keyed by stable shard id.
@@ -142,6 +157,7 @@ pub struct IndexStore {
     labels: RwLock<HashMap<String, Labels>>,
     generations: RwLock<HashMap<String, u64>>,
     ingests: RwLock<HashMap<String, IngestRecord>>,
+    schemas: RwLock<HashMap<String, Arc<BoundSchema>>>,
     data_root: Option<PathBuf>,
 }
 
@@ -152,6 +168,7 @@ impl Default for IndexStore {
             labels: RwLock::new(HashMap::new()),
             generations: RwLock::new(HashMap::new()),
             ingests: RwLock::new(HashMap::new()),
+            schemas: RwLock::new(HashMap::new()),
             data_root: None,
         }
     }
@@ -268,6 +285,24 @@ impl IndexStore {
             .insert(id.to_string(), record);
     }
 
+    /// Bind a derived schema to an open index. The next persist writes it
+    /// with the generation, and restore re-derives and validates it.
+    pub fn bind_schema(&self, id: &str, schema: Arc<BoundSchema>) {
+        self.schemas
+            .write()
+            .expect("index registry lock poisoned")
+            .insert(id.to_string(), schema);
+    }
+
+    /// The schema bound to an index, or `None` for a plain vector index.
+    pub fn schema(&self, id: &str) -> Option<Arc<BoundSchema>> {
+        self.schemas
+            .read()
+            .expect("index registry lock poisoned")
+            .get(id)
+            .cloned()
+    }
+
     /// Look up an open index by stable shard id.
     pub fn get(&self, id: &str) -> Option<Handle> {
         self.inner
@@ -305,6 +340,10 @@ impl IndexStore {
             .expect("index registry lock poisoned")
             .remove(id);
         self.ingests
+            .write()
+            .expect("index registry lock poisoned")
+            .remove(id);
+        self.schemas
             .write()
             .expect("index registry lock poisoned")
             .remove(id);
@@ -358,6 +397,7 @@ impl IndexStore {
         fs::create_dir(&temp_dir)
             .map_err(|e| path_error("create temporary generation", &temp_dir, e))?;
 
+        let schema = self.schema(id);
         let result = (|| {
             let index_path = temp_dir.join(INDEX_FILE);
             let last_ingest = self.ingest_record(id);
@@ -380,6 +420,20 @@ impl IndexStore {
                     }
                     None => (0, 0),
                 };
+                let schema_manifest = match schema.as_deref() {
+                    Some(bound) => {
+                        let path = temp_dir.join(SCHEMA_FILE);
+                        write_synced(&path, &bound.descriptor_set)?;
+                        let (descriptor_bytes, descriptor_crc32) = file_size_crc(&path)?;
+                        Some(SchemaManifest {
+                            message_type: bound.schema.message_type.clone(),
+                            fingerprint: bound.schema.fingerprint.clone(),
+                            descriptor_bytes,
+                            descriptor_crc32,
+                        })
+                    }
+                    None => None,
+                };
                 manifest_for(
                     id,
                     generation,
@@ -390,6 +444,7 @@ impl IndexStore {
                         labelled: labels.is_some(),
                         labels_count,
                         labels_crc32,
+                        schema: schema_manifest,
                     },
                     last_ingest,
                 )
@@ -517,13 +572,49 @@ impl IndexStore {
                 }
                 None
             };
+            let schema = match &manifest.schema {
+                Some(record) => Some(restore_schema(&generation_dir, record)?),
+                None => None,
+            };
             self.insert_with_id(id.to_string(), index, labels, generation)?;
             if let Some(record) = manifest.last_ingest {
                 self.set_ingest_record(id, record);
             }
+            if let Some(schema) = schema {
+                self.bind_schema(id, schema);
+            }
         }
         Ok(())
     }
+}
+
+/// Rebuild a bound schema from its persisted descriptor set. The plan is
+/// re-derived by the code that is loading it, and a fingerprint that no
+/// longer matches the manifest fails the restore: a derivation change is
+/// an index compatibility event, and serving through it would quietly
+/// change what the index means.
+fn restore_schema(
+    generation_dir: &Path,
+    record: &SchemaManifest,
+) -> Result<Arc<BoundSchema>, PersistenceError> {
+    let path = generation_dir.join(SCHEMA_FILE);
+    verify_file(&path, record.descriptor_bytes, record.descriptor_crc32)?;
+    let bytes = fs::read(&path).map_err(|e| path_error("read schema descriptor set", &path, e))?;
+    let bound = BoundSchema::derive(&bytes, &record.message_type).map_err(|e| {
+        PersistenceError::new(format!(
+            "re-derive persisted schema {}: {e}",
+            record.message_type
+        ))
+    })?;
+    if bound.schema.fingerprint != record.fingerprint {
+        return Err(PersistenceError::new(format!(
+            "schema fingerprint drift for {}: persisted {}, re-derived {}; \
+             the derivation rules changed since this shard was written, so this \
+             build refuses to serve it",
+            record.message_type, record.fingerprint, bound.schema.fingerprint
+        )));
+    }
+    Ok(Arc::new(bound))
 }
 
 fn validate_shard_id(id: &str) -> Result<(), PersistenceError> {
@@ -559,6 +650,7 @@ struct PersistedFiles {
     labelled: bool,
     labels_count: u64,
     labels_crc32: u32,
+    schema: Option<SchemaManifest>,
 }
 
 fn manifest_for(
@@ -593,6 +685,7 @@ fn manifest_for(
         labels_count: files.labels_count,
         labels_crc32: files.labels_crc32,
         last_ingest,
+        schema: files.schema,
     }
 }
 
