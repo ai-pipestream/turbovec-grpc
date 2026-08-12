@@ -127,6 +127,31 @@ SHA-256 over their UTF-8 bytes, big-endian — part of the wire contract, so
 any client can predict the labels its documents will carry in search
 results.
 
+### Sharded document collections
+
+The coordinator serves the same surface over many shards. Its
+`SearchDocuments` fans the query batch and the same CEL filter out to every
+shard, where each one evaluates the filter over its own stored fields and
+returns the exact top-k of the documents it admits; merging those lists by
+score is the exact collection top-k, because the union of per-shard admitted
+sets is the collection's admitted set. `matched`/`total` sum across shards.
+
+A filter can only mean one thing when every shard agrees what a document is,
+so schema agreement is part of collection binding: every shard must carry
+the same schema fingerprint, or none may carry any. A collection where some
+shards bind a schema and others do not — or bind different fingerprints —
+is refused by name (`mixed_schema`), and `SearchDocuments` on a plain vector
+collection is refused as `schema_required`. `ListNodes` reports each shard's
+fingerprint.
+
+Schema-bound shards need no calibration step to score comparably: an
+uncalibrated index encodes each row as a pure function of the row (fixed
+rotation and codebook from `(dim, bit_width)`, per-row scales), so the empty
+pair is itself a shared calibration and the merge is exact. `Split`/`Join`
+refuse id-mapped shards by name — turbovec's `IdMapIndex` does not expose
+the encoded rows those calls move — so a document collection is resharded by
+re-ingesting, for now.
+
 ## Run the coordinator
 
 The node table contains one shard per comma or newline-separated entry:

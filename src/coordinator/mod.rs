@@ -49,20 +49,24 @@ use turbovec::TurboQuantIndex;
 
 use crate::errors::{
     self, AMBIGUOUS_INDEX, BIT_WIDTH_MISMATCH, DIMENSION_MISMATCH, EMPTY_COLLECTION,
-    MIXED_CALIBRATION, NODE_UNREACHABLE, ROW_COUNT_MISMATCH,
+    MIXED_CALIBRATION, MIXED_SCHEMA, NODE_UNREACHABLE, POSITIONAL_INDEX_REQUIRED,
+    ROW_COUNT_MISMATCH, SCHEMA_REQUIRED,
 };
 use crate::observability::Metrics;
 use crate::proto::coordinator_server::{Coordinator, CoordinatorServer};
+use crate::proto::documents_client::DocumentsClient;
 use crate::proto::turbo_vec_admin_client::TurboVecAdminClient;
 use crate::proto::turbo_vec_query_client::TurboVecQueryClient;
 use crate::proto::{
-    Calibration, CollectionQueryResult, CollectionSearchRequest, CollectionSearchResponse,
-    ExportRowsRequest, FitCalibrationRequest, FitCalibrationResponse, FlushRequest,
-    GetCalibrationRequest, GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse,
-    ImportRowsStart, IndexInfo, JoinRequest, JoinResponse, ListIndexesRequest, ListNodesRequest,
-    ListNodesResponse, Neighbour, RegisterNodeRequest, RegisterNodeResponse, RowBlock,
-    SetCalibrationRequest, ShardRef, ShardStatus, SpareNodeStatus, SplitRequest, SplitResponse,
-    StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
+    Calibration, CollectionQueryResult, CollectionSearchDocumentsRequest,
+    CollectionSearchDocumentsResponse, CollectionSearchRequest, CollectionSearchResponse,
+    DocumentQueryResult, ExportRowsRequest, FitCalibrationRequest, FitCalibrationResponse,
+    FlushRequest, GetCalibrationRequest, GetIndexInfoRequest, GetSchemaRequest, ImportRowsRequest,
+    ImportRowsResponse, ImportRowsStart, IndexInfo, IndexSchema, JoinRequest, JoinResponse,
+    ListIndexesRequest, ListNodesRequest, ListNodesResponse, Neighbour, RegisterNodeRequest,
+    RegisterNodeResponse, RowBlock, SearchDocumentsRequest, SetCalibrationRequest, ShardRef,
+    ShardStatus, SpareNodeStatus, SplitRequest, SplitResponse, StartStreamSearch,
+    StreamSearchRequest, StreamSearchResponse,
 };
 use crate::service::calibration_difference;
 
@@ -164,6 +168,9 @@ struct Probe {
 
     /// Calibration pair the node reported.
     calibration: Calibration,
+
+    /// The schema bound to the index, absent for a plain vector shard.
+    schema: Option<IndexSchema>,
 }
 
 struct ExportPlan {
@@ -188,6 +195,12 @@ struct Pinned {
 
     /// The calibration pair every shard holds.
     calibration: Calibration,
+
+    /// The schema every shard binds, or `None` for a plain vector
+    /// collection. A collection where the shards disagree — some bound,
+    /// some not, or bound to different fingerprints — does not bind at
+    /// all; see [`bind`].
+    schema: Option<IndexSchema>,
 }
 
 /// One candidate in the coordinator's bounded global heap.
@@ -478,6 +491,12 @@ impl CoordinatorService {
             .max_encoding_message_size(MAX_MESSAGE_BYTES))
     }
 
+    fn documents_client(&self, address: &str) -> Result<DocumentsClient<Channel>, Status> {
+        Ok(DocumentsClient::new(self.channel(address)?)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES))
+    }
+
     /// Search one query with one global heap while every shard streams
     /// candidates above the highest floor observed so far.
     async fn stream_query(
@@ -724,6 +743,7 @@ impl CoordinatorService {
     async fn probe_for_search(&self, shard: &ShardConfig) -> Result<Probe, Status> {
         let primary = probe(
             self.query_client(&shard.address)?,
+            self.documents_client(&shard.address)?,
             shard.address.clone(),
             shard.index_id.clone(),
         )
@@ -741,6 +761,7 @@ impl CoordinatorService {
                 for address in &shard.replicas {
                     let replica = probe(
                         self.query_client(address)?,
+                        self.documents_client(address)?,
                         address.clone(),
                         shard.index_id.clone(),
                     )
@@ -804,6 +825,7 @@ impl CoordinatorService {
     async fn resolve(&self, shard: &ShardConfig) -> Result<Probe, Status> {
         probe(
             self.query_client(&shard.address)?,
+            self.documents_client(&shard.address)?,
             shard.address.clone(),
             shard.index_id.clone(),
         )
@@ -936,9 +958,11 @@ fn empty_block(source: &Probe) -> RowBlock {
     }
 }
 
-/// Read one node's view of one shard: which index, its metadata, its pair.
+/// Read one node's view of one shard: which index, its metadata, its pair,
+/// and the schema bound to it, if any.
 async fn probe(
     mut client: TurboVecQueryClient<Channel>,
+    mut documents: DocumentsClient<Channel>,
     address: String,
     index_id: Option<String>,
 ) -> Result<Probe, Status> {
@@ -982,11 +1006,33 @@ async fn probe(
         .await
         .map_err(|e| node_error(&address, &e))?
         .into_inner();
+    // A shard with no bound schema is an answer, not a failure: NOT_FOUND
+    // is what the Documents service says for a plain vector index, and
+    // UNIMPLEMENTED is what a node that does not serve Documents at all
+    // says. Everything else is the node failing the probe.
+    let schema = match documents
+        .get_schema(GetSchemaRequest {
+            index_id: index_id.clone(),
+        })
+        .await
+    {
+        Ok(response) => response.into_inner().schema,
+        Err(status)
+            if matches!(
+                status.code(),
+                tonic::Code::NotFound | tonic::Code::Unimplemented
+            ) =>
+        {
+            None
+        }
+        Err(status) => return Err(node_error(&address, &status)),
+    };
     Ok(Probe {
         address,
         index_id,
         info,
         calibration,
+        schema,
     })
 }
 
@@ -1044,15 +1090,61 @@ fn bind(generation: u64, shards: Vec<Probe>) -> Result<Pinned, Status> {
                 ),
             ));
         }
+        // The schema question is all-or-nothing, like the calibration one:
+        // either every shard binds the same fingerprint (a document
+        // collection) or no shard binds any (a plain vector collection). A
+        // shard that disagrees means the shards do not hold slices of one
+        // thing, which no amount of merging can repair.
+        match (&head.schema, &shard.schema) {
+            (None, None) => {}
+            (Some(expected), Some(found)) if expected.fingerprint == found.fingerprint => {}
+            (Some(expected), Some(found)) => {
+                return Err(errors::precondition(
+                    MIXED_SCHEMA,
+                    format!(
+                        "shard {} binds schema {} ({}) and shard {} binds schema {} ({}); a \
+                         filter over the planned fields cannot mean one thing across them",
+                        head.address,
+                        expected.fingerprint,
+                        expected.message_type,
+                        shard.address,
+                        found.fingerprint,
+                        found.message_type
+                    ),
+                ));
+            }
+            (Some(expected), None) => {
+                return Err(errors::precondition(
+                    MIXED_SCHEMA,
+                    format!(
+                        "shard {} binds schema {} ({}) and shard {} binds no schema; bind the \
+                         same schema on every shard, or on none",
+                        head.address, expected.fingerprint, expected.message_type, shard.address
+                    ),
+                ));
+            }
+            (None, Some(found)) => {
+                return Err(errors::precondition(
+                    MIXED_SCHEMA,
+                    format!(
+                        "shard {} binds no schema and shard {} binds schema {} ({}); bind the \
+                         same schema on every shard, or on none",
+                        head.address, shard.address, found.fingerprint, found.message_type
+                    ),
+                ));
+            }
+        }
         rows += shard.info.len;
     }
     let calibration = head.calibration.clone();
+    let schema = head.schema.clone();
     Ok(Pinned {
         generation,
         shards,
         dim: dim as usize,
         rows,
         calibration,
+        schema,
     })
 }
 
@@ -1086,6 +1178,28 @@ fn shard_ref(address: &str, index_id: &str) -> ShardRef {
         address: address.to_string(),
         index_id: index_id.to_string(),
     }
+}
+
+/// Refuse an id-mapped shard where a row move needs a positional one.
+///
+/// Split and Join move rows as encoded codes, through `ExportRows` and
+/// `ImportRows`, which need `TurboQuantIndex`'s raw-parts accessors that
+/// `IdMapIndex` does not forward. The node would refuse the export itself,
+/// but only once the transfer starts; checking the probed kind here refuses
+/// before anything is created — and keeps a zero-row source, whose transfer
+/// would never touch the export path at all, from slipping through.
+fn require_positional(probe: &Probe, what: &str) -> Result<(), Status> {
+    if probe.info.kind != crate::proto::IndexKind::Positional as i32 {
+        return Err(errors::precondition(
+            POSITIONAL_INDEX_REQUIRED,
+            format!(
+                "{what} moves rows as encoded codes, which turbovec's IdMapIndex does not \
+                 expose; shard {} index {} is id-mapped",
+                probe.address, probe.index_id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_required_generation(config: &ShardConfig, probe: &Probe) -> Result<(), Status> {
@@ -1159,6 +1273,11 @@ impl Coordinator for CoordinatorService {
                         info: Some(probe.info.clone()),
                         calibration: Some(probe.calibration.clone()),
                         error: String::new(),
+                        schema_fingerprint: probe
+                            .schema
+                            .as_ref()
+                            .map(|schema| schema.fingerprint.clone())
+                            .unwrap_or_default(),
                     });
                     healthy.push(probe);
                 }
@@ -1170,6 +1289,7 @@ impl Coordinator for CoordinatorService {
                     info: None,
                     calibration: None,
                     error: e.message().to_string(),
+                    schema_fingerprint: String::new(),
                 }),
             }
         }
@@ -1327,6 +1447,132 @@ impl Coordinator for CoordinatorService {
         }))
     }
 
+    async fn search_documents(
+        &self,
+        request: Request<CollectionSearchDocumentsRequest>,
+    ) -> Result<Response<CollectionSearchDocumentsResponse>, Status> {
+        let req = request.into_inner();
+        let k = req.k as usize;
+        if k == 0 || k > self.limits.max_k {
+            return Err(Status::invalid_argument(format!(
+                "k must be between 1 and {}",
+                self.limits.max_k
+            )));
+        }
+        let pinned = self.collection().await?;
+        if pinned.schema.is_none() {
+            return Err(errors::precondition(
+                SCHEMA_REQUIRED,
+                "this collection's shards carry no bound schema; SearchDocuments needs a \
+                 schema-bound collection — bind the same schema on every shard, or use Search",
+            ));
+        }
+        if req.queries.is_empty() || !req.queries.len().is_multiple_of(pinned.dim) {
+            return Err(Status::invalid_argument(format!(
+                "query buffer length {} is not a positive multiple of the collection dim {}",
+                req.queries.len(),
+                pinned.dim
+            )));
+        }
+        let nq = req.queries.len() / pinned.dim;
+        if nq > self.limits.max_queries_per_request {
+            return Err(Status::resource_exhausted(format!(
+                "request has {nq} queries; limit is {}",
+                self.limits.max_queries_per_request
+            )));
+        }
+
+        // Every shard evaluates the filter over its own stored fields and
+        // returns the exact top-k of the documents it admits. The union of
+        // the per-shard admitted sets is the collection's admitted set, and
+        // each shard's list already contains every admitted document that
+        // could place globally, so the merge below is the collection's
+        // exact top-k. The whole query batch goes to every shard in one
+        // call: unlike the streaming Search path there is no floor to feed
+        // back, so there is nothing to gain from splitting it.
+        let mut tasks = Vec::with_capacity(pinned.shards.len());
+        for shard in &pinned.shards {
+            let mut client = self.documents_client(&shard.address)?;
+            let mut shard_request = Request::new(SearchDocumentsRequest {
+                index_id: shard.index_id.clone(),
+                queries: req.queries.clone(),
+                k: req.k,
+                filter: req.filter.clone(),
+            });
+            shard_request.set_timeout(self.limits.query_timeout);
+            tasks.push(tokio::spawn(async move {
+                client.search_documents(shard_request).await
+            }));
+        }
+        let mut shard_responses = Vec::with_capacity(pinned.shards.len());
+        for (task, shard) in tasks.into_iter().zip(&pinned.shards) {
+            let response = task
+                .await
+                .map_err(|e| Status::internal(format!("shard search task failed: {e}")))?
+                .map_err(|status| match status.code() {
+                    // A shard's INVALID_ARGUMENT is a diagnosis of this
+                    // request — the filter does not parse, references an
+                    // unplanned field, or met a value it cannot handle — and
+                    // every shard would say the same thing, because they all
+                    // hold one schema. It travels back as what it is rather
+                    // than being rewrapped as the node not answering.
+                    tonic::Code::InvalidArgument => Status::invalid_argument(format!(
+                        "{} (shard {})",
+                        status.message(),
+                        shard.address
+                    )),
+                    _ => node_error(&shard.address, &status),
+                })?
+                .into_inner();
+            if response.results.len() != nq {
+                return Err(Status::internal(format!(
+                    "shard {} returned {} results for {nq} queries",
+                    shard.address,
+                    response.results.len()
+                )));
+            }
+            shard_responses.push(response);
+        }
+
+        let mut results = Vec::with_capacity(nq);
+        for qi in 0..nq {
+            // (shard rank, rank within the shard's list, hit): score decides,
+            // then shard order, then the shard's own order — the same
+            // deterministic-but-meaningless tie rule the streaming merge uses.
+            let mut merged = Vec::new();
+            for (shard_rank, response) in shard_responses.iter().enumerate() {
+                for (hit_rank, hit) in response.results[qi].hits.iter().enumerate() {
+                    if hit.score.is_nan() {
+                        return Err(Status::internal(format!(
+                            "shard {} returned a NaN score",
+                            pinned.shards[shard_rank].address
+                        )));
+                    }
+                    merged.push((shard_rank, hit_rank, hit.clone()));
+                }
+            }
+            merged.sort_by(|a, b| {
+                b.2.score
+                    .total_cmp(&a.2.score)
+                    .then_with(|| a.0.cmp(&b.0))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            merged.truncate(k);
+            results.push(DocumentQueryResult {
+                hits: merged.into_iter().map(|(_, _, hit)| hit).collect(),
+            });
+        }
+        let matched = shard_responses.iter().map(|r| r.matched).sum();
+        let total = shard_responses.iter().map(|r| r.total).sum();
+        self.metrics.coordinator_search_finished();
+        Ok(Response::new(CollectionSearchDocumentsResponse {
+            results,
+            matched,
+            total,
+            topology_generation: pinned.generation,
+        }))
+    }
+
     async fn fit_calibration(
         &self,
         request: Request<FitCalibrationRequest>,
@@ -1412,6 +1658,7 @@ impl Coordinator for CoordinatorService {
             Status::invalid_argument("split needs a source shard to redistribute")
         })?;
         let source = self.resolve(&to_config(&source)).await?;
+        require_positional(&source, "Split")?;
         let counts = plan_counts(source.info.len, req.targets.len(), &req.row_counts)?;
 
         // One target at a time. Every transfer is a bounded block stream and
@@ -1470,7 +1717,9 @@ impl Coordinator for CoordinatorService {
         // what an operator has to act on.
         let mut probes = Vec::with_capacity(sources.len());
         for source in &sources {
-            probes.push(self.resolve(source).await?);
+            let probe = self.resolve(source).await?;
+            require_positional(&probe, "Join")?;
+            probes.push(probe);
         }
         let pinned = bind(self.topology().0, probes.clone())?;
 

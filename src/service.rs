@@ -16,9 +16,12 @@
 //! Four calls exist for the distributed layer rather than for a single-node
 //! client: `SetCalibration` and `GetCalibration` commit and read back the TQ+
 //! pair that makes separately built indexes score comparably, and `ExportRows`
-//! and `ImportRows` move rows between servers as encoded codes. All four are
-//! positional-only, because they need `TurboQuantIndex`'s raw-parts accessors
-//! and `IdMapIndex` does not forward them.
+//! and `ImportRows` move rows between servers as encoded codes. `GetCalibration`
+//! answers for both index shapes — an uncalibrated id-mapped index truthfully
+//! reports the empty pair, which is what lets a coordinator bind a collection
+//! of schema-bound shards. The other three stay positional-only, because they
+//! need `TurboQuantIndex`'s raw-parts accessors and `IdMapIndex` does not
+//! forward them.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -380,6 +383,45 @@ fn calibration_of(index: &TurboQuantIndex) -> Calibration {
         tqplus_shift: index.tqplus_shift().to_vec(),
         tqplus_scale: index.tqplus_scale().to_vec(),
     }
+}
+
+/// Read the calibration pair behind a handle, for either index shape.
+///
+/// The pair is what a distributed caller compares: the coordinator binds a
+/// collection by holding every shard to one pair, and schema-bound
+/// (id-mapped) shards have to answer that question too. `IdMapIndex` does
+/// not forward the TQ+ getters, but an uncalibrated index's pair is the
+/// empty one by definition, and no call on this server can commit a pair to
+/// an id-mapped index (`SetCalibration` is positional-only), so Uncalibrated
+/// is the one state an id-mapped index can truthfully report. The empty pair
+/// is not a gap in the exactness story: uncalibrated encoding is a pure
+/// per-row function (fixed rotation and codebook from `(dim, bit_width)`,
+/// per-row scales), so rows score identically wherever they are stored,
+/// exactly as they do under a shared non-empty pair.
+///
+/// An id-mapped index that reports Calibrated anyway (possible only through
+/// foreign snapshot bytes) has a pair this server cannot read, and that is
+/// refused by name rather than reported as empty.
+fn calibration_of_index(index: &Index) -> Result<Calibration, Status> {
+    let (tqplus_shift, tqplus_scale) = match index {
+        Index::Positional(inner) => (inner.tqplus_shift().to_vec(), inner.tqplus_scale().to_vec()),
+        Index::IdMap(inner) => match inner.calibration_state() {
+            turbovec::CalibrationState::Uncalibrated => (Vec::new(), Vec::new()),
+            _ => {
+                return Err(errors::precondition(
+                    INVALID_CALIBRATION,
+                    "this id-mapped index holds a committed TQ+ pair, which turbovec's \
+                     IdMapIndex does not expose for reading; its pair cannot be verified \
+                     against a collection's",
+                ))
+            }
+        },
+    };
+    Ok(Calibration {
+        state: calibration_state(index.calibration_state()) as i32,
+        tqplus_shift,
+        tqplus_scale,
+    })
 }
 
 /// A validated, prepared filter for one search, built once and reused across
@@ -1271,10 +1313,7 @@ impl TurboVec for TurboVecService {
         let guard = handle
             .read()
             .map_err(|_| Status::internal("index lock poisoned"))?;
-        Ok(Response::new(calibration_of(positional(
-            &guard,
-            "GetCalibration",
-        )?)))
+        Ok(Response::new(calibration_of_index(&guard)?))
     }
 
     type ExportRowsStream = ReceiverStream<Result<RowBlock, Status>>;
