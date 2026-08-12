@@ -6,22 +6,24 @@
 //! produces: a serialized `FileDescriptorSet` with imports included.
 
 use prost::Message as _;
-use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+use prost_reflect::{DescriptorPool, DynamicMessage, ReflectMessage as _, Value};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Endpoint, Server};
+use turbovec_grpc::filter::CompiledFilter;
 use turbovec_grpc::proto::documents_client::DocumentsClient;
 use turbovec_grpc::proto::turbo_vec_client::TurboVecClient;
 use turbovec_grpc::proto::{
-    AddDocumentsRequest, BindSchemaRequest, FieldKind, FieldRole, FlushRequest, GetSchemaRequest,
-    PlanSchemaRequest, SchemaSource, SearchRequest,
+    AddDocumentsRequest, AddRequest, BindSchemaRequest, FieldKind, FieldRole, FlushRequest,
+    GetSchemaRequest, PlanSchemaRequest, RemoveRequest, SchemaSource, SearchDocumentsRequest,
+    SearchRequest,
 };
 use turbovec_grpc::schema::{hash_string_id, BoundSchema};
 use turbovec_grpc::{DocumentsService, IndexStore, ServiceLimits, TurboVecService};
 
 /// A product type exercising hints and inference together: an explicit
 /// VECTOR hint with declared dims, an explicit SKIP, a nested message that
-/// expands into dotted paths, a Timestamp leaf, and inferred keyword/text
-/// splits.
+/// expands into dotted paths, a Timestamp leaf, an enum, a repeated
+/// scalar, and inferred keyword/text splits.
 const ANNOTATED: &str = r#"
 syntax = "proto3";
 package test.v1;
@@ -43,6 +45,14 @@ message Product {
   string scratch = 8 [(ai.pipestream.proto.index.hints.v1.index) = {
     type: INDEX_FIELD_TYPE_SKIP
   }];
+  repeated string tags = 9;
+  Status status = 10;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_ACTIVE = 1;
+  STATUS_DISCONTINUED = 2;
 }
 
 message Meta {
@@ -117,6 +127,40 @@ fn embedding(doc: usize) -> Vec<Value> {
         .collect()
 }
 
+/// Encode one fully populated test.v1.Product, nested Timestamp included.
+fn product(
+    descriptor_set: &[u8],
+    doc: usize,
+    price_cents: i64,
+    author: &str,
+    created_seconds: i64,
+    tags: &[&str],
+    status: i32,
+) -> Vec<u8> {
+    document(descriptor_set, "test.v1.Product", move |m| {
+        let pool = m.descriptor().parent_pool().clone();
+        m.set_field_by_name("id", Value::String(format!("doc-{doc}")));
+        m.set_field_by_name("title", Value::String(format!("product {doc}")));
+        m.set_field_by_name("price_cents", Value::I64(price_cents));
+        m.set_field_by_name("in_stock", Value::Bool(doc.is_multiple_of(2)));
+        m.set_field_by_name("embedding", Value::List(embedding(doc)));
+        m.set_field_by_name(
+            "tags",
+            Value::List(tags.iter().map(|t| Value::String(t.to_string())).collect()),
+        );
+        m.set_field_by_name("status", Value::EnumNumber(status));
+        let mut timestamp = DynamicMessage::new(
+            pool.get_message_by_name("google.protobuf.Timestamp")
+                .unwrap(),
+        );
+        timestamp.set_field_by_name("seconds", Value::I64(created_seconds));
+        let mut meta = DynamicMessage::new(pool.get_message_by_name("test.v1.Meta").unwrap());
+        meta.set_field_by_name("author", Value::String(author.to_string()));
+        meta.set_field_by_name("created_at", Value::Message(timestamp));
+        m.set_field_by_name("meta", Value::Message(meta));
+    })
+}
+
 #[test]
 fn derives_a_deterministic_plan_with_hints_and_inference() {
     let bound = derive(ANNOTATED, "test.v1.Product");
@@ -165,6 +209,8 @@ fn derives_a_deterministic_plan_with_hints_and_inference() {
             ),
             ("embedding", "embedding", FieldKind::Vector, FieldRole::None),
             // scratch is hinted SKIP and does not appear.
+            ("tags", "tags", FieldKind::Text, FieldRole::None),
+            ("status", "status", FieldKind::Keyword, FieldRole::None),
         ]
     );
 
@@ -284,9 +330,12 @@ fn extraction_reads_ids_and_vectors_and_fails_loud() {
         m.set_field_by_name("id", Value::String("doc-1".into()));
         m.set_field_by_name("embedding", Value::List(embedding(0)));
     });
-    let (label, vector) = bound.extract(&good).unwrap();
-    assert_eq!(label, hash_string_id("doc-1"));
-    assert_eq!(vector.len(), 8);
+    let extracted = bound.extract(&good).unwrap();
+    assert_eq!(extracted.label, hash_string_id("doc-1"));
+    assert_eq!(extracted.vector.len(), 8);
+    // Every stored field is present, defaults included: 9 planned fields
+    // minus the vector, which is not a stored field.
+    assert_eq!(extracted.fields.len(), bound.schema.fields.len() - 1);
 
     let missing_id = document(&descriptor_set, "test.v1.Product", |m| {
         m.set_field_by_name("embedding", Value::List(embedding(0)));
@@ -306,6 +355,80 @@ fn extraction_reads_ids_and_vectors_and_fails_loud() {
     });
     let error = bound.extract(&no_vector).unwrap_err().to_string();
     assert!(error.contains("empty vector"), "{error}");
+}
+
+#[test]
+fn cel_filters_read_the_documents_own_proto_fields() {
+    let descriptor_set = compile(ANNOTATED);
+    let bound = BoundSchema::derive(&descriptor_set, "test.v1.Product").unwrap();
+    let full = bound
+        .extract(&product(
+            &descriptor_set,
+            1,
+            4200,
+            "kagome",
+            1_700_000_000,
+            &["legal", "opinion"],
+            1, // STATUS_ACTIVE
+        ))
+        .unwrap();
+    let sparse = bound
+        .extract(&document(&descriptor_set, "test.v1.Product", |m| {
+            m.set_field_by_name("id", Value::String("doc-9".into()));
+            m.set_field_by_name("embedding", Value::List(embedding(0)));
+        }))
+        .unwrap();
+
+    let admits = |expression: &str, fields: &_| {
+        CompiledFilter::compile(expression, &bound.schema, bound.stored_fields())
+            .unwrap()
+            .matches(fields)
+            .unwrap()
+    };
+
+    // Scalars, nested paths, timestamps, repeated membership, enum names.
+    assert!(admits("price_cents < 5000", &full.fields));
+    assert!(!admits("price_cents < 4200", &full.fields));
+    assert!(admits(r#"meta.author == "kagome""#, &full.fields));
+    assert!(admits(
+        r#"meta.created_at > timestamp("2020-01-01T00:00:00Z")"#,
+        &full.fields
+    ));
+    assert!(admits(r#""legal" in tags"#, &full.fields));
+    assert!(admits(r#"status == "STATUS_ACTIVE""#, &full.fields));
+    assert!(admits(
+        r#"price_cents < 5000 && meta.author == "kagome" && !("draft" in tags)"#,
+        &full.fields
+    ));
+
+    // Unset proto3 fields evaluate as their defaults, epoch included.
+    assert!(admits(r#"title == """#, &sparse.fields));
+    assert!(admits("in_stock == false", &sparse.fields));
+    assert!(admits("size(tags) == 0", &sparse.fields));
+    assert!(admits(r#"status == "STATUS_UNSPECIFIED""#, &sparse.fields));
+    assert!(admits(
+        r#"meta.created_at == timestamp("1970-01-01T00:00:00Z")"#,
+        &sparse.fields
+    ));
+
+    // Failures are loud and name the problem.
+    let unknown = CompiledFilter::compile("nonexistent > 1", &bound.schema, bound.stored_fields())
+        .expect_err("unknown fields fail at compile time")
+        .to_string();
+    assert!(
+        unknown.contains("nonexistent") && unknown.contains("price_cents"),
+        "names the field and what is available: {unknown}"
+    );
+    let unparsed = CompiledFilter::compile("price_cents <", &bound.schema, bound.stored_fields())
+        .expect_err("syntax errors fail at compile time")
+        .to_string();
+    assert!(unparsed.contains("parse"), "{unparsed}");
+    let non_bool = CompiledFilter::compile("price_cents + 1", &bound.schema, bound.stored_fields())
+        .unwrap()
+        .matches(&full.fields)
+        .expect_err("a non-boolean filter fails at evaluation")
+        .to_string();
+    assert!(non_bool.contains("boolean"), "{non_bool}");
 }
 
 /// Start a node with the vector services and the Documents service on one
@@ -460,6 +583,194 @@ async fn documents_round_trip_over_grpc_and_survive_restart() {
         .err()
         .expect("corrupt schema must fail restore");
     assert!(error.to_string().contains("schema"), "{error}");
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_search_is_the_exact_top_k_of_the_admitted_set() {
+    let root = std::env::temp_dir().join(format!("turbovec-docs-{}", uuid::Uuid::new_v4()));
+    let (mut documents, mut vectors) = start(&root).await;
+    let descriptor_set = compile(ANNOTATED);
+    let index_id = documents
+        .bind_schema(BindSchemaRequest {
+            source: Some(SchemaSource {
+                descriptor_set: descriptor_set.clone(),
+                message_type: "test.v1.Product".to_string(),
+            }),
+            bit_width: 4,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .index_id;
+
+    // doc-i costs 1000 * (i + 1) cents; authors alternate.
+    let docs: Vec<Vec<u8>> = (0..4)
+        .map(|i| {
+            product(
+                &descriptor_set,
+                i,
+                1000 * (i as i64 + 1),
+                if i % 2 == 0 { "kagome" } else { "rin" },
+                1_600_000_000 + i as i64,
+                &["legal"],
+                1,
+            )
+        })
+        .collect();
+    documents
+        .add_documents(tokio_stream::iter(vec![AddDocumentsRequest {
+            index_id: index_id.clone(),
+            documents: docs,
+        }]))
+        .await
+        .unwrap();
+    let query: Vec<f32> = embedding(2)
+        .iter()
+        .map(|v| match v {
+            Value::F32(f) => *f,
+            _ => unreachable!(),
+        })
+        .collect();
+
+    // Unfiltered: doc-2 is the nearest neighbour and hits carry the
+    // original string id, not just the label.
+    let unfiltered = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 1,
+            filter: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(unfiltered.matched, 4);
+    assert_eq!(unfiltered.total, 4);
+    let top = &unfiltered.results[0].hits[0];
+    assert_eq!(top.label, hash_string_id("doc-2"));
+    assert_eq!(top.id, "doc-2");
+
+    // A filter that excludes the nearest neighbour returns the exact
+    // top-k of the admitted set, not a re-ranked approximation.
+    let filtered = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 4,
+            filter: "price_cents <= 2000".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(filtered.matched, 2);
+    assert_eq!(filtered.total, 4);
+    let mut ids: Vec<String> = filtered.results[0]
+        .hits
+        .iter()
+        .map(|hit| hit.id.clone())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["doc-0", "doc-1"]);
+
+    // Nested paths and identity work through the same expression surface.
+    let by_author = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 4,
+            filter: r#"meta.author == "rin" && id != "doc-1""#.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(by_author.matched, 1);
+    assert_eq!(by_author.results[0].hits[0].id, "doc-3");
+
+    // A bad expression is an INVALID_ARGUMENT naming the problem, never
+    // an empty result.
+    let status = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 1,
+            filter: "no_such_field == 1".to_string(),
+        })
+        .await
+        .expect_err("unknown fields fail the request");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(status.message().contains("no_such_field"));
+
+    // Remove drops the row's stored fields with the row.
+    vectors
+        .remove(RemoveRequest {
+            index_id: index_id.clone(),
+            id: hash_string_id("doc-3"),
+        })
+        .await
+        .unwrap();
+    let gone = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 4,
+            filter: r#"meta.author == "rin" && id != "doc-1""#.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(gone.matched, 0);
+    assert_eq!(gone.total, 3);
+    assert!(gone.results[0].hits.is_empty());
+
+    // A raw vector Add would create rows with no stored fields, so a
+    // schema-bound index refuses it.
+    let status = vectors
+        .add(tokio_stream::iter(vec![AddRequest {
+            index_id: index_id.clone(),
+            dim: 8,
+            vectors: vec![0.5; 8],
+            ids: vec![77],
+            operation_id: String::new(),
+            expected_len: None,
+            expected_rows: 0,
+        }]))
+        .await
+        .expect_err("schema-bound indexes only ingest through AddDocuments");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("AddDocuments"));
+
+    // The stored fields persist with the generation and restore exactly;
+    // a corrupted documents file fails the whole restore.
+    vectors
+        .flush(FlushRequest {
+            index_id: index_id.clone(),
+        })
+        .await
+        .unwrap();
+    let restored = IndexStore::open(&root).unwrap();
+    let columns = restored
+        .columns(&index_id)
+        .expect("columns survive restart");
+    assert_eq!(columns.read().unwrap().len(), 3);
+    drop(restored);
+
+    let documents_file = root
+        .join(&index_id)
+        .join("gen-00000000000000000001")
+        .join("documents.pb");
+    let mut bytes = std::fs::read(&documents_file).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&documents_file, bytes).unwrap();
+    let error = IndexStore::open(&root)
+        .err()
+        .expect("corrupt stored documents must fail restore");
+    assert!(
+        error.to_string().contains("documents.pb"),
+        "names the file: {error}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }

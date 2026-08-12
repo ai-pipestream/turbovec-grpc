@@ -14,10 +14,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crc32fast::Hasher;
+use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use turbovec::{CalibrationState, IdMapIndex, TurboQuantIndex};
 
-use crate::proto::IndexKind;
+use crate::columns::DocumentColumns;
+use crate::proto::{IndexKind, StoredDocumentSet};
 use crate::schema::BoundSchema;
 
 const MANIFEST_VERSION: u32 = 1;
@@ -26,6 +28,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 const INDEX_FILE: &str = "index.tv";
 const LABELS_FILE: &str = "labels.le64";
 const SCHEMA_FILE: &str = "schema.fds";
+const DOCUMENTS_FILE: &str = "documents.pb";
 
 /// One open index, of either storage model.
 pub enum Index {
@@ -118,14 +121,18 @@ impl fmt::Display for PersistenceError {
 impl std::error::Error for PersistenceError {}
 
 /// Manifest entry for a bound schema. The descriptor set itself lives in
-/// `schema.fds` beside the index, verbatim as the client registered it;
-/// the manifest carries what restore needs to validate it.
+/// `schema.fds` beside the index, verbatim as the client registered it,
+/// and the stored document field values live in `documents.pb`; the
+/// manifest carries what restore needs to validate both.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SchemaManifest {
     message_type: String,
     fingerprint: String,
     descriptor_bytes: u64,
     descriptor_crc32: u32,
+    documents_bytes: u64,
+    documents_crc32: u32,
+    documents_count: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +165,7 @@ pub struct IndexStore {
     generations: RwLock<HashMap<String, u64>>,
     ingests: RwLock<HashMap<String, IngestRecord>>,
     schemas: RwLock<HashMap<String, Arc<BoundSchema>>>,
+    columns: RwLock<HashMap<String, Arc<RwLock<DocumentColumns>>>>,
     data_root: Option<PathBuf>,
 }
 
@@ -169,6 +177,7 @@ impl Default for IndexStore {
             generations: RwLock::new(HashMap::new()),
             ingests: RwLock::new(HashMap::new()),
             schemas: RwLock::new(HashMap::new()),
+            columns: RwLock::new(HashMap::new()),
             data_root: None,
         }
     }
@@ -285,18 +294,43 @@ impl IndexStore {
             .insert(id.to_string(), record);
     }
 
-    /// Bind a derived schema to an open index. The next persist writes it
-    /// with the generation, and restore re-derives and validates it.
+    /// Bind a derived schema to an open index, with an empty column set
+    /// for its documents. The next persist writes both with the
+    /// generation, and restore re-derives and validates them.
     pub fn bind_schema(&self, id: &str, schema: Arc<BoundSchema>) {
+        let columns = DocumentColumns::new(schema.schema.fingerprint.clone());
+        self.bind_schema_with_columns(id, schema, columns);
+    }
+
+    fn bind_schema_with_columns(
+        &self,
+        id: &str,
+        schema: Arc<BoundSchema>,
+        columns: DocumentColumns,
+    ) {
         self.schemas
             .write()
             .expect("index registry lock poisoned")
             .insert(id.to_string(), schema);
+        self.columns
+            .write()
+            .expect("index registry lock poisoned")
+            .insert(id.to_string(), Arc::new(RwLock::new(columns)));
     }
 
     /// The schema bound to an index, or `None` for a plain vector index.
     pub fn schema(&self, id: &str) -> Option<Arc<BoundSchema>> {
         self.schemas
+            .read()
+            .expect("index registry lock poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    /// The stored document field values of a schema-bound index, or
+    /// `None` for a plain vector index.
+    pub fn columns(&self, id: &str) -> Option<Arc<RwLock<DocumentColumns>>> {
+        self.columns
             .read()
             .expect("index registry lock poisoned")
             .get(id)
@@ -344,6 +378,10 @@ impl IndexStore {
             .expect("index registry lock poisoned")
             .remove(id);
         self.schemas
+            .write()
+            .expect("index registry lock poisoned")
+            .remove(id);
+        self.columns
             .write()
             .expect("index registry lock poisoned")
             .remove(id);
@@ -425,11 +463,31 @@ impl IndexStore {
                         let path = temp_dir.join(SCHEMA_FILE);
                         write_synced(&path, &bound.descriptor_set)?;
                         let (descriptor_bytes, descriptor_crc32) = file_size_crc(&path)?;
+                        // The columns snapshot is coherent with the index
+                        // snapshot: this thread holds the index read lock,
+                        // and every columns mutation happens under the
+                        // index write lock.
+                        let columns = self.columns(id).ok_or_else(|| {
+                            PersistenceError::new(format!(
+                                "shard {id} has a bound schema but no document columns"
+                            ))
+                        })?;
+                        let set = columns
+                            .read()
+                            .map_err(|_| PersistenceError::new("columns lock poisoned"))?
+                            .to_set();
+                        let documents_count = set.documents.len() as u64;
+                        let documents_path = temp_dir.join(DOCUMENTS_FILE);
+                        write_synced(&documents_path, &set.encode_to_vec())?;
+                        let (documents_bytes, documents_crc32) = file_size_crc(&documents_path)?;
                         Some(SchemaManifest {
                             message_type: bound.schema.message_type.clone(),
                             fingerprint: bound.schema.fingerprint.clone(),
                             descriptor_bytes,
                             descriptor_crc32,
+                            documents_bytes,
+                            documents_crc32,
+                            documents_count,
                         })
                     }
                     None => None,
@@ -573,15 +631,19 @@ impl IndexStore {
                 None
             };
             let schema = match &manifest.schema {
-                Some(record) => Some(restore_schema(&generation_dir, record)?),
+                Some(record) => {
+                    let bound = restore_schema(&generation_dir, record)?;
+                    let columns = restore_columns(&generation_dir, record, manifest.rows)?;
+                    Some((bound, columns))
+                }
                 None => None,
             };
             self.insert_with_id(id.to_string(), index, labels, generation)?;
             if let Some(record) = manifest.last_ingest {
                 self.set_ingest_record(id, record);
             }
-            if let Some(schema) = schema {
-                self.bind_schema(id, schema);
+            if let Some((bound, columns)) = schema {
+                self.bind_schema_with_columns(id, bound, columns);
             }
         }
         Ok(())
@@ -615,6 +677,39 @@ fn restore_schema(
         )));
     }
     Ok(Arc::new(bound))
+}
+
+/// Restore a schema-bound shard's stored document field values, verified
+/// against the manifest and cross-checked against the row count: a
+/// schema-bound index without columns for exactly its rows cannot answer
+/// filters truthfully, so it does not serve.
+fn restore_columns(
+    generation_dir: &Path,
+    record: &SchemaManifest,
+    rows: usize,
+) -> Result<DocumentColumns, PersistenceError> {
+    let path = generation_dir.join(DOCUMENTS_FILE);
+    verify_file(&path, record.documents_bytes, record.documents_crc32)?;
+    let bytes = fs::read(&path).map_err(|e| path_error("read stored documents", &path, e))?;
+    let set = StoredDocumentSet::decode(bytes.as_slice())
+        .map_err(|e| PersistenceError::new(format!("decode {}: {e}", path.display())))?;
+    if set.documents.len() as u64 != record.documents_count {
+        return Err(PersistenceError::new(format!(
+            "{} holds {} documents, manifest expects {}",
+            path.display(),
+            set.documents.len(),
+            record.documents_count
+        )));
+    }
+    if set.documents.len() != rows {
+        return Err(PersistenceError::new(format!(
+            "{} holds {} documents but the index holds {rows} rows",
+            path.display(),
+            set.documents.len()
+        )));
+    }
+    DocumentColumns::from_set(set, &record.fingerprint)
+        .map_err(|e| PersistenceError::new(format!("restore {}: {e}", path.display())))
 }
 
 fn validate_shard_id(id: &str) -> Result<(), PersistenceError> {

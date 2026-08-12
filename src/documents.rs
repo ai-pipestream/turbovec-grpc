@@ -1,27 +1,35 @@
-//! The `turbovec.v1.Documents` gRPC service: protobuf-first ingestion.
+//! The `turbovec.v1.Documents` gRPC service: protobuf-first ingestion
+//! and filtered search.
 //!
 //! A client registers the schema its producers already maintain — a
 //! serialized `FileDescriptorSet` and a message type name — and then
 //! streams documents as the serialized protobuf messages they already are.
 //! The node derives the indexing plan (see [`crate::schema`]), decodes
 //! each document against the bound descriptor, and indexes the extracted
-//! `(id, vector)` pair. No JSON, no intermediate document model, no field
-//! mapping to maintain by hand.
+//! `(id, vector)` pair alongside the planned scalar field values. No JSON,
+//! no intermediate document model, no field mapping to maintain by hand.
 //!
-//! Derivation and extraction are CPU-bound, so both run inside
-//! `tokio::task::spawn_blocking`, following the rest of this crate.
+//! `SearchDocuments` closes the loop: a boolean CEL expression over those
+//! stored fields becomes an exact allowlist for the vector search, so a
+//! filtered top-k is the true top-k of the admitted set.
+//!
+//! Derivation, extraction, and filtering are CPU-bound, so all of it runs
+//! inside `tokio::task::spawn_blocking`, following the rest of this crate.
 //! `AddDocuments` stages the complete stream before mutating the index, so
 //! a broken or invalid stream commits no prefix, the same contract the
 //! vector `Add` keeps.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::filter::CompiledFilter;
 use crate::proto::documents_server::{Documents, DocumentsServer};
 use crate::proto::{
-    AddDocumentsRequest, AddDocumentsResponse, BindSchemaRequest, BindSchemaResponse,
-    GetSchemaRequest, GetSchemaResponse, PlanSchemaRequest, PlanSchemaResponse, SchemaSource,
+    stored_value, AddDocumentsRequest, AddDocumentsResponse, BindSchemaRequest, BindSchemaResponse,
+    DocumentHit, DocumentQueryResult, GetSchemaRequest, GetSchemaResponse, PlanSchemaRequest,
+    PlanSchemaResponse, SchemaSource, SearchDocumentsRequest, SearchDocumentsResponse, StoredValue,
 };
 use crate::schema::BoundSchema;
 use crate::service::ServiceLimits;
@@ -56,6 +64,28 @@ impl DocumentsService {
             )));
         }
         Ok(())
+    }
+
+    fn validate_k(&self, k: usize) -> Result<(), Status> {
+        if k == 0 || k > self.limits.max_k {
+            return Err(Status::invalid_argument(format!(
+                "k must be between 1 and {}",
+                self.limits.max_k
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Render the document id field's stored value back into the string the
+/// client indexed. The plan only accepts string and integer id fields, so
+/// these are the only shapes a stored id can have.
+fn id_of(fields: &HashMap<u32, StoredValue>, doc_id_ordinal: u32) -> String {
+    match fields.get(&doc_id_ordinal).and_then(|v| v.value.as_ref()) {
+        Some(stored_value::Value::StringValue(text)) => text.clone(),
+        Some(stored_value::Value::IntValue(v)) => v.to_string(),
+        Some(stored_value::Value::UintValue(v)) => v.to_string(),
+        _ => String::new(),
     }
 }
 
@@ -163,11 +193,18 @@ impl Documents for DocumentsService {
             ))
         })?;
 
+        let columns = self.store.columns(&index_id).ok_or_else(|| {
+            Status::internal(format!(
+                "index {index_id} has a bound schema but no document columns"
+            ))
+        })?;
+
         // Stage the complete operation before mutating the index: decode and
         // extract every frame, then add once. A document that fails is named
         // by its position across the whole stream, and nothing is applied.
         let mut ids: Vec<u64> = Vec::new();
         let mut vectors: Vec<f32> = Vec::new();
+        let mut fields: Vec<HashMap<u32, StoredValue>> = Vec::new();
         let mut dim: usize = 0;
         let mut position: u64 = 0;
         let mut frame = Some(first);
@@ -181,30 +218,31 @@ impl Documents for DocumentsService {
             let extracted = tokio::task::spawn_blocking(move || {
                 let mut out = Vec::with_capacity(current.documents.len());
                 for (offset, document) in current.documents.iter().enumerate() {
-                    let pair = schema.extract(document).map_err(|e| {
+                    let extracted = schema.extract(document).map_err(|e| {
                         Status::invalid_argument(format!(
                             "document {}: {e}",
                             position + offset as u64
                         ))
                     })?;
-                    out.push(pair);
+                    out.push(extracted);
                 }
                 Ok::<_, Status>(out)
             })
             .await
             .map_err(join_err)??;
-            for (label, vector) in extracted {
+            for document in extracted {
                 if dim == 0 {
-                    dim = vector.len();
-                } else if vector.len() != dim {
+                    dim = document.vector.len();
+                } else if document.vector.len() != dim {
                     return Err(Status::invalid_argument(format!(
                         "document {position} has a {}-coordinate vector; earlier \
                          documents in this stream have {dim}",
-                        vector.len()
+                        document.vector.len()
                     )));
                 }
-                ids.push(label);
-                vectors.extend_from_slice(&vector);
+                ids.push(document.label);
+                vectors.extend_from_slice(&document.vector);
+                fields.push(document.fields);
                 position += 1;
             }
             self.validate_frame(vectors.len())?;
@@ -229,12 +267,144 @@ impl Documents for DocumentsService {
                     ))
                 }
             }
+            // The columns are updated while the index write lock is still
+            // held, so every reader that has the index read lock sees the
+            // vectors and their field values move together.
+            let mut columns = columns
+                .write()
+                .map_err(|_| Status::internal("columns lock poisoned"))?;
+            for (label, values) in ids.iter().zip(fields) {
+                columns.insert(*label, values);
+            }
             Ok::<_, Status>(guard.len() as u64)
         })
         .await
         .map_err(join_err)??;
 
         Ok(Response::new(AddDocumentsResponse { added, len }))
+    }
+
+    async fn search_documents(
+        &self,
+        request: Request<SearchDocumentsRequest>,
+    ) -> Result<Response<SearchDocumentsResponse>, Status> {
+        let req = request.into_inner();
+        let index_id = req.index_id.clone();
+        let handle = self
+            .store
+            .get(&index_id)
+            .ok_or_else(|| Status::not_found(format!("unknown index_id: {index_id}")))?;
+        let bound = self.store.schema(&index_id).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "index {index_id} has no bound schema; SearchDocuments needs a \
+                 schema-bound index — plain vector indexes use Search"
+            ))
+        })?;
+        let columns = self.store.columns(&index_id).ok_or_else(|| {
+            Status::internal(format!(
+                "index {index_id} has a bound schema but no document columns"
+            ))
+        })?;
+        let k = req.k as usize;
+        self.validate_k(k)?;
+        self.validate_frame(req.queries.len())?;
+        let max_queries = self.limits.max_queries_per_request;
+
+        let response = tokio::task::spawn_blocking(move || {
+            let guard = handle
+                .read()
+                .map_err(|_| Status::internal("index lock poisoned"))?;
+            let index = match &*guard {
+                Index::IdMap(index) => index,
+                Index::Positional(_) => {
+                    return Err(Status::failed_precondition(
+                        "schema-bound indexes are id-mapped; this index is positional",
+                    ))
+                }
+            };
+            let Some(dim) = guard.dim_opt() else {
+                return Err(Status::failed_precondition(
+                    "index has no documents; add documents before searching",
+                ));
+            };
+            crate::service::validate_queries(&req.queries, dim)?;
+            let nq = req.queries.len() / dim;
+            if nq > max_queries {
+                return Err(Status::resource_exhausted(format!(
+                    "request has {nq} queries; limit is {max_queries}"
+                )));
+            }
+
+            let columns = columns
+                .read()
+                .map_err(|_| Status::internal("columns lock poisoned"))?;
+            let total = columns.len() as u64;
+
+            // The filter compiles once and evaluates over every document's
+            // stored values; the admitted labels become an exact allowlist
+            // for the vector search. An evaluation failure is a request
+            // problem (the expression met a value it cannot handle) and
+            // fails the search rather than shrinking the result.
+            let allow: Option<Vec<u64>> = if req.filter.is_empty() {
+                None
+            } else {
+                let compiled =
+                    CompiledFilter::compile(&req.filter, &bound.schema, bound.stored_fields())
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                let mut allow = Vec::new();
+                for (label, fields) in columns.iter() {
+                    let admitted = compiled
+                        .matches(fields)
+                        .map_err(|e| Status::invalid_argument(format!("document {label}: {e}")))?;
+                    if admitted && index.contains(label) {
+                        allow.push(label);
+                    }
+                }
+                Some(allow)
+            };
+            let matched = allow.as_ref().map_or(total, |a| a.len() as u64);
+
+            let results = if guard.is_empty() || allow.as_ref().is_some_and(Vec::is_empty) {
+                vec![DocumentQueryResult::default(); nq]
+            } else {
+                let (scores, labels) = match &allow {
+                    Some(allow) => index
+                        .search_with_allowlist(&req.queries, k, Some(allow.as_slice()))
+                        .map_err(|e| Status::internal(format!("allowlist search: {e}")))?,
+                    None => index.search(&req.queries, k),
+                };
+                let k_eff = scores.len().checked_div(nq).unwrap_or(0);
+                (0..nq)
+                    .map(|qi| {
+                        let lo = qi * k_eff;
+                        let hi = lo + k_eff;
+                        DocumentQueryResult {
+                            hits: scores[lo..hi]
+                                .iter()
+                                .zip(&labels[lo..hi])
+                                .map(|(&score, &label)| DocumentHit {
+                                    score,
+                                    label,
+                                    id: columns
+                                        .get(label)
+                                        .map(|fields| id_of(fields, bound.doc_id_ordinal()))
+                                        .unwrap_or_default(),
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect()
+            };
+            Ok::<_, Status>(SearchDocumentsResponse {
+                results,
+                matched,
+                total,
+            })
+        })
+        .await
+        .map_err(join_err)??;
+
+        Ok(Response::new(response))
     }
 }
 

@@ -528,7 +528,7 @@ fn search_prepared(
 
 /// Validate a query buffer against a bound `dim`: non-empty, a whole multiple
 /// of `dim`, and every coordinate finite and in range for the SIMD kernel.
-fn validate_queries(queries: &[f32], dim: usize) -> Result<(), Status> {
+pub(crate) fn validate_queries(queries: &[f32], dim: usize) -> Result<(), Status> {
     if queries.is_empty() || !queries.len().is_multiple_of(dim) {
         return Err(Status::invalid_argument(format!(
             "query buffer length {} is not a positive multiple of dim {dim}",
@@ -687,6 +687,16 @@ impl TurboVec for TurboVecService {
                 ),
             ));
         }
+        if self.store.schema(&index_id).is_some() {
+            // A schema-bound index stores field values beside every row so
+            // CEL filters answer truthfully. A raw vector add would create
+            // rows without stored fields, and every later filter over the
+            // index would silently pass over them.
+            return Err(Status::failed_precondition(format!(
+                "index {index_id} has a bound schema; add documents through \
+                 Documents.AddDocuments so their field values are stored with them"
+            )));
+        }
 
         // Validate and stage the complete bounded operation before mutating the
         // index. A broken stream therefore commits no prefix.
@@ -837,12 +847,27 @@ impl TurboVec for TurboVecService {
     ) -> Result<Response<RemoveResponse>, Status> {
         let req = request.into_inner();
         let handle = self.handle(&req.index_id)?;
+        let columns = self.store.columns(&req.index_id);
         let removed = tokio::task::spawn_blocking(move || {
             let mut guard = handle
                 .write()
                 .map_err(|_| Status::internal("index lock poisoned"))?;
             match &mut *guard {
-                Index::IdMap(inner) => Ok(inner.remove(req.id)),
+                Index::IdMap(inner) => {
+                    let removed = inner.remove(req.id);
+                    // A schema-bound index drops the row's stored fields
+                    // with the row, under the same index write lock, so
+                    // the columns never describe a row that is gone.
+                    if removed {
+                        if let Some(columns) = columns {
+                            columns
+                                .write()
+                                .map_err(|_| Status::internal("columns lock poisoned"))?
+                                .remove(req.id);
+                        }
+                    }
+                    Ok(removed)
+                }
                 Index::Positional(_) => Err(Status::failed_precondition(
                     "remove requires an ID_MAP index",
                 )),

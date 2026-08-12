@@ -52,10 +52,12 @@ pub mod hints {
     tonic::include_proto!("ai.pipestream.proto.index.hints.v1");
 }
 
+pub mod columns;
 pub mod config;
 pub mod coordinator;
 pub mod documents;
 pub mod errors;
+pub mod filter;
 pub mod observability;
 pub mod schema;
 pub mod service;

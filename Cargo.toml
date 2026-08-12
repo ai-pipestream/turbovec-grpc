@@ -33,11 +33,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+cel = { version = "0.14", features = ["chrono"] }
+prost-types = "0.13"
+chrono = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12"
 
 [dev-dependencies]
 protox = "0.7"
-prost-types = "0.13"
 prost-reflect = "0.14"

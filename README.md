@@ -58,7 +58,7 @@ Node methods are separated into three gRPC services:
 |---|---|
 | `TurboVecQuery` | metadata, calibration read, `Search`, `SearchStream`, `StreamSearch` |
 | `TurboVecAdmin` | create/delete, retry-safe `Add`, remove, calibration write, `Flush`, streaming row export/import |
-| `Documents` | `PlanSchema`, `BindSchema`, `GetSchema`, streaming `AddDocuments` |
+| `Documents` | `PlanSchema`, `BindSchema`, `GetSchema`, streaming `AddDocuments`, CEL-filtered `SearchDocuments` |
 
 `Snapshot` and `Load` server-path RPCs do not exist. `Flush` writes an atomic,
 checksummed generation below `TURBOVEC_DATA_DIR`, including stable row labels
@@ -85,7 +85,31 @@ with no JSON and no hand-maintained field mapping. The contract is
    the plan and refuses to serve on a fingerprint mismatch.
 3. `AddDocuments` streams serialized messages of the bound type. The node
    decodes each document against the bound descriptor and indexes its
-   `(id, vector)` pair. A broken or invalid stream commits no prefix.
+   `(id, vector)` pair along with every planned scalar field's value. A
+   broken or invalid stream commits no prefix. The stored field values
+   persist with the shard generation (`documents.pb`, checksummed like
+   every other section) and restore with it.
+4. `SearchDocuments` runs a top-k vector search optionally restricted by a
+   [CEL](https://cel.dev) filter over the planned fields, spelled the way
+   the proto spells them:
+
+   ```text
+   price_cents < 5000 && meta.author == "kagome" && "legal" in tags
+     && meta.created_at > timestamp("2020-01-01T00:00:00Z")
+   ```
+
+   The expression is evaluated against every document's stored values and
+   the admitted labels become an exact allowlist for the vector search, so
+   a filtered result is the true top-k of the admitted set — never an
+   over-fetch heuristic. Enum fields compare by value name, unset proto3
+   fields evaluate as their defaults, and hits report the original
+   document id, not just its u64 label. An expression that does not
+   parse, references an unplanned field, or does not evaluate to a
+   boolean fails with `INVALID_ARGUMENT` naming the problem.
+
+Because a schema-bound index stores field values beside every row, the raw
+vector `Add` RPC refuses such indexes; ingest goes through `AddDocuments`,
+and `Remove` drops a row's stored fields with the row.
 
 Fields may carry explicit hints as descriptor options using the
 `ai.pipestream.proto.index.hints.v1` extension (vendored byte-identically

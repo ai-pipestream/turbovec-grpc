@@ -29,10 +29,13 @@ use prost_reflect::{
     DescriptorPool, DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, Value,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::hints;
-use crate::proto::{FieldKind, FieldRole, IndexSchema, PlannedField};
+use crate::proto::{
+    stored_value, FieldKind, FieldRole, IndexSchema, PlannedField, StoredValue, StoredValueList,
+};
 
 /// Full name of the field-option extension carrying indexing hints, owned
 /// by protomolt and vendored under `proto/ai/pipestream/`.
@@ -84,6 +87,18 @@ enum DocIdSource {
     HashedString,
 }
 
+/// One planned field whose value ingest keeps for filtering: its ordinal in
+/// the plan and the navigation steps to its leaf.
+pub struct StoredField {
+    /// Index of this field in `IndexSchema.fields`. Covered by the schema
+    /// fingerprint, so persisted values keyed by ordinal only ever pair
+    /// with the plan they were written under.
+    pub ordinal: u32,
+
+    /// Field steps from the message root to the leaf.
+    steps: Vec<FieldDescriptor>,
+}
+
 /// A schema bound to an index: the derived plan plus everything needed to
 /// decode and extract documents at ingest time.
 pub struct BoundSchema {
@@ -105,6 +120,29 @@ pub struct BoundSchema {
 
     /// How the id leaf's value becomes a label.
     doc_id_source: DocIdSource,
+
+    /// The planned fields whose values ingest keeps, in plan order.
+    stored: Vec<StoredField>,
+
+    /// Ordinal of the document id field within `stored`'s vocabulary,
+    /// so a hit can report the original id value, not just the label.
+    doc_id_ordinal: u32,
+}
+
+/// Everything extracted from one decoded document: the index label, the
+/// vector, and the stored field values keyed by planned-field ordinal.
+#[derive(Debug)]
+pub struct ExtractedDocument {
+    /// The u64 label the row is indexed under.
+    pub label: u64,
+
+    /// The document's vector, in document order.
+    pub vector: Vec<f32>,
+
+    /// Values of the stored fields, keyed by ordinal into
+    /// `IndexSchema.fields`. Every stored field is present, defaults
+    /// included, so filter evaluation never has to guess at absence.
+    pub fields: HashMap<u32, StoredValue>,
 }
 
 impl fmt::Debug for BoundSchema {
@@ -173,6 +211,7 @@ impl BoundSchema {
 
         let vector = navigate(&message, &vector_path)?;
         let doc_id = navigate(&message, &doc_id_path)?;
+        let (stored, doc_id_ordinal) = stored_fields(&message, &schema)?;
         let doc_id_source = match doc_id.last().expect("navigated path is non-empty").kind() {
             Kind::String => DocIdSource::HashedString,
             Kind::Int32
@@ -200,6 +239,8 @@ impl BoundSchema {
             vector,
             doc_id,
             doc_id_source,
+            stored,
+            doc_id_ordinal,
         })
     }
 
@@ -208,11 +249,21 @@ impl BoundSchema {
         &self.schema.message_type
     }
 
+    /// The planned fields whose values ingest keeps, in plan order.
+    pub fn stored_fields(&self) -> &[StoredField] {
+        &self.stored
+    }
+
+    /// Ordinal of the document id field in `IndexSchema.fields`.
+    pub fn doc_id_ordinal(&self) -> u32 {
+        self.doc_id_ordinal
+    }
+
     /// Decode one serialized document of the bound type and extract its
-    /// `(label, vector)` pair per the plan. Anything missing or malformed
-    /// is an error naming the path; the caller adds the document's
-    /// position in the stream.
-    pub fn extract(&self, document: &[u8]) -> Result<(u64, Vec<f32>), SchemaError> {
+    /// label, vector, and stored field values per the plan. Anything
+    /// missing or malformed is an error naming the path; the caller adds
+    /// the document's position in the stream.
+    pub fn extract(&self, document: &[u8]) -> Result<ExtractedDocument, SchemaError> {
         let message = DynamicMessage::decode(self.message.clone(), document).map_err(|e| {
             SchemaError::new(format!(
                 "document does not decode as {}: {e}",
@@ -271,8 +322,157 @@ impl BoundSchema {
                 ),
             ));
         }
-        Ok((label, vector))
+
+        let mut fields = HashMap::with_capacity(self.stored.len());
+        for stored in &self.stored {
+            let path = &self.schema.fields[stored.ordinal as usize].path;
+            let value = read_leaf(&message, &stored.steps, path)?;
+            let leaf = stored.steps.last().expect("navigated path is non-empty");
+            fields.insert(stored.ordinal, stored_value(&value, leaf, path)?);
+        }
+
+        Ok(ExtractedDocument {
+            label,
+            vector,
+            fields,
+        })
     }
+}
+
+/// Select the planned fields whose values ingest keeps: every scalar leaf
+/// except the vector, un-expanded OBJECT/NESTED entries, and anything
+/// inside a CHUNKS scope (chunks are not consumed by this engine yet).
+/// The document id is stored like any other field, so a hit can report
+/// the original value the client indexed.
+fn stored_fields(
+    root: &MessageDescriptor,
+    schema: &IndexSchema,
+) -> Result<(Vec<StoredField>, u32), SchemaError> {
+    let chunk_scopes: Vec<String> = schema
+        .fields
+        .iter()
+        .filter(|f| f.role == FieldRole::Chunks as i32)
+        .map(|f| format!("{}.", f.path))
+        .collect();
+    let mut stored = Vec::new();
+    let mut doc_id_ordinal = None;
+    for (ordinal, field) in schema.fields.iter().enumerate() {
+        let kind = FieldKind::try_from(field.kind).expect("derived plans hold known kinds");
+        if matches!(
+            kind,
+            FieldKind::Vector | FieldKind::Object | FieldKind::Nested | FieldKind::Unspecified
+        ) {
+            continue;
+        }
+        if chunk_scopes.iter().any(|s| field.path.starts_with(s)) {
+            continue;
+        }
+        let ordinal = u32::try_from(ordinal).expect("a plan holds far fewer than 2^32 fields");
+        if field.role == FieldRole::DocId as i32 {
+            doc_id_ordinal = Some(ordinal);
+        }
+        stored.push(StoredField {
+            ordinal,
+            steps: navigate(root, &field.path)?,
+        });
+    }
+    let doc_id_ordinal =
+        doc_id_ordinal.expect("resolve_doc_id planned a storable doc id field before this ran");
+    Ok((stored, doc_id_ordinal))
+}
+
+/// Convert one extracted leaf value into its stored form. The descriptor
+/// guarantees the value's shape, so a mismatch here is a bug, not bad
+/// input — except a Timestamp, whose seconds/nanos any client can set.
+fn stored_value(
+    value: &Value,
+    leaf: &FieldDescriptor,
+    path: &str,
+) -> Result<StoredValue, SchemaError> {
+    if leaf.is_list() {
+        let list = value
+            .as_list()
+            .ok_or_else(|| SchemaError::at(path, "a repeated field did not extract as a list"))?;
+        let mut values = Vec::with_capacity(list.len());
+        for element in list {
+            values.push(stored_scalar(element, leaf, path)?);
+        }
+        return Ok(StoredValue {
+            value: Some(stored_value::Value::ListValue(StoredValueList { values })),
+        });
+    }
+    stored_scalar(value, leaf, path)
+}
+
+fn stored_scalar(
+    value: &Value,
+    leaf: &FieldDescriptor,
+    path: &str,
+) -> Result<StoredValue, SchemaError> {
+    use stored_value::Value as V;
+    let stored = match value {
+        Value::String(text) => V::StringValue(text.clone()),
+        Value::Bool(v) => V::BoolValue(*v),
+        Value::I32(v) => V::IntValue(i64::from(*v)),
+        Value::I64(v) => V::IntValue(*v),
+        Value::U32(v) => V::UintValue(u64::from(*v)),
+        Value::U64(v) => V::UintValue(*v),
+        Value::F32(v) => V::DoubleValue(f64::from(*v)),
+        Value::F64(v) => V::DoubleValue(*v),
+        Value::Bytes(bytes) => V::BytesValue(bytes.to_vec()),
+        Value::EnumNumber(number) => V::StringValue(enum_value_name(leaf, *number)),
+        Value::Message(message) => V::TimestampValue(timestamp_of(message, path)?),
+        other => {
+            return Err(SchemaError::at(
+                path,
+                format!("stored field extracted an unsupported value: {other:?}"),
+            ))
+        }
+    };
+    Ok(StoredValue {
+        value: Some(stored),
+    })
+}
+
+/// An enum field stores its value's declared name, so filters read
+/// `status == "STATUS_ACTIVE"` rather than magic numbers. proto3 enums are
+/// open, so an unknown number (from a newer producer) stores as its
+/// decimal rendering rather than failing ingest.
+fn enum_value_name(leaf: &FieldDescriptor, number: i32) -> String {
+    match leaf.kind() {
+        Kind::Enum(descriptor) => descriptor
+            .get_value(number)
+            .map(|v| v.name().to_string())
+            .unwrap_or_else(|| number.to_string()),
+        _ => number.to_string(),
+    }
+}
+
+/// Read a google.protobuf.Timestamp leaf into the stored form, verbatim.
+/// The plan only assigns FIELD_KIND_DATE to Timestamp fields, so the
+/// message shape is guaranteed; the range is validated here, at ingest,
+/// so filter evaluation later never meets a timestamp chrono cannot hold.
+fn timestamp_of(
+    message: &DynamicMessage,
+    path: &str,
+) -> Result<::prost_types::Timestamp, SchemaError> {
+    let seconds = message
+        .get_field_by_name("seconds")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| SchemaError::at(path, "Timestamp has no seconds field"))?;
+    let nanos = message
+        .get_field_by_name("nanos")
+        .and_then(|v| v.as_i32())
+        .ok_or_else(|| SchemaError::at(path, "Timestamp has no nanos field"))?;
+    let nanos_u32 = u32::try_from(nanos)
+        .map_err(|_| SchemaError::at(path, format!("timestamp nanos {nanos} is negative")))?;
+    if chrono::DateTime::from_timestamp(seconds, nanos_u32).is_none() {
+        return Err(SchemaError::at(
+            path,
+            format!("timestamp seconds={seconds} nanos={nanos} is out of range"),
+        ));
+    }
+    Ok(::prost_types::Timestamp { seconds, nanos })
 }
 
 /// Reduce a string document id to a `u64` label: the first 8 bytes of

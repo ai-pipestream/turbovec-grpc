@@ -62,11 +62,31 @@ service Documents {
   // Adds documents to a schema-bound index. Client-streaming: each frame
   // carries a batch of serialized protobuf messages of the bound type.
   // The node decodes each document against the bound descriptor,
-  // extracts the vector and the document id per the plan, and indexes
-  // the pair. A document that does not decode, has no vector, has a
-  // vector of the wrong length, or has an unset id fails the stream by
-  // position, and nothing after it in that stream is applied.
+  // extracts the vector, the document id, and every planned scalar
+  // field per the plan, and indexes them. A document that does not
+  // decode, has no vector, has a vector of the wrong length, or has an
+  // unset id fails the stream by position, and nothing after it in that
+  // stream is applied.
   rpc AddDocuments(stream AddDocumentsRequest) returns (AddDocumentsResponse);
+
+  // Runs a top-k vector search over a schema-bound index, optionally
+  // restricted by a CEL filter over the planned fields.
+  //
+  // The filter is a boolean CEL expression whose variables are the
+  // document's own proto fields, spelled as they are in the schema:
+  // `price_cents < 5000 && meta.author == "kagome"`. The node evaluates
+  // it against the stored field values of every document and restricts
+  // the vector search to the documents it admits, so the result is the
+  // exact top-k of the admitted set — filtering never trades exactness
+  // for speed on this path.
+  //
+  // Unset proto3 fields evaluate as their proto3 defaults (empty
+  // string, 0, false; an unset Timestamp is the epoch), matching what
+  // the document actually carries on the wire. An expression that does
+  // not parse, references a field the schema does not plan, or does not
+  // evaluate to a boolean fails with INVALID_ARGUMENT naming the
+  // problem; it is never silently treated as "match nothing".
+  rpc SearchDocuments(SearchDocumentsRequest) returns (SearchDocumentsResponse);
 }
 
 // SchemaSource names one message type inside one descriptor set.
@@ -270,4 +290,58 @@ message AddDocumentsResponse {
 
   // Total rows in the index after the stream.
   uint64 len = 2;
+}
+
+// SearchDocumentsRequest carries queries, k, and an optional CEL filter.
+message SearchDocumentsRequest {
+  // Handle of a schema-bound index.
+  string index_id = 1;
+
+  // Row-major query data. Length must be a whole multiple of the index
+  // dim.
+  repeated float queries = 2;
+
+  // Number of neighbours to return per query. The effective count is
+  // min(k, number of admitted documents).
+  uint32 k = 3;
+
+  // Boolean CEL expression over the planned fields, or empty for no
+  // filter. Nested fields read as they do in the proto:
+  // `meta.created_at > timestamp("2020-01-01T00:00:00Z")`.
+  string filter = 4;
+}
+
+// DocumentHit is one returned neighbour.
+message DocumentHit {
+  // Similarity score.
+  float score = 1;
+
+  // The document's u64 label: the id field verbatim for an integer id,
+  // or the documented SHA-256 reduction for a string id.
+  uint64 label = 2;
+
+  // The document id field's original value: the string itself for a
+  // string id, the integer rendered in decimal for an integer id. This
+  // is the value the client indexed, not the reduction.
+  string id = 3;
+}
+
+// DocumentQueryResult is the top-k for a single query, best first.
+message DocumentQueryResult {
+  // Returned neighbours, in descending score order.
+  repeated DocumentHit hits = 1;
+}
+
+// SearchDocumentsResponse returns one result per query, in query order.
+message SearchDocumentsResponse {
+  // Results, aligned with the input queries.
+  repeated DocumentQueryResult results = 1;
+
+  // Documents the filter admitted. Equal to `total` when no filter was
+  // set.
+  uint64 matched = 2;
+
+  // Documents the filter was evaluated over: every document in the
+  // index.
+  uint64 total = 3;
 }

@@ -1,0 +1,79 @@
+// Storage format for the per-document field values a schema-bound index
+// keeps beside its vectors, so CEL filters evaluate against what each
+// document actually carried at ingest.
+//
+// This file is a durable on-disk format, not an RPC surface: one encoded
+// StoredDocumentSet is written per shard generation (documents.pb) and
+// verified by size and CRC against the generation manifest on restore,
+// like every other persisted section. Values are stored in the engine's
+// resolved-kind vocabulary rather than re-deriving them from the raw
+// documents at load time, so a restore needs no descriptor walk and the
+// bytes are self-contained.
+
+syntax = "proto3";
+
+package turbovec.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// StoredValue is one field's extracted value.
+message StoredValue {
+  oneof value {
+    // TEXT and KEYWORD fields, and enum fields stored by value name.
+    string string_value = 1;
+
+    // Signed integer fields (INT32 and INT64 kinds from signed proto
+    // types).
+    int64 int_value = 2;
+
+    // Unsigned integer fields (INT32 and INT64 kinds from unsigned
+    // proto types). Kept apart from int_value because CEL distinguishes
+    // int from uint.
+    uint64 uint_value = 3;
+
+    // FLOAT and DOUBLE fields. A float widens losslessly.
+    double double_value = 4;
+
+    // BOOLEAN fields.
+    bool bool_value = 5;
+
+    // BINARY fields.
+    bytes bytes_value = 6;
+
+    // DATE fields, verbatim from the document's Timestamp.
+    google.protobuf.Timestamp timestamp_value = 7;
+
+    // A repeated field: one element per entry, each a singular value of
+    // the field's kind.
+    StoredValueList list_value = 8;
+  }
+}
+
+// StoredValueList holds a repeated field's elements in document order.
+message StoredValueList {
+  repeated StoredValue values = 1;
+}
+
+// StoredDocument is one document's extracted field values.
+message StoredDocument {
+  // The document's u64 label, as indexed.
+  uint64 label = 1;
+
+  // Values keyed by planned-field ordinal: the index of the field in
+  // IndexSchema.fields. Ordinals are covered by the schema fingerprint,
+  // so a set only ever pairs with the plan it was written under. Only
+  // filterable fields appear: the vector, OBJECT/NESTED entries, and
+  // CHUNKS-scoped fields are not stored.
+  map<uint32, StoredValue> fields = 2;
+}
+
+// StoredDocumentSet is every document of one shard generation.
+message StoredDocumentSet {
+  // Fingerprint of the schema the ordinals refer to. Restore refuses a
+  // set whose fingerprint does not match the generation's schema.
+  string fingerprint = 1;
+
+  // Documents in ascending label order. The order is deterministic so
+  // repeated flushes of the same state write identical bytes.
+  repeated StoredDocument documents = 2;
+}

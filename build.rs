@@ -10,6 +10,7 @@ fn main() {
                 "proto/turbovec/v1/turbovec.proto",
                 "proto/turbovec/v1/coordinator.proto",
                 "proto/turbovec/v1/schema.proto",
+                "proto/turbovec/v1/stored_documents.proto",
                 // Vendored from protomolt, byte-identical. Compiled so hint
                 // extensions read off client descriptors decode into typed
                 // structs; prost ignores the `extend` blocks themselves.
