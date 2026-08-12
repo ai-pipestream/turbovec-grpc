@@ -998,3 +998,126 @@ async fn set_calibration_refuses_a_pair_of_the_wrong_width() {
         .into_inner();
     assert!(held.tqplus_shift.is_empty());
 }
+
+/// The fresh-container path: a node registers, waits in the persisted spare
+/// pool, survives a coordinator restart, and leaves the pool the moment a
+/// Split makes it a member. Registration itself never changes the topology.
+#[tokio::test]
+async fn register_node_feeds_the_spare_pool_and_split_drains_it() {
+    let root = std::env::temp_dir().join(format!("turbovec-register-{}", uuid::Uuid::new_v4()));
+    let serving = start_node_with_store(IndexStore::open(root.join("node-0")).unwrap()).await;
+    let pair = fit_pair(7);
+    let (monolith_id, _corpus) = build_monolith(&serving, &pair).await;
+    node_client(&serving)
+        .await
+        .flush(turbovec_grpc::proto::FlushRequest {
+            index_id: monolith_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let table = NodeTable::new(vec![ShardConfig::with_index_generation(
+        &serving,
+        &monolith_id,
+        Some(1),
+    )]);
+    let topology_path = root.join("topology.json");
+    let mut coordinator = start_persistent_coordinator(table.clone(), &topology_path).await;
+
+    // A registration must carry a dialable name.
+    let refused = coordinator
+        .register_node(turbovec_grpc::proto::RegisterNodeRequest {
+            address: "  ".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+
+    // An address the coordinator cannot reach is refused at registration
+    // time, not kept as a spare that fails a Split later.
+    let unreachable = coordinator
+        .register_node(turbovec_grpc::proto::RegisterNodeRequest {
+            address: "127.0.0.1:1".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        unreachable.message().starts_with("node_unreachable:"),
+        "register said: {}",
+        unreachable.message()
+    );
+
+    // A node already serving a shard is a member, not a spare.
+    let member = coordinator
+        .register_node(turbovec_grpc::proto::RegisterNodeRequest {
+            address: serving.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(member.member);
+    assert_eq!(member.topology_generation, 1);
+
+    // The fresh container announces itself, scheme-less like a container
+    // entrypoint would, and twice, like a re-announce loop does.
+    let fresh = start_node_with_store(IndexStore::open(root.join("node-1")).unwrap()).await;
+    let bare = fresh.strip_prefix("http://").unwrap().to_string();
+    for _ in 0..2 {
+        let registered = coordinator
+            .register_node(turbovec_grpc::proto::RegisterNodeRequest {
+                address: bare.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!registered.member);
+        assert_eq!(registered.topology_generation, 1);
+    }
+
+    let listed = coordinator
+        .list_nodes(turbovec_grpc::proto::ListNodesRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.shards.len(), 1, "registration must not add a shard");
+    assert_eq!(listed.spares.len(), 1, "re-announcing must not duplicate");
+    assert_eq!(listed.spares[0].address, fresh);
+    assert_eq!(listed.spares[0].indexes, 0);
+    assert!(listed.spares[0].error.is_empty());
+
+    // The pool is durable: a restarted coordinator still knows the spare.
+    let mut restarted = start_persistent_coordinator(table.clone(), &topology_path).await;
+    let listed = restarted
+        .list_nodes(turbovec_grpc::proto::ListNodesRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.spares.len(), 1);
+    assert_eq!(listed.spares[0].address, fresh);
+
+    // Placement stays explicit: the spare receives rows only when a Split
+    // names it, and becoming a member removes it from the pool.
+    restarted
+        .split(SplitRequest {
+            source: Some(ShardRef {
+                address: serving.clone(),
+                index_id: monolith_id.clone(),
+            }),
+            targets: vec![serving.clone(), fresh.clone()],
+            row_counts: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let listed = restarted
+        .list_nodes(turbovec_grpc::proto::ListNodesRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.shards.len(), 2);
+    assert!(listed.servable, "listing said: {}", listed.error);
+    assert!(
+        listed.spares.is_empty(),
+        "a placed spare must leave the pool"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

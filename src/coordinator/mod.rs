@@ -60,8 +60,9 @@ use crate::proto::{
     ExportRowsRequest, FitCalibrationRequest, FitCalibrationResponse, FlushRequest,
     GetCalibrationRequest, GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse,
     ImportRowsStart, IndexInfo, JoinRequest, JoinResponse, ListIndexesRequest, ListNodesRequest,
-    ListNodesResponse, Neighbour, RowBlock, SetCalibrationRequest, ShardRef, ShardStatus,
-    SplitRequest, SplitResponse, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
+    ListNodesResponse, Neighbour, RegisterNodeRequest, RegisterNodeResponse, RowBlock,
+    SetCalibrationRequest, ShardRef, ShardStatus, SpareNodeStatus, SplitRequest, SplitResponse,
+    StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
 };
 use crate::service::calibration_difference;
 
@@ -124,6 +125,12 @@ pub struct CoordinatorService {
     /// Optional durable topology state file. When configured, a new
     /// generation is fsynced here before it becomes active in memory.
     topology_path: Option<PathBuf>,
+
+    /// Registered nodes not serving any shard, in registration order.
+    /// Fed by `RegisterNode`, drained by a rebind that makes one of them a
+    /// member, persisted in the same state file as the topology. Never read
+    /// by Search: a spare holds no shard, so it takes no query traffic.
+    spares: Arc<Mutex<Vec<String>>>,
 
     /// The bound collection, or `None` when it has yet to be established or
     /// has been invalidated by a rebind.
@@ -268,7 +275,7 @@ impl CoordinatorService {
         limits: CoordinatorLimits,
         metrics: Metrics,
     ) -> Self {
-        Self::from_topology(1, table, None, limits, metrics)
+        Self::from_topology(1, table, Vec::new(), None, limits, metrics)
     }
 
     /// Create a coordinator whose topology survives restart. An existing
@@ -293,7 +300,7 @@ impl CoordinatorService {
         metrics: Metrics,
     ) -> Result<Self, String> {
         let path = path.into();
-        let (generation, table) = nodes::load_or_initialize(&path, &table)?;
+        let (generation, table, spares) = nodes::load_or_initialize(&path, &table)?;
         if table
             .shards
             .iter()
@@ -307,6 +314,7 @@ impl CoordinatorService {
         Ok(Self::from_topology(
             generation,
             table,
+            spares,
             Some(path),
             limits,
             metrics,
@@ -316,6 +324,7 @@ impl CoordinatorService {
     fn from_topology(
         generation: u64,
         table: NodeTable,
+        spares: Vec<String>,
         topology_path: Option<PathBuf>,
         limits: CoordinatorLimits,
         metrics: Metrics,
@@ -340,6 +349,7 @@ impl CoordinatorService {
                 shards: table.shards,
             })),
             topology_path,
+            spares: Arc::new(Mutex::new(spares)),
             pinned: Arc::new(Mutex::new(None)),
             channels: Arc::new(Mutex::new(HashMap::new())),
             limits,
@@ -394,13 +404,29 @@ impl CoordinatorService {
             .generation
             .checked_add(1)
             .ok_or_else(|| Status::internal("topology generation counter overflow"))?;
+        // A spare that the new topology places is a spare no longer. Compute
+        // the surviving pool under the topology lock so the persisted file
+        // is one consistent picture, and only commit it in memory after the
+        // file is durable.
+        let spares: Vec<String> = self
+            .spares
+            .lock()
+            .expect("coordinator spare pool lock poisoned")
+            .iter()
+            .filter(|spare| !shards.iter().any(|shard| serves_address(shard, spare)))
+            .cloned()
+            .collect();
         if let Some(path) = self.topology_path.as_deref() {
-            nodes::persist_topology(path, generation, &shards).map_err(|e| {
+            nodes::persist_topology(path, generation, &shards, &spares).map_err(|e| {
                 Status::internal(format!("persist topology generation {generation}: {e}"))
             })?;
         }
         topology.generation = generation;
         topology.shards = shards;
+        *self
+            .spares
+            .lock()
+            .expect("coordinator spare pool lock poisoned") = spares;
         drop(topology);
         self.metrics.set_topology_generation(generation);
         *self
@@ -1168,12 +1194,55 @@ impl Coordinator for CoordinatorService {
                 Err(e) => (false, e.message().to_string(), 0),
             }
         };
+        // The spare pool is probed with the same liveness the shards get: a
+        // spare that died since it registered shows up here as its error,
+        // not as a target that fails when named.
+        let pool = self
+            .spares
+            .lock()
+            .expect("coordinator spare pool lock poisoned")
+            .clone();
+        let mut spare_tasks = Vec::with_capacity(pool.len());
+        for address in pool {
+            let service = self.clone();
+            spare_tasks.push(tokio::spawn(async move {
+                let probed = async {
+                    let mut client = service.query_client(&address)?;
+                    client
+                        .list_indexes(ListIndexesRequest {})
+                        .await
+                        .map_err(|e| node_error(&address, &e))
+                }
+                .await;
+                match probed {
+                    Ok(listed) => SpareNodeStatus {
+                        address,
+                        indexes: listed.into_inner().indexes.len() as u64,
+                        error: String::new(),
+                    },
+                    Err(e) => SpareNodeStatus {
+                        address,
+                        indexes: 0,
+                        error: e.message().to_string(),
+                    },
+                }
+            }));
+        }
+        let mut spares = Vec::with_capacity(spare_tasks.len());
+        for task in spare_tasks {
+            spares.push(
+                task.await
+                    .map_err(|e| Status::internal(format!("spare probe task failed: {e}")))?,
+            );
+        }
+
         Ok(Response::new(ListNodesResponse {
             shards: statuses,
             servable,
             error,
             rows,
             topology_generation: generation,
+            spares,
         }))
     }
 
@@ -1432,6 +1501,72 @@ impl Coordinator for CoordinatorService {
             topology_generation,
         }))
     }
+
+    async fn register_node(
+        &self,
+        request: Request<RegisterNodeRequest>,
+    ) -> Result<Response<RegisterNodeResponse>, Status> {
+        let req = request.into_inner();
+        if req.address.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "a node registers the address the coordinator should dial it at; \
+                 a node listening on 0.0.0.0 must say which of its names to use",
+            ));
+        }
+        let address = nodes::with_scheme(req.address.trim().to_string());
+
+        // Dial the node back before accepting it. An address the coordinator
+        // cannot reach is refused now, while the operator is looking at the
+        // node that sent it, rather than kept as a spare that fails the
+        // Split it is eventually named in.
+        let mut client = self.query_client(&address)?;
+        client
+            .list_indexes(ListIndexesRequest {})
+            .await
+            .map_err(|e| node_error(&address, &e))?;
+
+        // Held across the persist so a concurrent Split cannot advance the
+        // generation between this snapshot and the file write; the lock
+        // order (topology, then spares) matches `rebind`.
+        let topology = self
+            .topology
+            .read()
+            .expect("coordinator topology lock poisoned");
+        let generation = topology.generation;
+        if topology
+            .shards
+            .iter()
+            .any(|shard| serves_address(shard, &address))
+        {
+            return Ok(Response::new(RegisterNodeResponse {
+                member: true,
+                topology_generation: generation,
+            }));
+        }
+
+        // Idempotent insert, persisted before it is acknowledged: a spare a
+        // node was told it is must still be there after a coordinator
+        // restart, or the "re-announce periodically" contract quietly turns
+        // into "hope the coordinator did not restart".
+        let mut spares = self
+            .spares
+            .lock()
+            .expect("coordinator spare pool lock poisoned");
+        if !spares.contains(&address) {
+            let mut next = spares.clone();
+            next.push(address.clone());
+            if let Some(path) = self.topology_path.as_deref() {
+                nodes::persist_topology(path, generation, &topology.shards, &next)
+                    .map_err(|e| Status::internal(format!("persist spare pool: {e}")))?;
+            }
+            *spares = next;
+            tracing::info!(%address, "node registered as spare");
+        }
+        Ok(Response::new(RegisterNodeResponse {
+            member: false,
+            topology_generation: generation,
+        }))
+    }
 }
 
 /// Turn a wire shard reference into a configuration entry.
@@ -1440,4 +1575,9 @@ fn to_config(shard: &ShardRef) -> ShardConfig {
         true => ShardConfig::new(shard.address.clone()),
         false => ShardConfig::with_index(shard.address.clone(), shard.index_id.clone()),
     }
+}
+
+/// Whether `address` serves this shard, as its primary or as a replica.
+fn serves_address(shard: &ShardConfig, address: &str) -> bool {
+    shard.address == address || shard.replicas.iter().any(|replica| replica == address)
 }

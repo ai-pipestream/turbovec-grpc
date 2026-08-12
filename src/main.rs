@@ -5,9 +5,21 @@
 //! - `TURBOVEC_DATA_DIR` — durable shard-generation root.
 //! - `TURBOVEC_ALLOW_EPHEMERAL` — opt into a non-durable demo node.
 //! - `TURBOVEC_METRICS_ADDR` — optional OpenMetrics HTTP listener.
+//! - `TURBOVEC_COORD_ADDR` — optional coordinator to self-register with. The
+//!   node announces itself on startup and re-announces periodically; the
+//!   coordinator holds it as a spare until an operator assigns it rows.
+//! - `TURBOVEC_ADVERTISE_ADDR` — the address the coordinator should dial
+//!   this node at. Required with `TURBOVEC_COORD_ADDR` when the listen
+//!   address is unspecified (`0.0.0.0`), because "everywhere" is not a name
+//!   another machine can dial.
+//! - `TURBOVEC_REGISTER_INTERVAL_MS` — re-announce period (default 30000).
 
 use std::sync::Arc;
+use std::time::Duration;
+
 use tonic::transport::Server;
+use turbovec_grpc::proto::coordinator_client::CoordinatorClient;
+use turbovec_grpc::proto::RegisterNodeRequest;
 use turbovec_grpc::proto::turbo_vec_admin_server::TurboVecAdminServer;
 use turbovec_grpc::proto::turbo_vec_query_server::TurboVecQueryServer;
 use turbovec_grpc::{proto, IndexStore, Metrics, ServiceLimits, TurboVecService};
@@ -112,6 +124,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
+    // Self-registration: tell a coordinator this node exists. Best-effort
+    // and repeating, because the node serving rows must not depend on the
+    // coordinator being up first; every failure is logged, and the next
+    // announce supersedes it. Registration never assigns rows by itself.
+    if let Ok(coordinator) = std::env::var("TURBOVEC_COORD_ADDR") {
+        let advertise = advertise_address(&addr)?;
+        let interval_ms =
+            turbovec_grpc::config::positive_usize("TURBOVEC_REGISTER_INTERVAL_MS", 30_000)?;
+        tokio::spawn(self_register(
+            coordinator,
+            advertise,
+            Duration::from_millis(interval_ms as u64),
+        ));
+    }
+
     tracing::info!(%addr, restored, persistent, "node listening");
     let serve_result = Server::builder()
         .tcp_nodelay(true)
@@ -129,4 +156,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     serve_result?;
     tracing::info!("node shut down");
     Ok(())
+}
+
+/// The address this node registers as: `TURBOVEC_ADVERTISE_ADDR` when set,
+/// otherwise the listen address, refused if that is unspecified. A node that
+/// registers `0.0.0.0` would pass its own probe never and a Split later, so
+/// the misconfiguration is a startup error here, where the fix is obvious.
+fn advertise_address(listen: &std::net::SocketAddr) -> Result<String, String> {
+    if let Ok(advertise) = std::env::var("TURBOVEC_ADVERTISE_ADDR") {
+        let advertise = advertise.trim().to_string();
+        if advertise.is_empty() {
+            return Err("TURBOVEC_ADVERTISE_ADDR is set but empty".to_string());
+        }
+        return Ok(advertise);
+    }
+    if listen.ip().is_unspecified() {
+        return Err(format!(
+            "cannot self-register: the listen address {listen} is unspecified, so it is not a \
+             name the coordinator can dial back; set TURBOVEC_ADVERTISE_ADDR to this node's \
+             reachable host:port"
+        ));
+    }
+    Ok(listen.to_string())
+}
+
+/// Announce this node to the coordinator, forever. The first announce runs
+/// immediately; each later one re-asserts the registration, so a coordinator
+/// that restarted with an older spare pool, or one that never saw the node,
+/// converges within one interval.
+async fn self_register(coordinator: String, advertise: String, interval: Duration) {
+    let coordinator = if coordinator.contains("://") {
+        coordinator
+    } else {
+        format!("http://{coordinator}")
+    };
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut registered = false;
+    loop {
+        ticker.tick().await;
+        let outcome = async {
+            let mut client = CoordinatorClient::connect(coordinator.clone()).await?;
+            let response = client
+                .register_node(RegisterNodeRequest {
+                    address: advertise.clone(),
+                })
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>(response.into_inner())
+        }
+        .await;
+        match outcome {
+            Ok(response) => {
+                // First success at each state is worth a line; the steady
+                // re-announce every interval is not.
+                if !registered {
+                    registered = true;
+                    tracing::info!(
+                        coordinator = %coordinator,
+                        advertise = %advertise,
+                        member = response.member,
+                        topology_generation = response.topology_generation,
+                        "registered with coordinator"
+                    );
+                }
+            }
+            Err(e) => {
+                registered = false;
+                tracing::warn!(
+                    coordinator = %coordinator,
+                    advertise = %advertise,
+                    error = %e,
+                    "self-registration failed; retrying"
+                );
+            }
+        }
+    }
 }

@@ -90,6 +90,14 @@ Targets are fully validated and flushed before a new topology generation is
 published. The coordinator state survives restart and cannot silently fall
 back to the startup table.
 
+A fresh node can announce itself instead of being pre-listed: start it with
+`TURBOVEC_COORD_ADDR` (and `TURBOVEC_ADVERTISE_ADDR` when it listens on
+`0.0.0.0`) and it registers on startup, re-announcing every
+`TURBOVEC_REGISTER_INTERVAL_MS` (default 30 s). The coordinator dials it back,
+holds it in the spare pool persisted with the topology, and reports it through
+`ListNodes`. Registration never changes the serving topology: rows reach a
+spare only when an operator names it as a `Split` or `Join` target.
+
 ## Production behavior
 
 - gRPC frames default to 16 MiB; row export frames target 2 MiB.

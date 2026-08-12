@@ -1,10 +1,15 @@
 //! The coordinator's node registry: which shards a collection is made of.
 //!
-//! Registration is static in this version. The table comes from configuration
-//! at startup, and the only thing that changes it afterwards is a Split or a
-//! Join, which rebinds it to the shards they just built. There is no
-//! discovery, no gossip and no membership protocol: an operator says which
-//! nodes hold the collection, and the coordinator holds them to it.
+//! The serving table is operator-controlled. It comes from configuration at
+//! startup, and the only thing that changes it afterwards is a Split or a
+//! Join, which rebinds it to the shards they just built. There is no gossip
+//! and no automatic placement: an operator says which nodes hold the
+//! collection, and the coordinator holds them to it.
+//!
+//! What a node can do on its own is announce itself. `RegisterNode` adds an
+//! address to the spare pool persisted alongside the table, where it waits
+//! until an operator names it as a Split or Join target. Registration never
+//! changes the serving topology.
 //!
 //! When `TURBOVEC_COORD_STATE` is configured, the active table and its
 //! generation are persisted atomically. A restart loads that state instead of
@@ -96,6 +101,12 @@ struct PersistedTopology {
     version: u32,
     generation: u64,
     shards: Vec<ShardConfig>,
+
+    /// Registered nodes not serving any shard, in registration order.
+    /// Absent in files written before the spare pool existed, which is the
+    /// same as empty.
+    #[serde(default)]
+    spares: Vec<String>,
 }
 
 impl NodeTable {
@@ -171,8 +182,12 @@ impl NodeTable {
 }
 
 /// Load an existing topology state file, or atomically seed it from startup
-/// configuration at generation 1.
-pub fn load_or_initialize(path: &Path, initial: &NodeTable) -> Result<(u64, NodeTable), String> {
+/// configuration at generation 1. Returns the generation, the shard table,
+/// and the persisted spare pool.
+pub fn load_or_initialize(
+    path: &Path,
+    initial: &NodeTable,
+) -> Result<(u64, NodeTable, Vec<String>), String> {
     if path.exists() {
         let bytes =
             fs::read(path).map_err(|e| format!("read topology state {}: {e}", path.display()))?;
@@ -193,13 +208,17 @@ pub fn load_or_initialize(path: &Path, initial: &NodeTable) -> Result<(u64, Node
                 persisted.shards.len()
             ));
         }
-        return Ok((persisted.generation, NodeTable::new(persisted.shards)));
+        return Ok((
+            persisted.generation,
+            NodeTable::new(persisted.shards),
+            persisted.spares,
+        ));
     }
     if initial.is_empty() {
         return Err("cannot initialize an empty topology".to_string());
     }
-    persist_topology(path, 1, &initial.shards)?;
-    Ok((1, initial.clone()))
+    persist_topology(path, 1, &initial.shards, &[])?;
+    Ok((1, initial.clone(), Vec::new()))
 }
 
 /// Atomically replace a topology state file with one new generation.
@@ -207,6 +226,7 @@ pub fn persist_topology(
     path: &Path,
     generation: u64,
     shards: &[ShardConfig],
+    spares: &[String],
 ) -> Result<(), String> {
     if generation == 0 || shards.is_empty() {
         return Err(format!(
@@ -221,6 +241,7 @@ pub fn persist_topology(
         version: TOPOLOGY_VERSION,
         generation,
         shards: shards.to_vec(),
+        spares: spares.to_vec(),
     })
     .map_err(|e| format!("encode topology generation {generation}: {e}"))?;
     let temp = parent.join(format!(
@@ -273,7 +294,7 @@ fn strip_comment(entry: &str) -> &str {
 
 /// Give a bare `host:port` the `http://` scheme the transport needs, and leave
 /// an address that already names a scheme alone.
-fn with_scheme(address: String) -> String {
+pub fn with_scheme(address: String) -> String {
     if address.contains("://") {
         address
     } else {
@@ -323,18 +344,39 @@ mod tests {
         let root = std::env::temp_dir().join(format!("turbovec-topology-{}", uuid::Uuid::new_v4()));
         let path = root.join("topology.json");
         let initial = NodeTable::new(vec![ShardConfig::with_index("node-a:1", "shard-a")]);
-        let (generation, loaded) = load_or_initialize(&path, &initial).unwrap();
+        let (generation, loaded, spares) = load_or_initialize(&path, &initial).unwrap();
         assert_eq!(generation, 1);
         assert_eq!(loaded, initial);
+        assert!(spares.is_empty());
 
         let next = vec![
             ShardConfig::with_index("node-b:2", "shard-b"),
             ShardConfig::with_index("node-c:3", "shard-c"),
         ];
-        persist_topology(&path, 2, &next).unwrap();
-        let (generation, loaded) = load_or_initialize(&path, &initial).unwrap();
+        let pool = vec!["http://node-d:4".to_string()];
+        persist_topology(&path, 2, &next, &pool).unwrap();
+        let (generation, loaded, spares) = load_or_initialize(&path, &initial).unwrap();
         assert_eq!(generation, 2);
         assert_eq!(loaded.shards, next);
+        assert_eq!(spares, pool);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn state_files_without_a_spare_pool_still_load() {
+        let root = std::env::temp_dir().join(format!("turbovec-topology-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("topology.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"generation":3,"shards":[{"address":"http://node-a:1","index_id":"shard-a","replicas":[],"required_generation":7}]}"#,
+        )
+        .unwrap();
+        let initial = NodeTable::new(vec![ShardConfig::new("unused:1")]);
+        let (generation, loaded, spares) = load_or_initialize(&path, &initial).unwrap();
+        assert_eq!(generation, 3);
+        assert_eq!(loaded.shards[0].required_generation, Some(7));
+        assert!(spares.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 }
