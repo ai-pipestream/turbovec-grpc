@@ -890,6 +890,7 @@ impl TurboVec for TurboVecService {
         let req = request.into_inner();
         let handle = self.handle(&req.index_id)?;
         let columns = self.store.columns(&req.index_id);
+        let parents = self.store.parents(&req.index_id);
         let removed = tokio::task::spawn_blocking(move || {
             let mut guard = handle
                 .write()
@@ -898,14 +899,24 @@ impl TurboVec for TurboVecService {
                 Index::IdMap(inner) => {
                     let removed = inner.remove(req.id);
                     // A schema-bound index drops the row's stored fields
-                    // with the row, under the same index write lock, so
-                    // the columns never describe a row that is gone.
+                    // (and its membership in the parent table) with the
+                    // row, under the same index write lock.
                     if removed {
                         if let Some(columns) = columns {
-                            columns
+                            let mut columns = columns
                                 .write()
-                                .map_err(|_| Status::internal("columns lock poisoned"))?
-                                .remove(req.id);
+                                .map_err(|_| Status::internal("columns lock poisoned"))?;
+                            if let Some(row) = columns.get(req.id).cloned() {
+                                columns.remove(req.id);
+                                if let Some(parents) = parents {
+                                    parents
+                                        .write()
+                                        .map_err(|_| Status::internal("parents lock poisoned"))?
+                                        .remove_chunk(row.parent_label, req.id);
+                                }
+                            } else {
+                                columns.remove(req.id);
+                            }
                         }
                     }
                     Ok(removed)

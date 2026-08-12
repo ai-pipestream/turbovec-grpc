@@ -316,14 +316,20 @@ message DocumentHit {
   // Similarity score.
   float score = 1;
 
-  // The document's u64 label: the id field verbatim for an integer id,
-  // or the documented SHA-256 reduction for a string id.
+  // The indexed row's u64 label. For a flat document this is the document
+  // id's reduction; for a chunked document it is the chunk row's label
+  // (see the documented parent‖chunk hash), never the parent id alone.
   uint64 label = 2;
 
-  // The document id field's original value: the string itself for a
-  // string id, the integer rendered in decimal for an integer id. This
+  // The parent document id field's original value: the string itself for
+  // a string id, the integer rendered in decimal for an integer id. This
   // is the value the client indexed, not the reduction.
   string id = 3;
+
+  // The chunk id inside a CHUNKS scope: the CHUNK_ID field's original
+  // value, or the chunk's ordinal in decimal when the schema has no
+  // CHUNK_ID. Empty for a flat (non-chunked) document.
+  string chunk_id = 4;
 }
 
 // DocumentQueryResult is the top-k for a single query, best first.

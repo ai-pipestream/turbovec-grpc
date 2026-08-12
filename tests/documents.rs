@@ -17,7 +17,7 @@ use turbovec_grpc::proto::{
     GetSchemaRequest, PlanSchemaRequest, RemoveRequest, SchemaSource, SearchDocumentsRequest,
     SearchRequest,
 };
-use turbovec_grpc::schema::{hash_string_id, BoundSchema};
+use turbovec_grpc::schema::{hash_chunk_label, hash_string_id, BoundSchema};
 use turbovec_grpc::{DocumentsService, IndexStore, ServiceLimits, TurboVecService};
 
 /// A product type exercising hints and inference together: an explicit
@@ -331,11 +331,14 @@ fn extraction_reads_ids_and_vectors_and_fails_loud() {
         m.set_field_by_name("embedding", Value::List(embedding(0)));
     });
     let extracted = bound.extract(&good).unwrap();
-    assert_eq!(extracted.label, hash_string_id("doc-1"));
-    assert_eq!(extracted.vector.len(), 8);
+    assert!(extracted.parent.is_none());
+    assert_eq!(extracted.rows.len(), 1);
+    let row = &extracted.rows[0];
+    assert_eq!(row.label, hash_string_id("doc-1"));
+    assert_eq!(row.vector.len(), 8);
     // Every stored field is present, defaults included: 9 planned fields
     // minus the vector, which is not a stored field.
-    assert_eq!(extracted.fields.len(), bound.schema.fields.len() - 1);
+    assert_eq!(row.fields.len(), bound.schema.fields.len() - 1);
 
     let missing_id = document(&descriptor_set, "test.v1.Product", |m| {
         m.set_field_by_name("embedding", Value::List(embedding(0)));
@@ -371,12 +374,20 @@ fn cel_filters_read_the_documents_own_proto_fields() {
             &["legal", "opinion"],
             1, // STATUS_ACTIVE
         ))
+        .unwrap()
+        .rows
+        .into_iter()
+        .next()
         .unwrap();
     let sparse = bound
         .extract(&document(&descriptor_set, "test.v1.Product", |m| {
             m.set_field_by_name("id", Value::String("doc-9".into()));
             m.set_field_by_name("embedding", Value::List(embedding(0)));
         }))
+        .unwrap()
+        .rows
+        .into_iter()
+        .next()
         .unwrap();
 
     let admits = |expression: &str, fields: &_| {
@@ -822,6 +833,233 @@ async fn bad_documents_fail_by_position_and_commit_nothing() {
         .unwrap()
         .into_inner();
     assert_eq!(info.len, 0, "a broken stream commits no prefix");
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Parent with a CHUNKS scope: each chunk is its own indexed row.
+const CHUNKED: &str = r#"
+syntax = "proto3";
+package test.v1;
+
+import "ai/pipestream/proto/index/hints/v1/indexing_hints.proto";
+
+message Opinion {
+  string id = 1 [(ai.pipestream.proto.index.hints.v1.index) = {
+    block_role: BLOCK_ROLE_DOC_ID
+  }];
+  string title = 2;
+  repeated Chunk chunks = 3 [(ai.pipestream.proto.index.hints.v1.index) = {
+    block_role: BLOCK_ROLE_CHUNKS
+  }];
+}
+
+message Chunk {
+  string chunk_id = 1 [(ai.pipestream.proto.index.hints.v1.index) = {
+    block_role: BLOCK_ROLE_CHUNK_ID
+  }];
+  string body = 2;
+  int64 ordinal = 3;
+  repeated float embedding = 4 [(ai.pipestream.proto.index.hints.v1.index) = {
+    type: INDEX_FIELD_TYPE_VECTOR
+    vector_dims: 8
+  }];
+}
+"#;
+
+fn chunked_opinion(descriptor_set: &[u8], doc: usize, n_chunks: usize) -> Vec<u8> {
+    document(descriptor_set, "test.v1.Opinion", move |m| {
+        let pool = m.descriptor().parent_pool().clone();
+        m.set_field_by_name("id", Value::String(format!("op-{doc}")));
+        m.set_field_by_name("title", Value::String(format!("opinion {doc}")));
+        let chunk_desc = pool.get_message_by_name("test.v1.Chunk").unwrap();
+        let chunks: Vec<Value> = (0..n_chunks)
+            .map(|c| {
+                let mut chunk = DynamicMessage::new(chunk_desc.clone());
+                chunk.set_field_by_name("chunk_id", Value::String(format!("c{c}")));
+                chunk.set_field_by_name("body", Value::String(format!("body-{doc}-{c}")));
+                chunk.set_field_by_name("ordinal", Value::I64(c as i64));
+                chunk.set_field_by_name(
+                    "embedding",
+                    Value::List(
+                        (0..8)
+                            .map(|i| Value::F32(if i == (doc * 2 + c) % 8 { 1.0 } else { 0.05 }))
+                            .collect(),
+                    ),
+                );
+                Value::Message(chunk)
+            })
+            .collect();
+        m.set_field_by_name("chunks", Value::List(chunks));
+    })
+}
+
+#[test]
+fn chunked_schema_indexes_each_chunk_as_its_own_row() {
+    let descriptor_set = compile(CHUNKED);
+    let bound = BoundSchema::derive(&descriptor_set, "test.v1.Opinion").unwrap();
+    assert!(bound.is_chunked());
+    assert_eq!(bound.schema.vector_path, "chunks.embedding");
+    assert_eq!(bound.schema.doc_id_path, "id");
+
+    let ingest = bound
+        .extract(&chunked_opinion(&descriptor_set, 0, 3))
+        .unwrap();
+    let parent = ingest.parent.expect("chunked extract yields a parent");
+    assert_eq!(parent.parent_label, hash_string_id("op-0"));
+    assert_eq!(ingest.rows.len(), 3);
+    for (i, row) in ingest.rows.iter().enumerate() {
+        assert_eq!(row.parent_id, "op-0");
+        assert_eq!(row.chunk_id, format!("c{i}"));
+        assert_eq!(row.label, hash_chunk_label("op-0", &format!("c{i}")));
+        assert_eq!(row.parent_label, parent.parent_label);
+        assert!(row.fields.contains_key(&bound.doc_id_ordinal()));
+    }
+
+    let empty = bound
+        .extract(&document(&descriptor_set, "test.v1.Opinion", |m| {
+            m.set_field_by_name("id", Value::String("op-empty".into()));
+        }))
+        .unwrap_err()
+        .to_string();
+    assert!(empty.contains("no chunks"), "{empty}");
+
+    let flat_vector = r#"
+        syntax = "proto3";
+        package test.v1;
+        import "ai/pipestream/proto/index/hints/v1/indexing_hints.proto";
+        message Doc {
+          string id = 1;
+          repeated float embedding = 2 [(ai.pipestream.proto.index.hints.v1.index) = {
+            type: INDEX_FIELD_TYPE_VECTOR
+            vector_dims: 8
+          }];
+          repeated Chunk chunks = 3 [(ai.pipestream.proto.index.hints.v1.index) = {
+            block_role: BLOCK_ROLE_CHUNKS
+          }];
+        }
+        message Chunk {
+          string body = 1;
+        }
+    "#;
+    let error = derive_err(flat_vector, "test.v1.Doc");
+    assert!(
+        error.contains("inside the CHUNKS scope") || error.contains("CHUNKS"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn chunked_documents_search_filter_and_survive_restart() {
+    let root = std::env::temp_dir().join(format!("turbovec-chunks-{}", uuid::Uuid::new_v4()));
+    let (mut documents, mut vectors) = start(&root).await;
+    let descriptor_set = compile(CHUNKED);
+    let index_id = documents
+        .bind_schema(BindSchemaRequest {
+            source: Some(SchemaSource {
+                descriptor_set: descriptor_set.clone(),
+                message_type: "test.v1.Opinion".to_string(),
+            }),
+            bit_width: 4,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .index_id;
+
+    let added = documents
+        .add_documents(tokio_stream::iter(vec![AddDocumentsRequest {
+            index_id: index_id.clone(),
+            documents: vec![
+                chunked_opinion(&descriptor_set, 0, 2),
+                chunked_opinion(&descriptor_set, 1, 2),
+            ],
+        }]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(added.added, 4);
+    assert_eq!(added.len, 4);
+
+    let mut query = vec![0.05f32; 8];
+    query[1] = 1.0;
+    let response = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 4,
+            filter: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.total, 4);
+    let top = &response.results[0].hits[0];
+    assert_eq!(top.id, "op-0");
+    assert_eq!(top.chunk_id, "c1");
+    assert_eq!(top.label, hash_chunk_label("op-0", "c1"));
+
+    let filtered = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 4,
+            filter: r#"title == "opinion 1" && chunks.ordinal == 0"#.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(filtered.matched, 1);
+    assert_eq!(filtered.results[0].hits[0].id, "op-1");
+    assert_eq!(filtered.results[0].hits[0].chunk_id, "c0");
+
+    let chunk_label = hash_chunk_label("op-0", "c0");
+    assert!(
+        vectors
+            .remove(RemoveRequest {
+                index_id: index_id.clone(),
+                id: chunk_label,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .removed
+    );
+    let after = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 4,
+            filter: r#"id == "op-0""#.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(after.matched, 1);
+    assert_eq!(after.results[0].hits[0].chunk_id, "c1");
+
+    vectors
+        .flush(FlushRequest {
+            index_id: index_id.clone(),
+        })
+        .await
+        .unwrap();
+    drop(documents);
+    drop(vectors);
+
+    let (mut documents, _) = start(&root).await;
+    let restored = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query,
+            k: 4,
+            filter: r#"id == "op-0""#.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(restored.matched, 1);
+    assert_eq!(restored.results[0].hits[0].chunk_id, "c1");
 
     std::fs::remove_dir_all(&root).unwrap();
 }

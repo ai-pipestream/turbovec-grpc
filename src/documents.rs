@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::columns::StoredRow;
 use crate::filter::CompiledFilter;
 use crate::proto::documents_server::{Documents, DocumentsServer};
 use crate::proto::{
@@ -77,11 +78,10 @@ impl DocumentsService {
     }
 }
 
-/// Render the document id field's stored value back into the string the
-/// client indexed. The plan only accepts string and integer id fields, so
-/// these are the only shapes a stored id can have.
-fn id_of(fields: &HashMap<u32, StoredValue>, doc_id_ordinal: u32) -> String {
-    match fields.get(&doc_id_ordinal).and_then(|v| v.value.as_ref()) {
+/// Render a string/integer stored id field back into the string the
+/// client indexed.
+fn id_of(fields: &HashMap<u32, StoredValue>, ordinal: u32) -> String {
+    match fields.get(&ordinal).and_then(|v| v.value.as_ref()) {
         Some(stored_value::Value::StringValue(text)) => text.clone(),
         Some(stored_value::Value::IntValue(v)) => v.to_string(),
         Some(stored_value::Value::UintValue(v)) => v.to_string(),
@@ -198,13 +198,21 @@ impl Documents for DocumentsService {
                 "index {index_id} has a bound schema but no document columns"
             ))
         })?;
+        let parents = self.store.parents(&index_id);
+        if bound.is_chunked() && parents.is_none() {
+            return Err(Status::internal(format!(
+                "index {index_id} is chunked but has no parent store"
+            )));
+        }
 
         // Stage the complete operation before mutating the index: decode and
         // extract every frame, then add once. A document that fails is named
         // by its position across the whole stream, and nothing is applied.
+        // `position` counts parent wire messages; `added` counts indexed rows.
         let mut ids: Vec<u64> = Vec::new();
         let mut vectors: Vec<f32> = Vec::new();
-        let mut fields: Vec<HashMap<u32, StoredValue>> = Vec::new();
+        let mut rows: Vec<StoredRow> = Vec::new();
+        let mut parent_upserts: Vec<(u64, HashMap<u32, StoredValue>, Vec<u64>)> = Vec::new();
         let mut dim: usize = 0;
         let mut position: u64 = 0;
         let mut frame = Some(first);
@@ -230,19 +238,31 @@ impl Documents for DocumentsService {
             })
             .await
             .map_err(join_err)??;
-            for document in extracted {
-                if dim == 0 {
-                    dim = document.vector.len();
-                } else if document.vector.len() != dim {
-                    return Err(Status::invalid_argument(format!(
-                        "document {position} has a {}-coordinate vector; earlier \
-                         documents in this stream have {dim}",
-                        document.vector.len()
-                    )));
+            for ingest in extracted {
+                let mut chunk_labels = Vec::with_capacity(ingest.rows.len());
+                for row in ingest.rows {
+                    if dim == 0 {
+                        dim = row.vector.len();
+                    } else if row.vector.len() != dim {
+                        return Err(Status::invalid_argument(format!(
+                            "document {position} has a {}-coordinate vector; earlier \
+                             documents in this stream have {dim}",
+                            row.vector.len()
+                        )));
+                    }
+                    ids.push(row.label);
+                    chunk_labels.push(row.label);
+                    vectors.extend_from_slice(&row.vector);
+                    rows.push(StoredRow {
+                        fields: row.fields,
+                        parent_id: row.parent_id,
+                        chunk_id: row.chunk_id,
+                        parent_label: row.parent_label,
+                    });
                 }
-                ids.push(document.label);
-                vectors.extend_from_slice(&document.vector);
-                fields.push(document.fields);
+                if let Some(parent) = ingest.parent {
+                    parent_upserts.push((parent.parent_label, parent.fields, chunk_labels));
+                }
                 position += 1;
             }
             self.validate_frame(vectors.len())?;
@@ -267,14 +287,21 @@ impl Documents for DocumentsService {
                     ))
                 }
             }
-            // The columns are updated while the index write lock is still
-            // held, so every reader that has the index read lock sees the
-            // vectors and their field values move together.
+            // Columns and parents update under the index write lock so every
+            // reader with the index read lock sees them move together.
             let mut columns = columns
                 .write()
                 .map_err(|_| Status::internal("columns lock poisoned"))?;
-            for (label, values) in ids.iter().zip(fields) {
-                columns.insert(*label, values);
+            for (label, row) in ids.iter().zip(rows) {
+                columns.insert(*label, row);
+            }
+            if let Some(parents) = parents {
+                let mut parents = parents
+                    .write()
+                    .map_err(|_| Status::internal("parents lock poisoned"))?;
+                for (parent_label, parent_fields, chunk_labels) in parent_upserts {
+                    parents.upsert(parent_label, parent_fields, chunk_labels);
+                }
             }
             Ok::<_, Status>(guard.len() as u64)
         })
@@ -352,9 +379,9 @@ impl Documents for DocumentsService {
                     CompiledFilter::compile(&req.filter, &bound.schema, bound.stored_fields())
                         .map_err(|e| Status::invalid_argument(e.to_string()))?;
                 let mut allow = Vec::new();
-                for (label, fields) in columns.iter() {
+                for (label, row) in columns.iter() {
                     let admitted = compiled
-                        .matches(fields)
+                        .matches(&row.fields)
                         .map_err(|e| Status::invalid_argument(format!("document {label}: {e}")))?;
                     if admitted && index.contains(label) {
                         allow.push(label);
@@ -382,13 +409,24 @@ impl Documents for DocumentsService {
                             hits: scores[lo..hi]
                                 .iter()
                                 .zip(&labels[lo..hi])
-                                .map(|(&score, &label)| DocumentHit {
-                                    score,
-                                    label,
-                                    id: columns
-                                        .get(label)
-                                        .map(|fields| id_of(fields, bound.doc_id_ordinal()))
-                                        .unwrap_or_default(),
+                                .map(|(&score, &label)| {
+                                    let row = columns.get(label);
+                                    DocumentHit {
+                                        score,
+                                        label,
+                                        id: row
+                                            .map(|row| {
+                                                if row.parent_id.is_empty() {
+                                                    id_of(&row.fields, bound.doc_id_ordinal())
+                                                } else {
+                                                    row.parent_id.clone()
+                                                }
+                                            })
+                                            .unwrap_or_default(),
+                                        chunk_id: row
+                                            .map(|row| row.chunk_id.clone())
+                                            .unwrap_or_default(),
+                                    }
                                 })
                                 .collect(),
                         }

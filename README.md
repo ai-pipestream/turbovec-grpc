@@ -127,6 +127,18 @@ SHA-256 over their UTF-8 bytes, big-endian — part of the wire contract, so
 any client can predict the labels its documents will carry in search
 results.
 
+### Chunk scopes (parent / child)
+
+A message may declare one `BLOCK_ROLE_CHUNKS` repeated field. The vector
+must live inside that scope; the document id stays on the parent. Ingest
+explodes each wire message into N chunk rows (unique labels from the
+documented `parent_id‖chunk_id` hash) plus one parent record. Parent
+scalars are denormalized onto every chunk row so CEL filters see
+`title == "…" && chunks.ordinal == 0` without a join at query time.
+`SearchDocuments` hits report `id` (parent) and `chunk_id`. Chunks need
+not share a shard with their parent later; this cut is node-local only.
+`parents.pb` persists the parent table beside `documents.pb`.
+
 ### Sharded document collections
 
 The coordinator serves the same surface over many shards. Its

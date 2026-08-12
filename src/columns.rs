@@ -1,8 +1,8 @@
 //! Per-index document field values, kept beside the vectors.
 //!
 //! A schema-bound index stores every planned scalar field of every
-//! document it holds, keyed by the document's u64 label, so CEL filters
-//! evaluate against what each document actually carried at ingest. The
+//! indexed row it holds, keyed by the row's u64 label, so CEL filters
+//! evaluate against what each row actually carried at ingest. The
 //! in-memory representation is the wire/storage types themselves
 //! ([`StoredValue`], see `stored_documents.proto`): persistence is one
 //! deterministic encode, restore is one decode, and there is no parallel
@@ -12,13 +12,22 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::proto::{StoredDocument, StoredDocumentSet, StoredValue};
 
-/// The stored field values of every document in one index.
+/// One indexed row's stored fields and identity strings.
+#[derive(Clone, Debug)]
+pub struct StoredRow {
+    pub fields: HashMap<u32, StoredValue>,
+    pub parent_id: String,
+    pub chunk_id: String,
+    pub parent_label: u64,
+}
+
+/// The stored field values of every indexed row in one index.
 ///
 /// Labels are kept in a `BTreeMap` so iteration — and therefore the
 /// persisted byte stream — is deterministic for a given state.
 pub struct DocumentColumns {
     fingerprint: String,
-    documents: BTreeMap<u64, HashMap<u32, StoredValue>>,
+    documents: BTreeMap<u64, StoredRow>,
 }
 
 impl DocumentColumns {
@@ -45,26 +54,24 @@ impl DocumentColumns {
         self.documents.is_empty()
     }
 
-    /// Insert (or replace) one document's values.
-    pub fn insert(&mut self, label: u64, fields: HashMap<u32, StoredValue>) {
-        self.documents.insert(label, fields);
+    /// Insert (or replace) one row.
+    pub fn insert(&mut self, label: u64, row: StoredRow) {
+        self.documents.insert(label, row);
     }
 
-    /// Remove one document's values. Returns whether it was present.
+    /// Remove one row's values. Returns whether it was present.
     pub fn remove(&mut self, label: u64) -> bool {
         self.documents.remove(&label).is_some()
     }
 
-    /// One document's values, by label.
-    pub fn get(&self, label: u64) -> Option<&HashMap<u32, StoredValue>> {
+    /// One row, by label.
+    pub fn get(&self, label: u64) -> Option<&StoredRow> {
         self.documents.get(&label)
     }
 
-    /// Iterate every document in ascending label order.
-    pub fn iter(&self) -> impl Iterator<Item = (u64, &HashMap<u32, StoredValue>)> {
-        self.documents
-            .iter()
-            .map(|(label, fields)| (*label, fields))
+    /// Iterate every row in ascending label order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &StoredRow)> {
+        self.documents.iter().map(|(label, row)| (*label, row))
     }
 
     /// Encode the whole set for persistence, in ascending label order.
@@ -74,17 +81,18 @@ impl DocumentColumns {
             documents: self
                 .documents
                 .iter()
-                .map(|(label, fields)| StoredDocument {
+                .map(|(label, row)| StoredDocument {
                     label: *label,
-                    fields: fields.clone(),
+                    fields: row.fields.clone(),
+                    parent_id: row.parent_id.clone(),
+                    chunk_id: row.chunk_id.clone(),
+                    parent_label: row.parent_label,
                 })
                 .collect(),
         }
     }
 
-    /// Rebuild from a persisted set, refusing one written under a
-    /// different schema fingerprint: ordinals are only meaningful against
-    /// the plan they were derived from.
+    /// Rebuild from a persisted set, refusing a fingerprint mismatch.
     pub fn from_set(set: StoredDocumentSet, expected_fingerprint: &str) -> Result<Self, String> {
         if set.fingerprint != expected_fingerprint {
             return Err(format!(
@@ -95,7 +103,32 @@ impl DocumentColumns {
         }
         let mut documents = BTreeMap::new();
         for document in set.documents {
-            if documents.insert(document.label, document.fields).is_some() {
+            let parent_label = if document.parent_label == 0 && document.chunk_id.is_empty() {
+                // Legacy flat rows written before parent_label existed:
+                // the row label is the parent label.
+                document.label
+            } else if document.parent_label == 0 {
+                document.label
+            } else {
+                document.parent_label
+            };
+            let parent_id = if document.parent_id.is_empty() {
+                String::new()
+            } else {
+                document.parent_id
+            };
+            if documents
+                .insert(
+                    document.label,
+                    StoredRow {
+                        fields: document.fields,
+                        parent_id,
+                        chunk_id: document.chunk_id,
+                        parent_label,
+                    },
+                )
+                .is_some()
+            {
                 return Err(format!(
                     "stored documents carry label {} twice",
                     document.label

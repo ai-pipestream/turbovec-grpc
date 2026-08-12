@@ -51,7 +51,7 @@ const MAX_DEPTH: usize = 8;
 /// Version tag mixed into the canonical fingerprint bytes. Bump on any
 /// change to derivation semantics or to the canonical encoding: a changed
 /// fingerprint is how drift is caught at restore time.
-const FINGERPRINT_VERSION: &str = "turbovec-schema/v1";
+const FINGERPRINT_VERSION: &str = "turbovec-schema/v2";
 
 /// A derivation failure, with the dotted field path where it applies.
 #[derive(Debug)]
@@ -95,7 +95,9 @@ pub struct StoredField {
     /// with the plan they were written under.
     pub ordinal: u32,
 
-    /// Field steps from the message root to the leaf.
+    /// Field steps from the extraction root to the leaf. For parent-level
+    /// fields the root is the bound message; for chunk-local fields it is
+    /// the chunk message.
     steps: Vec<FieldDescriptor>,
 }
 
@@ -112,36 +114,83 @@ pub struct BoundSchema {
     /// Descriptor of the bound message type.
     message: MessageDescriptor,
 
-    /// Field steps from the root to the vector leaf.
+    /// Field steps to the vector leaf. From the parent root when flat;
+    /// from the chunk message when chunked.
     vector: Vec<FieldDescriptor>,
 
-    /// Field steps from the root to the document id leaf.
+    /// Field steps from the parent root to the document id leaf.
     doc_id: Vec<FieldDescriptor>,
 
-    /// How the id leaf's value becomes a label.
+    /// How the id leaf's value becomes a parent label.
     doc_id_source: DocIdSource,
 
-    /// The planned fields whose values ingest keeps, in plan order.
+    /// Planned fields whose values are stored on every indexed row, in
+    /// plan order. For a chunked schema this is parent scalars plus
+    /// chunk scalars (the row denormalizes both).
     stored: Vec<StoredField>,
 
-    /// Ordinal of the document id field within `stored`'s vocabulary,
-    /// so a hit can report the original id value, not just the label.
+    /// Parent-level stored fields only. Empty when the schema is flat.
+    /// Used to build the parent table beside the chunk rows.
+    parent_stored: Vec<StoredField>,
+
+    /// Chunk-local stored fields only. Empty when the schema is flat.
+    chunk_stored: Vec<StoredField>,
+
+    /// The repeated CHUNKS field on the parent, when the schema is chunked.
+    chunks_field: Option<FieldDescriptor>,
+
+    /// Field steps from the chunk message to the CHUNK_ID leaf, when set.
+    chunk_id: Option<Vec<FieldDescriptor>>,
+
+    /// Ordinal of the document id field in `IndexSchema.fields`.
     doc_id_ordinal: u32,
+
+    /// Ordinal of the CHUNK_ID field in `IndexSchema.fields`, when set.
+    chunk_id_ordinal: Option<u32>,
 }
 
-/// Everything extracted from one decoded document: the index label, the
-/// vector, and the stored field values keyed by planned-field ordinal.
+/// Everything extracted from one parent wire message ready for ingest.
+#[derive(Debug)]
+pub struct ExtractedIngest {
+    /// Parent table entry when the schema is chunked; `None` when flat.
+    pub parent: Option<ExtractedParent>,
+
+    /// Indexed rows: one for a flat document, one per chunk when chunked.
+    pub rows: Vec<ExtractedDocument>,
+}
+
+/// Parent-level fields for the parent table.
+#[derive(Debug)]
+pub struct ExtractedParent {
+    /// Parent document id's u64 reduction.
+    pub parent_label: u64,
+
+    /// Parent-level stored field values.
+    pub fields: HashMap<u32, StoredValue>,
+}
+
+/// One indexed row extracted from a decoded document.
 #[derive(Debug)]
 pub struct ExtractedDocument {
     /// The u64 label the row is indexed under.
     pub label: u64,
 
-    /// The document's vector, in document order.
+    /// Parent document id's u64 reduction. Equal to `label` when flat.
+    pub parent_label: u64,
+
+    /// The parent document id's original value, as the client indexed it.
+    pub parent_id: String,
+
+    /// Chunk id string; empty when the schema is flat.
+    pub chunk_id: String,
+
+    /// The row's vector, in document order.
     pub vector: Vec<f32>,
 
     /// Values of the stored fields, keyed by ordinal into
     /// `IndexSchema.fields`. Every stored field is present, defaults
     /// included, so filter evaluation never has to guess at absence.
+    /// Chunk rows denormalize parent scalars onto the row.
     pub fields: HashMap<u32, StoredValue>,
 }
 
@@ -192,8 +241,10 @@ impl BoundSchema {
             )));
         }
 
-        let vector_path = resolve_vector(&mut fields)?;
-        let doc_id_path = resolve_doc_id(&mut fields)?;
+        let chunks_path = resolve_chunks(&fields)?;
+        let vector_path = resolve_vector(&mut fields, chunks_path.as_deref())?;
+        let doc_id_path = resolve_doc_id(&mut fields, chunks_path.as_deref())?;
+        let chunk_id_path = resolve_chunk_id(&fields, chunks_path.as_deref())?;
         let dim = fields
             .iter()
             .find(|f| f.path == vector_path)
@@ -209,9 +260,7 @@ impl BoundSchema {
         };
         schema.fingerprint = fingerprint(&schema);
 
-        let vector = navigate(&message, &vector_path)?;
         let doc_id = navigate(&message, &doc_id_path)?;
-        let (stored, doc_id_ordinal) = stored_fields(&message, &schema)?;
         let doc_id_source = match doc_id.last().expect("navigated path is non-empty").kind() {
             Kind::String => DocIdSource::HashedString,
             Kind::Int32
@@ -232,6 +281,56 @@ impl BoundSchema {
             }
         };
 
+        let (chunks_field, vector, chunk_id, parent_stored, chunk_stored, stored) =
+            if let Some(chunks_path) = chunks_path.as_deref() {
+                let chunks_field = message.get_field_by_name(chunks_path).ok_or_else(|| {
+                    SchemaError::at(chunks_path, "CHUNKS field missing from descriptor")
+                })?;
+                let chunk_message = match chunks_field.kind() {
+                    Kind::Message(child) => child,
+                    _ => {
+                        return Err(SchemaError::at(
+                            chunks_path,
+                            "BLOCK_ROLE_CHUNKS requires a repeated message field",
+                        ))
+                    }
+                };
+                let vector_rel = strip_prefix(&vector_path, chunks_path)?;
+                let vector = navigate(&chunk_message, &vector_rel)?;
+                let chunk_id = match chunk_id_path.as_deref() {
+                    Some(path) => {
+                        let rel = strip_prefix(path, chunks_path)?;
+                        Some(navigate(&chunk_message, &rel)?)
+                    }
+                    None => None,
+                };
+                let (parent_stored, chunk_stored, stored) =
+                    stored_fields_chunked(&message, &chunk_message, &schema, chunks_path)?;
+                (
+                    Some(chunks_field),
+                    vector,
+                    chunk_id,
+                    parent_stored,
+                    chunk_stored,
+                    stored,
+                )
+            } else {
+                let vector = navigate(&message, &vector_path)?;
+                let (stored, _) = stored_fields_flat(&message, &schema)?;
+                (None, vector, None, Vec::new(), Vec::new(), stored)
+            };
+
+        let doc_id_ordinal = schema
+            .fields
+            .iter()
+            .position(|f| f.role == FieldRole::DocId as i32)
+            .expect("resolve_doc_id planned a doc id") as u32;
+        let chunk_id_ordinal = schema
+            .fields
+            .iter()
+            .position(|f| f.role == FieldRole::ChunkId as i32)
+            .map(|i| i as u32);
+
         Ok(Self {
             schema,
             descriptor_set: descriptor_set.to_vec(),
@@ -240,7 +339,12 @@ impl BoundSchema {
             doc_id,
             doc_id_source,
             stored,
+            parent_stored,
+            chunk_stored,
+            chunks_field,
+            chunk_id,
             doc_id_ordinal,
+            chunk_id_ordinal,
         })
     }
 
@@ -249,7 +353,12 @@ impl BoundSchema {
         &self.schema.message_type
     }
 
-    /// The planned fields whose values ingest keeps, in plan order.
+    /// True when the schema has a CHUNKS scope and indexes chunk rows.
+    pub fn is_chunked(&self) -> bool {
+        self.chunks_field.is_some()
+    }
+
+    /// The planned fields whose values ingest keeps on every row.
     pub fn stored_fields(&self) -> &[StoredField] {
         &self.stored
     }
@@ -259,11 +368,14 @@ impl BoundSchema {
         self.doc_id_ordinal
     }
 
-    /// Decode one serialized document of the bound type and extract its
-    /// label, vector, and stored field values per the plan. Anything
-    /// missing or malformed is an error naming the path; the caller adds
-    /// the document's position in the stream.
-    pub fn extract(&self, document: &[u8]) -> Result<ExtractedDocument, SchemaError> {
+    /// Ordinal of the CHUNK_ID field, when the schema declares one.
+    pub fn chunk_id_ordinal(&self) -> Option<u32> {
+        self.chunk_id_ordinal
+    }
+
+    /// Decode one serialized document of the bound type and extract the
+    /// indexed rows (and parent record, when chunked).
+    pub fn extract(&self, document: &[u8]) -> Result<ExtractedIngest, SchemaError> {
         let message = DynamicMessage::decode(self.message.clone(), document).map_err(|e| {
             SchemaError::new(format!(
                 "document does not decode as {}: {e}",
@@ -272,8 +384,11 @@ impl BoundSchema {
         })?;
 
         let id_value = read_leaf(&message, &self.doc_id, &self.schema.doc_id_path)?;
-        let label = match self.doc_id_source {
-            DocIdSource::Integer => integer_id(&id_value, &self.schema.doc_id_path)?,
+        let (parent_label, parent_id) = match self.doc_id_source {
+            DocIdSource::Integer => {
+                let label = integer_id(&id_value, &self.schema.doc_id_path)?;
+                (label, label.to_string())
+            }
             DocIdSource::HashedString => {
                 let text = id_value.as_str().ok_or_else(|| {
                     SchemaError::at(&self.schema.doc_id_path, "document id is not a string")
@@ -284,76 +399,212 @@ impl BoundSchema {
                         "document id is empty; every document must carry a set id",
                     ));
                 }
-                hash_string_id(text)
+                (hash_string_id(text), text.to_string())
             }
         };
 
-        let vector_value = read_leaf(&message, &self.vector, &self.schema.vector_path)?;
-        let list = vector_value.as_list().ok_or_else(|| {
-            SchemaError::at(&self.schema.vector_path, "vector field is not repeated")
-        })?;
-        if list.is_empty() {
-            return Err(SchemaError::at(
-                &self.schema.vector_path,
-                "document has an empty vector; every document must carry one",
-            ));
+        if let Some(chunks_field) = &self.chunks_field {
+            self.extract_chunked(&message, chunks_field, parent_label, parent_id)
+        } else {
+            self.extract_flat(&message, parent_label, parent_id)
         }
-        let mut vector = Vec::with_capacity(list.len());
-        for value in list {
-            let coord = match value {
-                Value::F32(v) => *v,
-                Value::F64(v) => *v as f32,
-                other => {
-                    return Err(SchemaError::at(
-                        &self.schema.vector_path,
-                        format!("vector element is not a float: {other:?}"),
-                    ))
-                }
-            };
-            vector.push(coord);
-        }
-        if self.schema.dim != 0 && vector.len() != self.schema.dim as usize {
-            return Err(SchemaError::at(
-                &self.schema.vector_path,
-                format!(
-                    "vector has {} coordinates, schema declares {}",
-                    vector.len(),
-                    self.schema.dim
-                ),
-            ));
-        }
+    }
 
+    fn extract_flat(
+        &self,
+        message: &DynamicMessage,
+        parent_label: u64,
+        parent_id: String,
+    ) -> Result<ExtractedIngest, SchemaError> {
+        let vector = read_vector(
+            message,
+            &self.vector,
+            &self.schema.vector_path,
+            self.schema.dim,
+        )?;
         let mut fields = HashMap::with_capacity(self.stored.len());
         for stored in &self.stored {
             let path = &self.schema.fields[stored.ordinal as usize].path;
-            let value = read_leaf(&message, &stored.steps, path)?;
+            let value = read_leaf(message, &stored.steps, path)?;
             let leaf = stored.steps.last().expect("navigated path is non-empty");
             fields.insert(stored.ordinal, stored_value(&value, leaf, path)?);
         }
+        Ok(ExtractedIngest {
+            parent: None,
+            rows: vec![ExtractedDocument {
+                label: parent_label,
+                parent_label,
+                parent_id,
+                chunk_id: String::new(),
+                vector,
+                fields,
+            }],
+        })
+    }
 
-        Ok(ExtractedDocument {
-            label,
-            vector,
-            fields,
+    fn extract_chunked(
+        &self,
+        message: &DynamicMessage,
+        chunks_field: &FieldDescriptor,
+        parent_label: u64,
+        parent_id: String,
+    ) -> Result<ExtractedIngest, SchemaError> {
+        let chunks_path = chunks_field.name();
+        let list = match message.get_field(chunks_field).into_owned() {
+            Value::List(list) => list,
+            _ => {
+                return Err(SchemaError::at(
+                    chunks_path,
+                    "CHUNKS field did not extract as a repeated message list",
+                ))
+            }
+        };
+        if list.is_empty() {
+            return Err(SchemaError::at(
+                chunks_path,
+                "document has no chunks; every document must carry at least one",
+            ));
+        }
+
+        let mut parent_fields = HashMap::with_capacity(self.parent_stored.len());
+        for stored in &self.parent_stored {
+            let path = &self.schema.fields[stored.ordinal as usize].path;
+            let value = read_leaf(message, &stored.steps, path)?;
+            let leaf = stored.steps.last().expect("navigated path is non-empty");
+            parent_fields.insert(stored.ordinal, stored_value(&value, leaf, path)?);
+        }
+
+        let mut rows = Vec::with_capacity(list.len());
+        for (ordinal, entry) in list.iter().enumerate() {
+            let chunk = match entry {
+                Value::Message(chunk) => chunk,
+                other => {
+                    return Err(SchemaError::at(
+                        chunks_path,
+                        format!("chunk {ordinal} is not a message: {other:?}"),
+                    ))
+                }
+            };
+            let vector = read_vector(
+                chunk,
+                &self.vector,
+                &self.schema.vector_path,
+                self.schema.dim,
+            )?;
+            let chunk_id = match &self.chunk_id {
+                Some(steps) => {
+                    let path = self
+                        .schema
+                        .fields
+                        .iter()
+                        .find(|f| f.role == FieldRole::ChunkId as i32)
+                        .map(|f| f.path.as_str())
+                        .unwrap_or("chunk_id");
+                    let value = read_leaf(chunk, steps, path)?;
+                    chunk_id_string(&value, path)?
+                }
+                None => ordinal.to_string(),
+            };
+            if chunk_id.is_empty() {
+                return Err(SchemaError::at(
+                    &format!("{chunks_path}[{ordinal}]"),
+                    "chunk id is empty; every chunk must carry a set id",
+                ));
+            }
+            let label = hash_chunk_label(&parent_id, &chunk_id);
+
+            let mut fields = HashMap::with_capacity(self.stored.len());
+            for (ordinal, value) in &parent_fields {
+                fields.insert(*ordinal, value.clone());
+            }
+            for stored in &self.chunk_stored {
+                let path = &self.schema.fields[stored.ordinal as usize].path;
+                let value = read_leaf(chunk, &stored.steps, path)?;
+                let leaf = stored.steps.last().expect("navigated path is non-empty");
+                fields.insert(stored.ordinal, stored_value(&value, leaf, path)?);
+            }
+
+            rows.push(ExtractedDocument {
+                label,
+                parent_label,
+                parent_id: parent_id.clone(),
+                chunk_id,
+                vector,
+                fields,
+            });
+        }
+
+        Ok(ExtractedIngest {
+            parent: Some(ExtractedParent {
+                parent_label,
+                fields: parent_fields,
+            }),
+            rows,
         })
     }
 }
 
-/// Select the planned fields whose values ingest keeps: every scalar leaf
-/// except the vector, un-expanded OBJECT/NESTED entries, and anything
-/// inside a CHUNKS scope (chunks are not consumed by this engine yet).
-/// The document id is stored like any other field, so a hit can report
-/// the original value the client indexed.
-fn stored_fields(
+fn read_vector(
+    message: &DynamicMessage,
+    steps: &[FieldDescriptor],
+    path: &str,
+    declared_dim: u32,
+) -> Result<Vec<f32>, SchemaError> {
+    let vector_value = read_leaf(message, steps, path)?;
+    let list = vector_value
+        .as_list()
+        .ok_or_else(|| SchemaError::at(path, "vector field is not repeated"))?;
+    if list.is_empty() {
+        return Err(SchemaError::at(
+            path,
+            "document has an empty vector; every document must carry one",
+        ));
+    }
+    let mut vector = Vec::with_capacity(list.len());
+    for value in list {
+        let coord = match value {
+            Value::F32(v) => *v,
+            Value::F64(v) => *v as f32,
+            other => {
+                return Err(SchemaError::at(
+                    path,
+                    format!("vector element is not a float: {other:?}"),
+                ))
+            }
+        };
+        vector.push(coord);
+    }
+    if declared_dim != 0 && vector.len() != declared_dim as usize {
+        return Err(SchemaError::at(
+            path,
+            format!(
+                "vector has {} coordinates, schema declares {declared_dim}",
+                vector.len()
+            ),
+        ));
+    }
+    Ok(vector)
+}
+
+fn chunk_id_string(value: &Value, path: &str) -> Result<String, SchemaError> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::I32(v) => Ok(v.to_string()),
+        Value::I64(v) => Ok(v.to_string()),
+        Value::U32(v) => Ok(v.to_string()),
+        Value::U64(v) => Ok(v.to_string()),
+        other => Err(SchemaError::at(
+            path,
+            format!("chunk id must be a string or integer, not {other:?}"),
+        )),
+    }
+}
+
+/// Select stored fields for a flat (non-chunked) schema.
+fn stored_fields_flat(
     root: &MessageDescriptor,
     schema: &IndexSchema,
 ) -> Result<(Vec<StoredField>, u32), SchemaError> {
-    let chunk_scopes: Vec<String> = schema
-        .fields
-        .iter()
-        .filter(|f| f.role == FieldRole::Chunks as i32)
-        .map(|f| format!("{}.", f.path))
-        .collect();
     let mut stored = Vec::new();
     let mut doc_id_ordinal = None;
     for (ordinal, field) in schema.fields.iter().enumerate() {
@@ -364,7 +615,7 @@ fn stored_fields(
         ) {
             continue;
         }
-        if chunk_scopes.iter().any(|s| field.path.starts_with(s)) {
+        if field.role == FieldRole::Chunks as i32 {
             continue;
         }
         let ordinal = u32::try_from(ordinal).expect("a plan holds far fewer than 2^32 fields");
@@ -379,6 +630,53 @@ fn stored_fields(
     let doc_id_ordinal =
         doc_id_ordinal.expect("resolve_doc_id planned a storable doc id field before this ran");
     Ok((stored, doc_id_ordinal))
+}
+
+/// Select parent-level and chunk-local stored fields for a chunked schema.
+type StoredFieldTriple = (Vec<StoredField>, Vec<StoredField>, Vec<StoredField>);
+
+fn stored_fields_chunked(
+    root: &MessageDescriptor,
+    chunk: &MessageDescriptor,
+    schema: &IndexSchema,
+    chunks_path: &str,
+) -> Result<StoredFieldTriple, SchemaError> {
+    let prefix = format!("{chunks_path}.");
+    let mut parent_stored = Vec::new();
+    let mut chunk_stored = Vec::new();
+    for (ordinal, field) in schema.fields.iter().enumerate() {
+        let kind = FieldKind::try_from(field.kind).expect("derived plans hold known kinds");
+        if matches!(
+            kind,
+            FieldKind::Vector | FieldKind::Object | FieldKind::Nested | FieldKind::Unspecified
+        ) {
+            continue;
+        }
+        if field.role == FieldRole::Chunks as i32 {
+            continue;
+        }
+        let ordinal = u32::try_from(ordinal).expect("a plan holds far fewer than 2^32 fields");
+        if let Some(rel) = field.path.strip_prefix(&prefix) {
+            chunk_stored.push(StoredField {
+                ordinal,
+                steps: navigate(chunk, rel)?,
+            });
+        } else if field.path != chunks_path {
+            parent_stored.push(StoredField {
+                ordinal,
+                steps: navigate(root, &field.path)?,
+            });
+        }
+    }
+    let stored: Vec<StoredField> = parent_stored
+        .iter()
+        .chain(chunk_stored.iter())
+        .map(|f| StoredField {
+            ordinal: f.ordinal,
+            steps: f.steps.clone(),
+        })
+        .collect();
+    Ok((parent_stored, chunk_stored, stored))
 }
 
 /// Convert one extracted leaf value into its stored form. The descriptor
@@ -480,6 +778,20 @@ fn timestamp_of(
 /// any client can compute the label its documents will carry.
 pub fn hash_string_id(id: &str) -> u64 {
     let digest = Sha256::digest(id.as_bytes());
+    u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 yields 32 bytes"))
+}
+
+/// Reduce a chunk row's identity to a `u64` label: the first 8 bytes of
+/// SHA-256 over `turbovec-chunk-label/v1\0{parent_id}\0{chunk_id}`,
+/// big-endian. Distinct from [`hash_string_id`] so a parent id never
+/// collides with one of its chunk rows. Part of the wire contract.
+pub fn hash_chunk_label(parent_id: &str, chunk_id: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"turbovec-chunk-label/v1\0");
+    hasher.update(parent_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(chunk_id.as_bytes());
+    let digest = hasher.finalize();
     u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 yields 32 bytes"))
 }
 
@@ -763,11 +1075,16 @@ fn validate_hint(
             ));
         }
     }
-    if hint.role == FieldRole::DocId {
+    if hint.role == FieldRole::DocId || hint.role == FieldRole::ChunkId {
+        let role_name = if hint.role == FieldRole::DocId {
+            "BLOCK_ROLE_DOC_ID"
+        } else {
+            "BLOCK_ROLE_CHUNK_ID"
+        };
         if field.is_list() || field.is_map() {
             return Err(SchemaError::at(
                 path,
-                "BLOCK_ROLE_DOC_ID requires a singular field",
+                format!("{role_name} requires a singular field"),
             ));
         }
         let id_ok = matches!(
@@ -787,25 +1104,83 @@ fn validate_hint(
         if !id_ok {
             return Err(SchemaError::at(
                 path,
-                "BLOCK_ROLE_DOC_ID requires an integer or string field",
+                format!("{role_name} requires an integer or string field"),
             ));
         }
     }
     Ok(())
 }
 
+/// At most one CHUNKS scope per schema.
+fn resolve_chunks(fields: &[PlannedField]) -> Result<Option<String>, SchemaError> {
+    let chunks: Vec<&PlannedField> = fields
+        .iter()
+        .filter(|f| f.role == FieldRole::Chunks as i32)
+        .collect();
+    match chunks.len() {
+        0 => Ok(None),
+        1 => Ok(Some(chunks[0].path.clone())),
+        _ => Err(SchemaError::new(format!(
+            "the schema hints {} CHUNKS fields ({}); a document has at most one chunk scope",
+            chunks.len(),
+            paths(&chunks)
+        ))),
+    }
+}
+
 /// Pick the plan's vector field. An explicit VECTOR hint wins; without
 /// one, exactly one repeated float/double field with a vector-shaped name
 /// is accepted and its planned kind is rewritten to VECTOR. Anything else
 /// is an error naming the fix.
-fn resolve_vector(fields: &mut [PlannedField]) -> Result<String, SchemaError> {
+///
+/// When the schema has a CHUNKS scope the vector must live inside it
+/// (each chunk is a searchable row). When there is no CHUNKS scope the
+/// vector must not pass through one.
+fn resolve_vector(
+    fields: &mut [PlannedField],
+    chunks_path: Option<&str>,
+) -> Result<String, SchemaError> {
     let explicit: Vec<&PlannedField> = fields
         .iter()
         .filter(|f| f.kind == FieldKind::Vector as i32)
         .collect();
-    match explicit.len() {
-        1 => return validated_scope(explicit[0].path.clone(), fields, "vector"),
-        0 => {}
+    let path = match explicit.len() {
+        1 => explicit[0].path.clone(),
+        0 => {
+            let candidates: Vec<usize> = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| {
+                    f.repeated
+                        && (f.kind == FieldKind::Float as i32 || f.kind == FieldKind::Double as i32)
+                        && vector_shaped_name(f.path.rsplit('.').next().unwrap_or(&f.path))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            match candidates.len() {
+                1 => {
+                    let index = candidates[0];
+                    fields[index].kind = FieldKind::Vector as i32;
+                    fields[index].path.clone()
+                }
+                0 => {
+                    return Err(SchemaError::new(
+                        "no vector field: hint exactly one repeated float field with \
+                         (ai.pipestream.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR, \
+                         or name it vector/embedding",
+                    ))
+                }
+                _ => {
+                    let named: Vec<&PlannedField> =
+                        candidates.iter().map(|&i| &fields[i]).collect();
+                    return Err(SchemaError::new(format!(
+                        "several fields look like the vector ({}); hint the intended one with \
+                         (ai.pipestream.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR",
+                        paths(&named)
+                    )));
+                }
+            }
+        }
         _ => {
             return Err(SchemaError::new(format!(
                 "the schema hints {} VECTOR fields ({}); an index is built over exactly one",
@@ -813,50 +1188,48 @@ fn resolve_vector(fields: &mut [PlannedField]) -> Result<String, SchemaError> {
                 paths(&explicit)
             )))
         }
-    }
-    let candidates: Vec<usize> = fields
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| {
-            f.repeated
-                && (f.kind == FieldKind::Float as i32 || f.kind == FieldKind::Double as i32)
-                && vector_shaped_name(f.path.rsplit('.').next().unwrap_or(&f.path))
-        })
-        .map(|(i, _)| i)
-        .collect();
-    match candidates.len() {
-        1 => {
-            let index = candidates[0];
-            fields[index].kind = FieldKind::Vector as i32;
-            validated_scope(fields[index].path.clone(), fields, "vector")
-        }
-        0 => Err(SchemaError::new(
-            "no vector field: hint exactly one repeated float field with \
-             (ai.pipestream.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR, \
-             or name it vector/embedding",
-        )),
-        _ => {
-            let named: Vec<&PlannedField> = candidates.iter().map(|&i| &fields[i]).collect();
-            Err(SchemaError::new(format!(
-                "several fields look like the vector ({}); hint the intended one with \
-                 (ai.pipestream.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR",
-                paths(&named)
-            )))
-        }
-    }
+    };
+    validate_vector_scope(&path, chunks_path)?;
+    Ok(path)
 }
 
 /// Pick the plan's document id field. An explicit DOC_ID role wins;
 /// without one, a singular top-level field named "id" is accepted and its
-/// planned role is rewritten. Anything else is an error naming the fix.
-fn resolve_doc_id(fields: &mut [PlannedField]) -> Result<String, SchemaError> {
+/// planned role is rewritten. The document id always lives on the parent,
+/// never inside the CHUNKS scope.
+fn resolve_doc_id(
+    fields: &mut [PlannedField],
+    chunks_path: Option<&str>,
+) -> Result<String, SchemaError> {
     let explicit: Vec<&PlannedField> = fields
         .iter()
         .filter(|f| f.role == FieldRole::DocId as i32)
         .collect();
-    match explicit.len() {
-        1 => return validated_scope(explicit[0].path.clone(), fields, "document id"),
-        0 => {}
+    let path = match explicit.len() {
+        1 => explicit[0].path.clone(),
+        0 => {
+            let fallback = fields.iter().position(|f| {
+                f.path == "id"
+                    && !f.repeated
+                    && (f.kind == FieldKind::Keyword as i32
+                        || f.kind == FieldKind::Text as i32
+                        || f.kind == FieldKind::Int32 as i32
+                        || f.kind == FieldKind::Int64 as i32)
+            });
+            match fallback {
+                Some(index) => {
+                    fields[index].role = FieldRole::DocId as i32;
+                    fields[index].path.clone()
+                }
+                None => {
+                    return Err(SchemaError::new(
+                        "no document id field: hint exactly one integer or string field with \
+                         (ai.pipestream.proto.index.hints.v1.index).block_role = BLOCK_ROLE_DOC_ID, \
+                         or declare a singular top-level field named \"id\"",
+                    ))
+                }
+            }
+        }
         _ => {
             return Err(SchemaError::new(format!(
                 "the schema hints {} DOC_ID fields ({}); a document has exactly one identity",
@@ -864,58 +1237,86 @@ fn resolve_doc_id(fields: &mut [PlannedField]) -> Result<String, SchemaError> {
                 paths(&explicit)
             )))
         }
-    }
-    let fallback = fields.iter().position(|f| {
-        f.path == "id"
-            && !f.repeated
-            && (f.kind == FieldKind::Keyword as i32
-                || f.kind == FieldKind::Text as i32
-                || f.kind == FieldKind::Int32 as i32
-                || f.kind == FieldKind::Int64 as i32)
-    });
-    match fallback {
-        Some(index) => {
-            fields[index].role = FieldRole::DocId as i32;
-            Ok(fields[index].path.clone())
+    };
+    if let Some(chunks) = chunks_path {
+        if path == chunks || path.starts_with(&format!("{chunks}.")) {
+            return Err(SchemaError::at(
+                &path,
+                "the document id field cannot live inside the CHUNKS scope",
+            ));
         }
-        None => Err(SchemaError::new(
-            "no document id field: hint exactly one integer or string field with \
-             (ai.pipestream.proto.index.hints.v1.index).block_role = BLOCK_ROLE_DOC_ID, \
-             or declare a singular top-level field named \"id\"",
-        )),
     }
-}
-
-/// The vector and the document id identify the whole document, so their
-/// paths must not pass through a repeated or CHUNKS scope, where one
-/// document would have several values.
-fn validated_scope(
-    path: String,
-    fields: &[PlannedField],
-    what: &str,
-) -> Result<String, SchemaError> {
     let target = fields
         .iter()
         .find(|f| f.path == path)
         .expect("path came from this plan");
-    let inside_chunks = fields.iter().any(|f| {
-        f.role == FieldRole::Chunks as i32
-            && f.path != path
-            && path.starts_with(&format!("{}.", f.path))
-    });
-    if inside_chunks {
+    if target.repeated {
         return Err(SchemaError::at(
             &path,
-            format!("the {what} field cannot live inside the CHUNKS scope"),
-        ));
-    }
-    if what != "vector" && target.repeated {
-        return Err(SchemaError::at(
-            &path,
-            format!("the {what} field must be singular"),
+            "the document id field must be singular",
         ));
     }
     Ok(path)
+}
+
+/// Optional CHUNK_ID inside the CHUNKS scope.
+fn resolve_chunk_id(
+    fields: &[PlannedField],
+    chunks_path: Option<&str>,
+) -> Result<Option<String>, SchemaError> {
+    let ids: Vec<&PlannedField> = fields
+        .iter()
+        .filter(|f| f.role == FieldRole::ChunkId as i32)
+        .collect();
+    match (chunks_path, ids.len()) {
+        (_, 0) => Ok(None),
+        (None, _) => Err(SchemaError::new(format!(
+            "CHUNK_ID fields ({}) require a CHUNKS scope",
+            paths(&ids)
+        ))),
+        (Some(chunks), 1) => {
+            let path = &ids[0].path;
+            if !path.starts_with(&format!("{chunks}.")) {
+                return Err(SchemaError::at(
+                    path,
+                    "CHUNK_ID must live inside the CHUNKS scope",
+                ));
+            }
+            if ids[0].repeated {
+                return Err(SchemaError::at(path, "CHUNK_ID must be singular"));
+            }
+            Ok(Some(path.clone()))
+        }
+        (Some(_), n) => Err(SchemaError::new(format!(
+            "the schema hints {n} CHUNK_ID fields ({}); a chunk has at most one identity",
+            paths(&ids)
+        ))),
+    }
+}
+
+fn validate_vector_scope(path: &str, chunks_path: Option<&str>) -> Result<(), SchemaError> {
+    if let Some(chunks) = chunks_path {
+        if !path.starts_with(&format!("{chunks}.")) {
+            return Err(SchemaError::at(
+                path,
+                "the vector field must live inside the CHUNKS scope when the schema \
+                 declares one; each chunk is a searchable row",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn strip_prefix(path: &str, chunks_path: &str) -> Result<String, SchemaError> {
+    let prefix = format!("{chunks_path}.");
+    path.strip_prefix(&prefix)
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            SchemaError::at(
+                path,
+                format!("expected a path under the CHUNKS scope {chunks_path}"),
+            )
+        })
 }
 
 fn vector_shaped_name(name: &str) -> bool {
