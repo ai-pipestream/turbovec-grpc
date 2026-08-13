@@ -22,6 +22,7 @@ use turbovec_grpc::proto::{
     AddDocumentsRequest, BindSchemaRequest, CollectionSearchDocumentsRequest, CreateIndexRequest,
     IndexKind, ListNodesRequest, SchemaSource, SearchDocumentsRequest,
 };
+use turbovec_grpc::schema::{hash_chunk_label, hash_string_id};
 use turbovec_grpc::{
     CoordinatorService, DocumentsService, IndexStore, NodeTable, ServiceLimits, ShardConfig,
     TurboVecService,
@@ -297,6 +298,7 @@ async fn a_sharded_document_collection_equals_the_monolithic_one_under_a_filter(
             queries: queries.clone(),
             k: 4,
             filter: String::new(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -307,6 +309,7 @@ async fn a_sharded_document_collection_equals_the_monolithic_one_under_a_filter(
             queries: queries.clone(),
             k: 4,
             filter: String::new(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -333,6 +336,7 @@ async fn a_sharded_document_collection_equals_the_monolithic_one_under_a_filter(
             queries: queries.clone(),
             k: 4,
             filter: filter.to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -343,6 +347,7 @@ async fn a_sharded_document_collection_equals_the_monolithic_one_under_a_filter(
             queries: queries.clone(),
             k: 4,
             filter: filter.to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -365,6 +370,7 @@ async fn a_sharded_document_collection_equals_the_monolithic_one_under_a_filter(
             queries: queries.clone(),
             k: 4,
             filter: filter.to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -375,6 +381,7 @@ async fn a_sharded_document_collection_equals_the_monolithic_one_under_a_filter(
             queries: queries.clone(),
             k: 4,
             filter: filter.to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -394,6 +401,7 @@ async fn a_sharded_document_collection_equals_the_monolithic_one_under_a_filter(
             queries: queries.clone(),
             k: 4,
             filter: "no_such_field > 1".to_string(),
+            collapse_parents: false,
         })
         .await
         .expect_err("an unplanned field should be refused");
@@ -438,6 +446,7 @@ async fn shards_that_disagree_about_the_schema_are_refused_by_name() {
             queries: query(0),
             k: 1,
             filter: String::new(),
+            collapse_parents: false,
         })
         .await
         .expect_err("disagreeing schemas should refuse to bind");
@@ -499,6 +508,7 @@ async fn a_schema_bound_shard_next_to_a_plain_one_is_refused_by_name() {
             queries: query(0),
             k: 1,
             filter: String::new(),
+            collapse_parents: false,
         })
         .await
         .expect_err("a half-bound collection should refuse to bind");
@@ -538,6 +548,7 @@ async fn search_documents_requires_a_schema_bound_collection() {
             queries: query(0),
             k: 1,
             filter: String::new(),
+            collapse_parents: false,
         })
         .await
         .expect_err("a plain collection has no schema to filter against");
@@ -547,4 +558,245 @@ async fn search_documents_requires_a_schema_bound_collection() {
         "unexpected message: {}",
         error.message()
     );
+}
+
+const CHUNKED: &str = r#"
+syntax = "proto3";
+package test.v1;
+
+import "ai/pipestream/proto/index/hints/v1/indexing_hints.proto";
+
+message Opinion {
+  string id = 1 [(ai.pipestream.proto.index.hints.v1.index) = {
+    block_role: BLOCK_ROLE_DOC_ID
+  }];
+  string title = 2;
+  repeated Chunk chunks = 3 [(ai.pipestream.proto.index.hints.v1.index) = {
+    block_role: BLOCK_ROLE_CHUNKS
+  }];
+}
+
+message Chunk {
+  string chunk_id = 1 [(ai.pipestream.proto.index.hints.v1.index) = {
+    block_role: BLOCK_ROLE_CHUNK_ID
+  }];
+  string body = 2;
+  int64 ordinal = 3;
+  repeated float embedding = 4 [(ai.pipestream.proto.index.hints.v1.index) = {
+    type: INDEX_FIELD_TYPE_VECTOR
+    vector_dims: 8
+  }];
+}
+"#;
+
+fn chunked_opinion_chunks(descriptor_set: &[u8], doc: usize, chunk_ids: &[usize]) -> Vec<u8> {
+    use prost::Message as _;
+    let pool = DescriptorPool::decode(descriptor_set).unwrap();
+    let descriptor = pool.get_message_by_name("test.v1.Opinion").unwrap();
+    let mut m = DynamicMessage::new(descriptor);
+    let pool = m.descriptor().parent_pool().clone();
+    m.set_field_by_name("id", Value::String(format!("op-{doc}")));
+    m.set_field_by_name("title", Value::String(format!("opinion {doc}")));
+    let chunk_desc = pool.get_message_by_name("test.v1.Chunk").unwrap();
+    let chunks: Vec<Value> = chunk_ids
+        .iter()
+        .map(|&c| {
+            let mut chunk = DynamicMessage::new(chunk_desc.clone());
+            chunk.set_field_by_name("chunk_id", Value::String(format!("c{c}")));
+            chunk.set_field_by_name("body", Value::String(format!("body-{doc}-{c}")));
+            chunk.set_field_by_name("ordinal", Value::I64(c as i64));
+            chunk.set_field_by_name(
+                "embedding",
+                Value::List(
+                    (0..8)
+                        .map(|i| Value::F32(if i == (doc * 2 + c) % 8 { 1.0 } else { 0.05 }))
+                        .collect(),
+                ),
+            );
+            Value::Message(chunk)
+        })
+        .collect();
+    m.set_field_by_name("chunks", Value::List(chunks));
+    m.encode_to_vec()
+}
+
+fn chunk_query(doc: usize, chunk: usize) -> Vec<f32> {
+    (0..8)
+        .map(|i| {
+            if i == (doc * 2 + chunk) % 8 {
+                1.0
+            } else {
+                0.05
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_parent_split_across_shards_joins_membership_and_collapses() {
+    let descriptor_set = compile(CHUNKED);
+    let shard_addresses = [start_node().await, start_node().await];
+    let shard_a = bind_schema(&shard_addresses[0], &descriptor_set, "test.v1.Opinion").await;
+    let shard_b = bind_schema(&shard_addresses[1], &descriptor_set, "test.v1.Opinion").await;
+    // Same parent, different chunks, different shards. The coordinator
+    // must union membership; collapse must keep the better chunk.
+    add_documents(
+        &shard_addresses[0],
+        &shard_a,
+        vec![chunked_opinion_chunks(&descriptor_set, 0, &[0])],
+    )
+    .await;
+    add_documents(
+        &shard_addresses[1],
+        &shard_b,
+        vec![chunked_opinion_chunks(&descriptor_set, 0, &[1])],
+    )
+    .await;
+
+    let monolith_address = start_node().await;
+    let monolith = bind_schema(&monolith_address, &descriptor_set, "test.v1.Opinion").await;
+    add_documents(
+        &monolith_address,
+        &monolith,
+        vec![
+            chunked_opinion_chunks(&descriptor_set, 0, &[0]),
+            chunked_opinion_chunks(&descriptor_set, 0, &[1]),
+        ],
+    )
+    .await;
+    let mut monolith_client = DocumentsClient::new(connect(&monolith_address).await);
+
+    let mut coordinator = start_coordinator(vec![
+        ShardConfig::with_index(shard_addresses[0].clone(), shard_a.clone()),
+        ShardConfig::with_index(shard_addresses[1].clone(), shard_b.clone()),
+    ])
+    .await;
+
+    let queries = chunk_query(0, 1);
+    let distributed = coordinator
+        .search_documents(CollectionSearchDocumentsRequest {
+            queries: queries.clone(),
+            k: 2,
+            filter: String::new(),
+            collapse_parents: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let monolithic = monolith_client
+        .search_documents(SearchDocumentsRequest {
+            index_id: monolith.clone(),
+            queries,
+            k: 2,
+            filter: String::new(),
+            collapse_parents: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(distributed.matched, 2);
+    assert_eq!(distributed.total, 2);
+    assert_eq!(distributed.results[0].hits.len(), 1);
+    let hit = &distributed.results[0].hits[0];
+    assert_eq!(hit.id, "op-0");
+    assert_eq!(hit.chunk_id, "c1");
+    assert_eq!(hit.label, hash_chunk_label("op-0", "c1"));
+    assert_eq!(hit.parent_label, hash_string_id("op-0"));
+    assert_eq!(hit.parent_chunks, 2);
+    assert_eq!(hit.collapsed, 1);
+    assert_eq!(collection_hits_of(&distributed, 0), hits_of(&monolithic, 0));
+    assert_eq!(monolithic.results[0].hits[0].parent_chunks, 2);
+}
+
+#[tokio::test]
+async fn collapsed_collection_search_equals_the_monolith_when_one_parent_has_many_chunks() {
+    let descriptor_set = compile(CHUNKED);
+    let shard_addresses = [start_node().await, start_node().await];
+    let shard_a = bind_schema(&shard_addresses[0], &descriptor_set, "test.v1.Opinion").await;
+    let shard_b = bind_schema(&shard_addresses[1], &descriptor_set, "test.v1.Opinion").await;
+    add_documents(
+        &shard_addresses[0],
+        &shard_a,
+        vec![chunked_opinion_chunks(&descriptor_set, 0, &[0, 1, 2])],
+    )
+    .await;
+    add_documents(
+        &shard_addresses[1],
+        &shard_b,
+        vec![chunked_opinion_chunks(&descriptor_set, 2, &[0])],
+    )
+    .await;
+
+    let monolith_address = start_node().await;
+    let monolith = bind_schema(&monolith_address, &descriptor_set, "test.v1.Opinion").await;
+    add_documents(
+        &monolith_address,
+        &monolith,
+        vec![
+            chunked_opinion_chunks(&descriptor_set, 0, &[0, 1, 2]),
+            chunked_opinion_chunks(&descriptor_set, 2, &[0]),
+        ],
+    )
+    .await;
+    let mut monolith_client = DocumentsClient::new(connect(&monolith_address).await);
+
+    let mut coordinator = start_coordinator(vec![
+        ShardConfig::with_index(shard_addresses[0].clone(), shard_a.clone()),
+        ShardConfig::with_index(shard_addresses[1].clone(), shard_b.clone()),
+    ])
+    .await;
+
+    let queries: Vec<f32> = (0..8).map(|i| if i < 3 { 1.0 } else { 0.05 }).collect();
+    let uncollapsed = coordinator
+        .search_documents(CollectionSearchDocumentsRequest {
+            queries: queries.clone(),
+            k: 2,
+            filter: String::new(),
+            collapse_parents: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(uncollapsed.results[0].hits.len(), 2);
+    assert!(
+        uncollapsed.results[0]
+            .hits
+            .iter()
+            .all(|hit| hit.id == "op-0"),
+        "uncollapsed collection top-2 is crowded by one parent"
+    );
+
+    let distributed = coordinator
+        .search_documents(CollectionSearchDocumentsRequest {
+            queries: queries.clone(),
+            k: 2,
+            filter: String::new(),
+            collapse_parents: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let monolithic = monolith_client
+        .search_documents(SearchDocumentsRequest {
+            index_id: monolith,
+            queries,
+            k: 2,
+            filter: String::new(),
+            collapse_parents: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(distributed.matched, 4);
+    let ids: Vec<&str> = distributed.results[0]
+        .hits
+        .iter()
+        .map(|hit| hit.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["op-0", "op-2"]);
+    assert_eq!(distributed.results[0].hits[0].parent_chunks, 3);
+    assert_eq!(distributed.results[0].hits[1].parent_chunks, 1);
+    assert_eq!(collection_hits_of(&distributed, 0), hits_of(&monolithic, 0));
 }

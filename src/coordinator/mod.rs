@@ -36,17 +36,19 @@
 pub mod nodes;
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 use turbovec::TurboQuantIndex;
 
+use crate::collapse;
 use crate::errors::{
     self, AMBIGUOUS_INDEX, BIT_WIDTH_MISMATCH, DIMENSION_MISMATCH, EMPTY_COLLECTION,
     MIXED_CALIBRATION, MIXED_SCHEMA, NODE_UNREACHABLE, POSITIONAL_INDEX_REQUIRED,
@@ -60,13 +62,13 @@ use crate::proto::turbo_vec_query_client::TurboVecQueryClient;
 use crate::proto::{
     Calibration, CollectionQueryResult, CollectionSearchDocumentsRequest,
     CollectionSearchDocumentsResponse, CollectionSearchRequest, CollectionSearchResponse,
-    DocumentQueryResult, ExportRowsRequest, FitCalibrationRequest, FitCalibrationResponse,
-    FlushRequest, GetCalibrationRequest, GetIndexInfoRequest, GetSchemaRequest, ImportRowsRequest,
-    ImportRowsResponse, ImportRowsStart, IndexInfo, IndexSchema, JoinRequest, JoinResponse,
-    ListIndexesRequest, ListNodesRequest, ListNodesResponse, Neighbour, RegisterNodeRequest,
-    RegisterNodeResponse, RowBlock, SearchDocumentsRequest, SetCalibrationRequest, ShardRef,
-    ShardStatus, SpareNodeStatus, SplitRequest, SplitResponse, StartStreamSearch,
-    StreamSearchRequest, StreamSearchResponse,
+    DocumentHit, DocumentQueryResult, ExportRowsRequest, FieldRole, FitCalibrationRequest,
+    FitCalibrationResponse, FlushRequest, GetCalibrationRequest, GetIndexInfoRequest,
+    GetParentsRequest, GetSchemaRequest, ImportRowsRequest, ImportRowsResponse, ImportRowsStart,
+    IndexInfo, IndexSchema, JoinRequest, JoinResponse, ListIndexesRequest, ListNodesRequest,
+    ListNodesResponse, Neighbour, RegisterNodeRequest, RegisterNodeResponse, RowBlock,
+    SearchDocumentsRequest, SetCalibrationRequest, ShardRef, ShardStatus, SpareNodeStatus,
+    SplitRequest, SplitResponse, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
 };
 use crate::service::calibration_difference;
 
@@ -1155,6 +1157,34 @@ fn bind(generation: u64, shards: Vec<Probe>) -> Result<Pinned, Status> {
 /// node did not answer" would turn a diagnosis into a symptom. Anything else,
 /// including a node that genuinely did not answer, becomes `node_unreachable`
 /// carrying the node's own code and wording.
+/// A shard's INVALID_ARGUMENT on SearchDocuments or GetParents is a
+/// diagnosis of this request, not a node that failed to answer. Every
+/// shard holds one schema, so they would all say the same thing; it
+/// travels back as what it is.
+fn documents_shard_error(address: &str, status: Status) -> Status {
+    match status.code() {
+        tonic::Code::InvalidArgument => {
+            Status::invalid_argument(format!("{} (shard {address})", status.message()))
+        }
+        _ => node_error(address, &status),
+    }
+}
+
+fn schema_is_chunked(schema: &IndexSchema) -> bool {
+    schema
+        .fields
+        .iter()
+        .any(|field| field.role == FieldRole::Chunks as i32)
+}
+
+fn attach_parent_chunks(hits: &mut [DocumentHit], membership: &HashMap<u64, BTreeSet<u64>>) {
+    for hit in hits {
+        if let Some(chunks) = membership.get(&hit.parent_label) {
+            hit.parent_chunks = chunks.len() as u32;
+        }
+    }
+}
+
 fn node_error(address: &str, status: &Status) -> Status {
     if errors::is_named(status.message()) {
         return Status::new(
@@ -1483,84 +1513,133 @@ impl Coordinator for CoordinatorService {
         }
 
         // Every shard evaluates the filter over its own stored fields and
-        // returns the exact top-k of the documents it admits. The union of
-        // the per-shard admitted sets is the collection's admitted set, and
-        // each shard's list already contains every admitted document that
-        // could place globally, so the merge below is the collection's
-        // exact top-k. The whole query batch goes to every shard in one
-        // call: unlike the streaming Search path there is no floor to feed
-        // back, so there is nothing to gain from splitting it.
-        let mut tasks = Vec::with_capacity(pinned.shards.len());
-        for shard in &pinned.shards {
+        // returns the exact top-k of the documents it admits (or, under
+        // collapse_parents, the exact local top-k parents). The union of
+        // the per-shard admitted sets is the collection's admitted set.
+        // On a chunked collection a second stream overlaps that search:
+        // as the first shard's hits arrive, GetParents for those parent
+        // labels goes to every shard so membership is a union and a
+        // parent need not live on the same shard as the chunk that hit.
+        // The RPC does not complete until both streams finish.
+        let chunked = pinned.schema.as_ref().is_some_and(schema_is_chunked);
+        enum ShardWork {
+            Search {
+                rank: usize,
+                result: Result<Response<crate::proto::SearchDocumentsResponse>, Status>,
+            },
+            Parents {
+                address: String,
+                result: Result<Response<crate::proto::GetParentsResponse>, Status>,
+            },
+        }
+        let mut work = JoinSet::new();
+        for (rank, shard) in pinned.shards.iter().enumerate() {
             let mut client = self.documents_client(&shard.address)?;
             let mut shard_request = Request::new(SearchDocumentsRequest {
                 index_id: shard.index_id.clone(),
                 queries: req.queries.clone(),
                 k: req.k,
                 filter: req.filter.clone(),
+                collapse_parents: req.collapse_parents,
             });
             shard_request.set_timeout(self.limits.query_timeout);
-            tasks.push(tokio::spawn(async move {
-                client.search_documents(shard_request).await
-            }));
+            work.spawn(async move {
+                ShardWork::Search {
+                    rank,
+                    result: client.search_documents(shard_request).await,
+                }
+            });
         }
-        let mut shard_responses = Vec::with_capacity(pinned.shards.len());
-        for (task, shard) in tasks.into_iter().zip(&pinned.shards) {
-            let response = task
-                .await
-                .map_err(|e| Status::internal(format!("shard search task failed: {e}")))?
-                .map_err(|status| match status.code() {
-                    // A shard's INVALID_ARGUMENT is a diagnosis of this
-                    // request — the filter does not parse, references an
-                    // unplanned field, or met a value it cannot handle — and
-                    // every shard would say the same thing, because they all
-                    // hold one schema. It travels back as what it is rather
-                    // than being rewrapped as the node not answering.
-                    tonic::Code::InvalidArgument => Status::invalid_argument(format!(
-                        "{} (shard {})",
-                        status.message(),
-                        shard.address
-                    )),
-                    _ => node_error(&shard.address, &status),
-                })?
-                .into_inner();
-            if response.results.len() != nq {
-                return Err(Status::internal(format!(
-                    "shard {} returned {} results for {nq} queries",
-                    shard.address,
-                    response.results.len()
-                )));
+
+        let mut shard_responses: Vec<Option<crate::proto::SearchDocumentsResponse>> =
+            vec![None; pinned.shards.len()];
+        let mut fetched: HashSet<u64> = HashSet::new();
+        let mut parent_chunks: HashMap<u64, BTreeSet<u64>> = HashMap::new();
+        while let Some(joined) = work.join_next().await {
+            match joined.map_err(|e| Status::internal(format!("shard task failed: {e}")))? {
+                ShardWork::Search { rank, result } => {
+                    let address = &pinned.shards[rank].address;
+                    let response = result
+                        .map_err(|status| documents_shard_error(address, status))?
+                        .into_inner();
+                    if response.results.len() != nq {
+                        return Err(Status::internal(format!(
+                            "shard {address} returned {} results for {nq} queries",
+                            response.results.len()
+                        )));
+                    }
+                    if chunked {
+                        let mut new_labels = Vec::new();
+                        for result in &response.results {
+                            for hit in &result.hits {
+                                if fetched.insert(hit.parent_label) {
+                                    new_labels.push(hit.parent_label);
+                                }
+                            }
+                        }
+                        if !new_labels.is_empty() {
+                            for shard in &pinned.shards {
+                                let mut client = self.documents_client(&shard.address)?;
+                                let mut parent_request = Request::new(GetParentsRequest {
+                                    index_id: shard.index_id.clone(),
+                                    parent_labels: new_labels.clone(),
+                                });
+                                parent_request.set_timeout(self.limits.query_timeout);
+                                let address = shard.address.clone();
+                                work.spawn(async move {
+                                    ShardWork::Parents {
+                                        address,
+                                        result: client.get_parents(parent_request).await,
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    shard_responses[rank] = Some(response);
+                }
+                ShardWork::Parents { address, result } => {
+                    let response = result
+                        .map_err(|status| documents_shard_error(&address, status))?
+                        .into_inner();
+                    for parent in response.parents {
+                        parent_chunks
+                            .entry(parent.parent_label)
+                            .or_default()
+                            .extend(parent.chunk_labels);
+                    }
+                }
             }
-            shard_responses.push(response);
         }
+        let shard_responses: Vec<crate::proto::SearchDocumentsResponse> = shard_responses
+            .into_iter()
+            .enumerate()
+            .map(|(rank, response)| {
+                response.ok_or_else(|| {
+                    Status::internal(format!(
+                        "shard {} produced no SearchDocuments response",
+                        pinned.shards[rank].address
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         let mut results = Vec::with_capacity(nq);
         for qi in 0..nq {
-            // (shard rank, rank within the shard's list, hit): score decides,
-            // then shard order, then the shard's own order — the same
-            // deterministic-but-meaningless tie rule the streaming merge uses.
-            let mut merged = Vec::new();
+            let mut ranked = Vec::new();
             for (shard_rank, response) in shard_responses.iter().enumerate() {
-                for (hit_rank, hit) in response.results[qi].hits.iter().enumerate() {
+                for hit in &response.results[qi].hits {
                     if hit.score.is_nan() {
                         return Err(Status::internal(format!(
                             "shard {} returned a NaN score",
                             pinned.shards[shard_rank].address
                         )));
                     }
-                    merged.push((shard_rank, hit_rank, hit.clone()));
+                    ranked.push((shard_rank, hit.clone()));
                 }
             }
-            merged.sort_by(|a, b| {
-                b.2.score
-                    .total_cmp(&a.2.score)
-                    .then_with(|| a.0.cmp(&b.0))
-                    .then_with(|| a.1.cmp(&b.1))
-            });
-            merged.truncate(k);
-            results.push(DocumentQueryResult {
-                hits: merged.into_iter().map(|(_, _, hit)| hit).collect(),
-            });
+            let mut hits = collapse::merge_hits(ranked, k, req.collapse_parents);
+            attach_parent_chunks(&mut hits, &parent_chunks);
+            results.push(DocumentQueryResult { hits });
         }
         let matched = shard_responses.iter().map(|r| r.matched).sum();
         let total = shard_responses.iter().map(|r| r.total).sum();

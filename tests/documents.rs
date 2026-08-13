@@ -14,8 +14,8 @@ use turbovec_grpc::proto::documents_client::DocumentsClient;
 use turbovec_grpc::proto::turbo_vec_client::TurboVecClient;
 use turbovec_grpc::proto::{
     AddDocumentsRequest, AddRequest, BindSchemaRequest, FieldKind, FieldRole, FlushRequest,
-    GetSchemaRequest, PlanSchemaRequest, RemoveRequest, SchemaSource, SearchDocumentsRequest,
-    SearchRequest,
+    GetParentsRequest, GetSchemaRequest, PlanSchemaRequest, RemoveRequest, SchemaSource,
+    SearchDocumentsRequest, SearchRequest,
 };
 use turbovec_grpc::schema::{hash_chunk_label, hash_string_id, BoundSchema};
 use turbovec_grpc::{DocumentsService, IndexStore, ServiceLimits, TurboVecService};
@@ -653,6 +653,7 @@ async fn filtered_search_is_the_exact_top_k_of_the_admitted_set() {
             queries: query.clone(),
             k: 1,
             filter: String::new(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -671,6 +672,7 @@ async fn filtered_search_is_the_exact_top_k_of_the_admitted_set() {
             queries: query.clone(),
             k: 4,
             filter: "price_cents <= 2000".to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -692,6 +694,7 @@ async fn filtered_search_is_the_exact_top_k_of_the_admitted_set() {
             queries: query.clone(),
             k: 4,
             filter: r#"meta.author == "rin" && id != "doc-1""#.to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -707,6 +710,7 @@ async fn filtered_search_is_the_exact_top_k_of_the_admitted_set() {
             queries: query.clone(),
             k: 1,
             filter: "no_such_field == 1".to_string(),
+            collapse_parents: false,
         })
         .await
         .expect_err("unknown fields fail the request");
@@ -727,6 +731,7 @@ async fn filtered_search_is_the_exact_top_k_of_the_admitted_set() {
             queries: query.clone(),
             k: 4,
             filter: r#"meta.author == "rin" && id != "doc-1""#.to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -868,13 +873,19 @@ message Chunk {
 "#;
 
 fn chunked_opinion(descriptor_set: &[u8], doc: usize, n_chunks: usize) -> Vec<u8> {
+    chunked_opinion_chunks(descriptor_set, doc, &(0..n_chunks).collect::<Vec<_>>())
+}
+
+fn chunked_opinion_chunks(descriptor_set: &[u8], doc: usize, chunk_ids: &[usize]) -> Vec<u8> {
+    let chunk_ids = chunk_ids.to_vec();
     document(descriptor_set, "test.v1.Opinion", move |m| {
         let pool = m.descriptor().parent_pool().clone();
         m.set_field_by_name("id", Value::String(format!("op-{doc}")));
         m.set_field_by_name("title", Value::String(format!("opinion {doc}")));
         let chunk_desc = pool.get_message_by_name("test.v1.Chunk").unwrap();
-        let chunks: Vec<Value> = (0..n_chunks)
-            .map(|c| {
+        let chunks: Vec<Value> = chunk_ids
+            .iter()
+            .map(|&c| {
                 let mut chunk = DynamicMessage::new(chunk_desc.clone());
                 chunk.set_field_by_name("chunk_id", Value::String(format!("c{c}")));
                 chunk.set_field_by_name("body", Value::String(format!("body-{doc}-{c}")));
@@ -989,6 +1000,7 @@ async fn chunked_documents_search_filter_and_survive_restart() {
             queries: query.clone(),
             k: 4,
             filter: String::new(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -998,6 +1010,9 @@ async fn chunked_documents_search_filter_and_survive_restart() {
     assert_eq!(top.id, "op-0");
     assert_eq!(top.chunk_id, "c1");
     assert_eq!(top.label, hash_chunk_label("op-0", "c1"));
+    assert_eq!(top.parent_label, hash_string_id("op-0"));
+    assert_eq!(top.parent_chunks, 2);
+    assert_eq!(top.collapsed, 0);
 
     let filtered = documents
         .search_documents(SearchDocumentsRequest {
@@ -1005,6 +1020,7 @@ async fn chunked_documents_search_filter_and_survive_restart() {
             queries: query.clone(),
             k: 4,
             filter: r#"title == "opinion 1" && chunks.ordinal == 0"#.to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -1031,6 +1047,7 @@ async fn chunked_documents_search_filter_and_survive_restart() {
             queries: query.clone(),
             k: 4,
             filter: r#"id == "op-0""#.to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
@@ -1054,12 +1071,198 @@ async fn chunked_documents_search_filter_and_survive_restart() {
             queries: query,
             k: 4,
             filter: r#"id == "op-0""#.to_string(),
+            collapse_parents: false,
         })
         .await
         .unwrap()
         .into_inner();
     assert_eq!(restored.matched, 1);
     assert_eq!(restored.results[0].hits[0].chunk_id, "c1");
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn collapse_parents_keeps_weaker_parents_when_one_parent_has_many_chunks() {
+    let root = std::env::temp_dir().join(format!("turbovec-collapse-{}", uuid::Uuid::new_v4()));
+    let (mut documents, _) = start(&root).await;
+    let descriptor_set = compile(CHUNKED);
+    let index_id = documents
+        .bind_schema(BindSchemaRequest {
+            source: Some(SchemaSource {
+                descriptor_set: descriptor_set.clone(),
+                message_type: "test.v1.Opinion".to_string(),
+            }),
+            bit_width: 4,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .index_id;
+
+    // op-0 has three chunks peaking at dims 0, 1, 2. op-2 has one chunk
+    // peaking at dim 4. A query aligned with 0..2 makes every op-0 chunk
+    // beat op-2, so an uncollapsed top-2 is two siblings of op-0.
+    documents
+        .add_documents(tokio_stream::iter(vec![AddDocumentsRequest {
+            index_id: index_id.clone(),
+            documents: vec![
+                chunked_opinion(&descriptor_set, 0, 3),
+                chunked_opinion(&descriptor_set, 2, 1),
+            ],
+        }]))
+        .await
+        .unwrap();
+
+    let query: Vec<f32> = (0..8).map(|i| if i < 3 { 1.0 } else { 0.05 }).collect();
+    let uncollapsed = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 2,
+            filter: String::new(),
+            collapse_parents: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(uncollapsed.matched, 4);
+    assert_eq!(uncollapsed.total, 4);
+    assert_eq!(uncollapsed.results[0].hits.len(), 2);
+    assert!(
+        uncollapsed.results[0]
+            .hits
+            .iter()
+            .all(|hit| hit.id == "op-0"),
+        "uncollapsed top-2 is crowded by one parent: {:?}",
+        uncollapsed.results[0]
+            .hits
+            .iter()
+            .map(|h| (&h.id, &h.chunk_id))
+            .collect::<Vec<_>>()
+    );
+
+    let collapsed = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query.clone(),
+            k: 2,
+            filter: String::new(),
+            collapse_parents: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(collapsed.matched, 4);
+    assert_eq!(collapsed.total, 4);
+    let ids: Vec<&str> = collapsed.results[0]
+        .hits
+        .iter()
+        .map(|hit| hit.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["op-0", "op-2"]);
+    assert_eq!(collapsed.results[0].hits[0].collapsed, 2);
+    assert_eq!(collapsed.results[0].hits[0].parent_chunks, 3);
+    assert_eq!(collapsed.results[0].hits[1].collapsed, 0);
+    assert_eq!(collapsed.results[0].hits[1].parent_chunks, 1);
+    assert_eq!(
+        collapsed.results[0].hits[0].parent_label,
+        hash_string_id("op-0")
+    );
+
+    let filtered = documents
+        .search_documents(SearchDocumentsRequest {
+            index_id: index_id.clone(),
+            queries: query,
+            k: 1,
+            filter: r#"title == "opinion 0""#.to_string(),
+            collapse_parents: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(filtered.matched, 3);
+    assert_eq!(filtered.results[0].hits.len(), 1);
+    assert_eq!(filtered.results[0].hits[0].id, "op-0");
+    assert_eq!(filtered.results[0].hits[0].collapsed, 2);
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn get_parents_resolves_membership_and_omits_unknown() {
+    let root = std::env::temp_dir().join(format!("turbovec-parents-rpc-{}", uuid::Uuid::new_v4()));
+    let (mut documents, _) = start(&root).await;
+    let descriptor_set = compile(CHUNKED);
+    let index_id = documents
+        .bind_schema(BindSchemaRequest {
+            source: Some(SchemaSource {
+                descriptor_set: descriptor_set.clone(),
+                message_type: "test.v1.Opinion".to_string(),
+            }),
+            bit_width: 4,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .index_id;
+    documents
+        .add_documents(tokio_stream::iter(vec![AddDocumentsRequest {
+            index_id: index_id.clone(),
+            documents: vec![
+                chunked_opinion(&descriptor_set, 0, 2),
+                chunked_opinion(&descriptor_set, 1, 1),
+            ],
+        }]))
+        .await
+        .unwrap();
+
+    let parent_0 = hash_string_id("op-0");
+    let parent_1 = hash_string_id("op-1");
+    let resolved = documents
+        .get_parents(GetParentsRequest {
+            index_id: index_id.clone(),
+            parent_labels: vec![parent_0, 0xdead_beef, parent_1],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resolved.parents.len(), 2);
+    assert_eq!(resolved.parents[0].parent_label, parent_0);
+    assert_eq!(resolved.parents[0].id, "op-0");
+    let mut expected = vec![
+        hash_chunk_label("op-0", "c0"),
+        hash_chunk_label("op-0", "c1"),
+    ];
+    expected.sort_unstable();
+    assert_eq!(resolved.parents[0].chunk_labels, expected);
+    assert_eq!(resolved.parents[1].id, "op-1");
+    assert_eq!(
+        resolved.parents[1].chunk_labels,
+        vec![hash_chunk_label("op-1", "c0")]
+    );
+
+    let flat_id = documents
+        .bind_schema(BindSchemaRequest {
+            source: Some(SchemaSource {
+                descriptor_set: compile(ANNOTATED),
+                message_type: "test.v1.Product".to_string(),
+            }),
+            bit_width: 4,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .index_id;
+    let empty = documents
+        .get_parents(GetParentsRequest {
+            index_id: flat_id,
+            parent_labels: vec![parent_0],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(empty.parents.is_empty());
 
     std::fs::remove_dir_all(&root).unwrap();
 }

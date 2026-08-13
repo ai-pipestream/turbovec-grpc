@@ -135,9 +135,13 @@ explodes each wire message into N chunk rows (unique labels from the
 documented `parent_id‖chunk_id` hash) plus one parent record. Parent
 scalars are denormalized onto every chunk row so CEL filters see
 `title == "…" && chunks.ordinal == 0` without a join at query time.
-`SearchDocuments` hits report `id` (parent) and `chunk_id`. Chunks need
-not share a shard with their parent later; this cut is node-local only.
-`parents.pb` persists the parent table beside `documents.pb`.
+`SearchDocuments` hits report `id` (parent), `chunk_id`, and `parent_label`.
+`GetParents` resolves parent labels to the live chunk-row labels this node
+holds; unknown labels are omitted so a coordinator can fan the same set to
+every shard. `collapse_parents` ranks every admitted chunk and returns the
+first `k` distinct parents in score order — `k` is then top-k parents, not
+top-k chunks. `matched`/`total` stay in chunk rows. `parents.pb` persists
+the parent table beside `documents.pb`.
 
 ### Sharded document collections
 
@@ -147,6 +151,15 @@ shard, where each one evaluates the filter over its own stored fields and
 returns the exact top-k of the documents it admits; merging those lists by
 score is the exact collection top-k, because the union of per-shard admitted
 sets is the collection's admitted set. `matched`/`total` sum across shards.
+
+On a chunked collection a second stream overlaps that search: as the first
+shard's hits arrive, the coordinator fans `GetParents` for those parent
+labels to every shard and unions membership, so a chunk need not share a
+shard with its parent. `collapse_parents` asks each shard for its local
+top-k parents (every admitted chunk is ranked before collapse); the
+coordinator then re-collapses by parent, keeping the max score. That is the
+collection's exact top-k parents. The RPC does not return until every shard
+search and every parent lookup has finished.
 
 A filter can only mean one thing when every shard agrees what a document is,
 so schema agreement is part of collection binding: every shard must carry

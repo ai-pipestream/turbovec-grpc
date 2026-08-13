@@ -64,6 +64,16 @@ service Coordinator {
   // is the collection's admitted set, so merging the per-shard top-k by
   // score is the exact collection top-k, not an approximation of it.
   //
+  // On a chunked collection the coordinator overlaps a second stream:
+  // as the first shard's hits arrive it fans GetParents for those
+  // parent labels to every shard, so membership is a union and chunks
+  // need not share a shard with their parent. collapse_parents asks
+  // each shard for its local top-k parents (every admitted chunk is
+  // ranked before collapse); the coordinator then re-collapses by
+  // parent, keeping the max score, which is the collection's exact
+  // top-k parents. The RPC does not return until every shard search
+  // and every parent lookup has finished.
+  //
   // Fails, by name, if any shard is unreachable, if the shards do not
   // share one schema fingerprint or one calibration pair, or if the
   // filter does not parse, references an unplanned field, or does not
@@ -274,7 +284,8 @@ message CollectionSearchDocumentsRequest {
   repeated float queries = 1;
 
   // Number of neighbours to return per query, across the collection. The
-  // effective count is min(k, documents the filter admits).
+  // effective count is min(k, documents the filter admits). When
+  // collapse_parents is set, k is the number of parents.
   uint32 k = 2;
 
   // Boolean CEL expression over the planned fields, or empty for no
@@ -283,6 +294,10 @@ message CollectionSearchDocumentsRequest {
   // "kagome"`. Identical semantics on every shard, because every shard
   // holds the same schema fingerprint.
   string filter = 3;
+
+  // When true, return at most one hit per parent across the
+  // collection — the best-scoring admitted chunk of that parent.
+  bool collapse_parents = 4;
 }
 
 // CollectionSearchDocumentsResponse returns one result per query, in

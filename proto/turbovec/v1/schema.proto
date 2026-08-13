@@ -86,7 +86,20 @@ service Documents {
   // not parse, references a field the schema does not plan, or does not
   // evaluate to a boolean fails with INVALID_ARGUMENT naming the
   // problem; it is never silently treated as "match nothing".
+  //
+  // collapse_parents asks for the top-k parents rather than the top-k
+  // chunk rows. The node ranks every admitted chunk, then keeps the
+  // first k distinct parents in score order, so a parent with many
+  // high-scoring chunks cannot crowd other parents out of a local
+  // top-k. matched and total stay in chunk rows either way.
   rpc SearchDocuments(SearchDocumentsRequest) returns (SearchDocumentsResponse);
+
+  // Resolves parent labels to the parent id and the live chunk labels
+  // this node holds for each. Unknown labels are omitted, not an
+  // error, so a coordinator can fan the same set to every shard and
+  // union the membership. A flat index, or a schema-bound index with
+  // no parent table, returns an empty list.
+  rpc GetParents(GetParentsRequest) returns (GetParentsResponse);
 }
 
 // SchemaSource names one message type inside one descriptor set.
@@ -302,13 +315,18 @@ message SearchDocumentsRequest {
   repeated float queries = 2;
 
   // Number of neighbours to return per query. The effective count is
-  // min(k, number of admitted documents).
+  // min(k, number of admitted documents). When collapse_parents is
+  // set, k is the number of parents, not the number of chunk rows.
   uint32 k = 3;
 
   // Boolean CEL expression over the planned fields, or empty for no
   // filter. Nested fields read as they do in the proto:
   // `meta.created_at > timestamp("2020-01-01T00:00:00Z")`.
   string filter = 4;
+
+  // When true, return at most one hit per parent — the best-scoring
+  // admitted chunk of that parent. k is then top-k parents.
+  bool collapse_parents = 5;
 }
 
 // DocumentHit is one returned neighbour.
@@ -330,6 +348,19 @@ message DocumentHit {
   // value, or the chunk's ordinal in decimal when the schema has no
   // CHUNK_ID. Empty for a flat (non-chunked) document.
   string chunk_id = 4;
+
+  // The parent document id's u64 reduction. Equal to `label` for a
+  // flat document; for a chunked document it is the parent id hash,
+  // never the chunk row label.
+  uint64 parent_label = 5;
+
+  // Sibling chunk hits dropped for this parent in this result. Zero
+  // when collapse_parents is unset or the parent had only one hit.
+  uint32 collapsed = 6;
+
+  // Live chunk rows this node (or, after a coordinator join, the
+  // collection) holds for the parent. Zero on a flat document.
+  uint32 parent_chunks = 7;
 }
 
 // DocumentQueryResult is the top-k for a single query, best first.
@@ -344,10 +375,42 @@ message SearchDocumentsResponse {
   repeated DocumentQueryResult results = 1;
 
   // Documents the filter admitted. Equal to `total` when no filter was
-  // set.
+  // set. Chunk rows on a chunked schema, even under collapse_parents.
   uint64 matched = 2;
 
   // Documents the filter was evaluated over: every document in the
-  // index.
+  // index. For a chunked schema this is chunk rows, even when
+  // collapse_parents trimmed the hits to one per parent.
   uint64 total = 3;
+}
+
+// GetParentsRequest names an index and the parent labels to resolve.
+message GetParentsRequest {
+  // Handle of a schema-bound index.
+  string index_id = 1;
+
+  // Parent labels to look up. Unknown labels are omitted from the
+  // response; they are not an error.
+  repeated uint64 parent_labels = 2;
+}
+
+// ResolvedParent is one parent this node holds.
+message ResolvedParent {
+  // The parent document id's u64 reduction.
+  uint64 parent_label = 1;
+
+  // The parent document id field's original value, as SearchDocuments
+  // reports `id`.
+  string id = 2;
+
+  // Live chunk-row labels this node holds for the parent, in
+  // ascending order.
+  repeated uint64 chunk_labels = 3;
+}
+
+// GetParentsResponse is the subset of requested parents this node
+// holds. A flat index returns an empty list.
+message GetParentsResponse {
+  // Resolved parents, in request order among those that were found.
+  repeated ResolvedParent parents = 1;
 }

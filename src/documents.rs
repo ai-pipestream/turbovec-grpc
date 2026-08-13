@@ -11,7 +11,10 @@
 //!
 //! `SearchDocuments` closes the loop: a boolean CEL expression over those
 //! stored fields becomes an exact allowlist for the vector search, so a
-//! filtered top-k is the true top-k of the admitted set.
+//! filtered top-k is the true top-k of the admitted set. Optional parent
+//! collapse ranks every admitted chunk and keeps the first `k` distinct
+//! parents. `GetParents` is the PK lookup the coordinator overlaps with
+//! that search so membership can be unioned across shards.
 //!
 //! Derivation, extraction, and filtering are CPU-bound, so all of it runs
 //! inside `tokio::task::spawn_blocking`, following the rest of this crate.
@@ -24,13 +27,15 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::collapse;
 use crate::columns::StoredRow;
 use crate::filter::CompiledFilter;
 use crate::proto::documents_server::{Documents, DocumentsServer};
 use crate::proto::{
     stored_value, AddDocumentsRequest, AddDocumentsResponse, BindSchemaRequest, BindSchemaResponse,
-    DocumentHit, DocumentQueryResult, GetSchemaRequest, GetSchemaResponse, PlanSchemaRequest,
-    PlanSchemaResponse, SchemaSource, SearchDocumentsRequest, SearchDocumentsResponse, StoredValue,
+    DocumentHit, DocumentQueryResult, GetParentsRequest, GetParentsResponse, GetSchemaRequest,
+    GetSchemaResponse, PlanSchemaRequest, PlanSchemaResponse, ResolvedParent, SchemaSource,
+    SearchDocumentsRequest, SearchDocumentsResponse, StoredValue,
 };
 use crate::schema::BoundSchema;
 use crate::service::ServiceLimits;
@@ -332,6 +337,7 @@ impl Documents for DocumentsService {
                 "index {index_id} has a bound schema but no document columns"
             ))
         })?;
+        let parents = self.store.parents(&index_id);
         let k = req.k as usize;
         self.validate_k(k)?;
         self.validate_frame(req.queries.len())?;
@@ -365,6 +371,14 @@ impl Documents for DocumentsService {
             let columns = columns
                 .read()
                 .map_err(|_| Status::internal("columns lock poisoned"))?;
+            let parents = match &parents {
+                Some(parents) => Some(
+                    parents
+                        .read()
+                        .map_err(|_| Status::internal("parents lock poisoned"))?,
+                ),
+                None => None,
+            };
             let total = columns.len() as u64;
 
             // The filter compiles once and evaluates over every document's
@@ -391,26 +405,45 @@ impl Documents for DocumentsService {
             };
             let matched = allow.as_ref().map_or(total, |a| a.len() as u64);
 
-            let results = if guard.is_empty() || allow.as_ref().is_some_and(Vec::is_empty) {
-                vec![DocumentQueryResult::default(); nq]
+            // Collapse is top-k parents. Ranking only the request k chunks
+            // and collapsing afterwards is not exact: one parent with many
+            // high-scoring chunks can fill that local top-k and hide every
+            // other parent. Rank every admitted chunk, then take the first
+            // k distinct parents. Request k is still what validate_k saw;
+            // the internal width is not a client-facing limit.
+            let search_k = if req.collapse_parents {
+                allow.as_ref().map_or(columns.len(), Vec::len)
             } else {
-                let (scores, labels) = match &allow {
-                    Some(allow) => index
-                        .search_with_allowlist(&req.queries, k, Some(allow.as_slice()))
-                        .map_err(|e| Status::internal(format!("allowlist search: {e}")))?,
-                    None => index.search(&req.queries, k),
-                };
-                let k_eff = scores.len().checked_div(nq).unwrap_or(0);
-                (0..nq)
-                    .map(|qi| {
-                        let lo = qi * k_eff;
-                        let hi = lo + k_eff;
-                        DocumentQueryResult {
-                            hits: scores[lo..hi]
+                k
+            };
+
+            let results =
+                if guard.is_empty() || allow.as_ref().is_some_and(Vec::is_empty) || search_k == 0 {
+                    vec![DocumentQueryResult::default(); nq]
+                } else {
+                    let (scores, labels) = match &allow {
+                        Some(allow) => index
+                            .search_with_allowlist(&req.queries, search_k, Some(allow.as_slice()))
+                            .map_err(|e| Status::internal(format!("allowlist search: {e}")))?,
+                        None => index.search(&req.queries, search_k),
+                    };
+                    let k_eff = scores.len().checked_div(nq).unwrap_or(0);
+                    (0..nq)
+                        .map(|qi| {
+                            let lo = qi * k_eff;
+                            let hi = lo + k_eff;
+                            let mut hits: Vec<DocumentHit> = scores[lo..hi]
                                 .iter()
                                 .zip(&labels[lo..hi])
                                 .map(|(&score, &label)| {
                                     let row = columns.get(label);
+                                    let parent_label =
+                                        row.map(|row| row.parent_label).unwrap_or(label);
+                                    let parent_chunks = parents
+                                        .as_ref()
+                                        .and_then(|store| store.get(parent_label))
+                                        .map(|parent| parent.chunk_labels.len() as u32)
+                                        .unwrap_or(0);
                                     DocumentHit {
                                         score,
                                         label,
@@ -426,18 +459,68 @@ impl Documents for DocumentsService {
                                         chunk_id: row
                                             .map(|row| row.chunk_id.clone())
                                             .unwrap_or_default(),
+                                        parent_label,
+                                        collapsed: 0,
+                                        parent_chunks,
                                     }
                                 })
-                                .collect(),
-                        }
-                    })
-                    .collect()
-            };
+                                .collect();
+                            if req.collapse_parents {
+                                hits = collapse::collapse_parents(hits, k);
+                            }
+                            DocumentQueryResult { hits }
+                        })
+                        .collect()
+                };
             Ok::<_, Status>(SearchDocumentsResponse {
                 results,
                 matched,
                 total,
             })
+        })
+        .await
+        .map_err(join_err)??;
+
+        Ok(Response::new(response))
+    }
+
+    async fn get_parents(
+        &self,
+        request: Request<GetParentsRequest>,
+    ) -> Result<Response<GetParentsResponse>, Status> {
+        let req = request.into_inner();
+        let index_id = req.index_id.clone();
+        if self.store.get(&index_id).is_none() {
+            return Err(Status::not_found(format!("unknown index_id: {index_id}")));
+        }
+        let Some(bound) = self.store.schema(&index_id) else {
+            return Ok(Response::new(GetParentsResponse::default()));
+        };
+        if !bound.is_chunked() {
+            return Ok(Response::new(GetParentsResponse::default()));
+        }
+        let parents = self.store.parents(&index_id).ok_or_else(|| {
+            Status::internal(format!(
+                "index {index_id} is chunked but has no parent store"
+            ))
+        })?;
+
+        let response = tokio::task::spawn_blocking(move || {
+            let parents = parents
+                .read()
+                .map_err(|_| Status::internal("parents lock poisoned"))?;
+            let mut resolved = Vec::new();
+            for parent_label in req.parent_labels {
+                let Some(record) = parents.get(parent_label) else {
+                    continue;
+                };
+                resolved.push(ResolvedParent {
+                    parent_label,
+                    id: id_of(&record.fields, bound.doc_id_ordinal()),
+                    chunk_labels: record.chunk_labels.iter().copied().collect(),
+                });
+            }
+            Ok::<_, Status>(GetParentsResponse { parents: resolved })
         })
         .await
         .map_err(join_err)??;

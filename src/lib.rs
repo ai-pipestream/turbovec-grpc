@@ -52,6 +52,7 @@ pub mod hints {
     tonic::include_proto!("ai.pipestream.proto.index.hints.v1");
 }
 
+pub mod collapse;
 pub mod columns;
 pub mod config;
 pub mod coordinator;
