@@ -4,7 +4,7 @@ Minimal CPU-only distributed vector search over
 [`turbovec`](https://github.com/RyanCodrai/turbovec).
 
 This is a sister project, not code embedded in the upstream engine. It uses the
-`ai-pipestream/turbovec` fork branch `turbovec-pipestream-s14`, whose small
+`ai-pipestream/turbovec` fork branch `turbovec-pipestream-s15`, whose small
 patch exposes live-floor streaming scans and chunk-boundary control. All gRPC,
 persistence, sharding, topology, and failure behavior lives here.
 
@@ -19,10 +19,18 @@ every shard certifies completion. There is no partial-result mode.
 
 ## Scope
 
-This project owns vector search and the protobuf-first schema layer that feeds
-it. It does not own a document store, BM25, text analysis, model serving, or a
-corpus ingestion pipeline. Those concerns stay in separate services or in the
-larger `turbovec-search` project.
+This project is the network and sharding facade for local turbovec semantics.
+It owns vector RPCs, deadlines and cancellation, global heaps and floors,
+completion, replicas, topology, persistence, and encoded-row movement. It does
+not own document schemas, CEL, BM25, text analysis, model serving, facets,
+hybrid ranking, or corpus pipelines. Those are search-product concerns owned by
+`turbovec-search` and ProtoMolt.
+
+The `thin-coordinator` branch currently contains a `Documents` service and its
+schema, scalar-column, CEL, and parent/chunk implementation. That code was
+completed before this boundary was corrected. Preserve it while migrating the
+useful mechanisms, but do not extend it here or treat it as the intended scope
+of the facade.
 
 ## Build and test
 
@@ -35,7 +43,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-The canonical contracts are
+The canonical facade contracts are
 [`turbovec.proto`](proto/turbovec/v1/turbovec.proto) and
 [`coordinator.proto`](proto/turbovec/v1/coordinator.proto). Language examples
 generate directly from the canonical node proto, so there are no per-example
@@ -52,13 +60,13 @@ cargo run --release --locked --bin turbovec-grpc
 For a local disposable demo, set `TURBOVEC_ALLOW_EPHEMERAL=true` instead of a
 data directory.
 
-Node methods are separated into three gRPC services:
+Node methods are currently separated into three gRPC services:
 
 | Service | Methods |
 |---|---|
 | `TurboVecQuery` | metadata, calibration read, `Search`, `SearchStream`, `StreamSearch` |
 | `TurboVecAdmin` | create/delete, retry-safe `Add`, remove, calibration write, `Flush`, streaming row export/import |
-| `Documents` | `PlanSchema`, `BindSchema`, `GetSchema`, streaming `AddDocuments`, CEL-filtered `SearchDocuments` |
+| `Documents` | Transitional product-layer API awaiting migration to `turbovec-search` or a shared product crate |
 
 `Snapshot` and `Load` server-path RPCs do not exist. `Flush` writes an atomic,
 checksummed generation below `TURBOVEC_DATA_DIR`, including stable row labels
@@ -69,7 +77,10 @@ the first `Add` frame. The bounded operation is validated before mutation and
 flushed before success. A retry after a lost response or restart is replayed
 without duplicating rows.
 
-## Protobuf-first documents
+## Transitional protobuf document implementation
+
+This section records behavior that must not be lost during extraction. It does
+not expand the long-term `turbovec-grpc` product boundary.
 
 The `Documents` service indexes the protobuf messages producers already emit,
 with no JSON and no hand-maintained field mapping. The contract is
