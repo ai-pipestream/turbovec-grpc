@@ -12,6 +12,14 @@ This dependency reads and writes only TurboVec v7 indexes. A binary built from
 this branch cannot restore a pre-v7 shard generation; stage and verify a v7
 generation before deploying it over an older durable node.
 
+| Repository | Role | Depends on |
+|---|---|---|
+| [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s16` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) (this repo) | Network and sharding facade over the fork: durable node service plus an exact distributed coordinator | fork branch `turbovec-pipestream-s16` |
+| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s16` |
+| [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
+
 The repository builds two binaries:
 
 - `turbovec-grpc` serves durable handle-addressed shards.
