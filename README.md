@@ -4,9 +4,13 @@ Minimal CPU-only distributed vector search over
 [`turbovec`](https://github.com/RyanCodrai/turbovec).
 
 This is a sister project, not code embedded in the upstream engine. It uses the
-`ai-pipestream/turbovec` fork branch `turbovec-pipestream-s15`, whose small
+`ai-pipestream/turbovec` fork branch `turbovec-pipestream-s16`, whose small
 patch exposes live-floor streaming scans and chunk-boundary control. All gRPC,
 persistence, sharding, topology, and failure behavior lives here.
+
+This dependency reads and writes only TurboVec v7 indexes. A binary built from
+this branch cannot restore a pre-v7 shard generation; stage and verify a v7
+generation before deploying it over an older durable node.
 
 The repository builds two binaries:
 
