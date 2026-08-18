@@ -1,0 +1,416 @@
+// gRPC contract for protobuf-first document indexing.
+//
+// The premise: your data already has a schema, the protobuf schema your
+// producers maintain. This service takes that schema directly — a
+// serialized google.protobuf.FileDescriptorSet plus a message type name —
+// and derives the index shape from it. Documents then travel as the
+// serialized protobuf messages they already are. Nothing on this path is
+// transcoded to JSON or to any other intermediate document model, so
+// there is no mapping layer for field types to drift in.
+//
+// The derived plan is deterministic: the same descriptor set and type
+// name produce the same fields, in the same order, with the same
+// fingerprint, on every node and on every run. Two indexes agree on
+// their schema exactly when their fingerprints agree, the same
+// discipline this workspace applies to analysis fingerprints and chunk
+// recipes.
+//
+// Fields may carry explicit indexing hints as descriptor options, using
+// the ai.pipestream.proto.index.hints.v1 extension (vendored under
+// proto/ai/pipestream/, owned by protomolt). A proto annotated for
+// protomolt's indexers is understood here without modification. Where a
+// field carries no hint, its kind is inferred from the descriptor. An
+// unannotated proto is still indexable when the derivation can resolve a
+// vector field and a document id field without guessing; when it cannot,
+// registration fails and names the hint to add — it never picks one of
+// several candidates silently.
+
+syntax = "proto3";
+
+package turbovec.v1;
+
+import "turbovec/v1/turbovec.proto";
+
+// Documents is the protobuf-first ingestion surface of one node.
+service Documents {
+  // Derives the indexing plan for a message type without creating
+  // anything. This is the dry run an operator or a console uses to see
+  // exactly what an index over this type would look like, including the
+  // fingerprint, before committing to it.
+  //
+  // Fails with the specific reason when the plan cannot support ingest:
+  // no resolvable vector field, no resolvable document id, an ambiguous
+  // candidate set, or a hint that contradicts the field it sits on.
+  rpc PlanSchema(PlanSchemaRequest) returns (PlanSchemaResponse);
+
+  // Creates a new id-mapped index shaped by the derived plan and binds
+  // the schema to it. The index dimensionality comes from the vector
+  // field's declared dims; a schema that does not declare dims produces
+  // a lazy index whose dim is bound by the first document.
+  //
+  // The bound schema is part of the shard from then on: Flush persists
+  // it with the generation, and restart restores it, re-derives the
+  // plan, and refuses to serve if the fingerprint no longer matches —
+  // a derivation drift is an index compatibility event, not a warning.
+  rpc BindSchema(BindSchemaRequest) returns (BindSchemaResponse);
+
+  // Returns the schema bound to one index, in full: the plan, the
+  // fingerprint, and the message type. Fails with NOT_FOUND for an
+  // index that exists but has no bound schema.
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+
+  // Adds documents to a schema-bound index. Client-streaming: each frame
+  // carries a batch of serialized protobuf messages of the bound type.
+  // The node decodes each document against the bound descriptor,
+  // extracts the vector, the document id, and every planned scalar
+  // field per the plan, and indexes them. A document that does not
+  // decode, has no vector, has a vector of the wrong length, or has an
+  // unset id fails the stream by position, and nothing after it in that
+  // stream is applied.
+  rpc AddDocuments(stream AddDocumentsRequest) returns (AddDocumentsResponse);
+
+  // Runs a top-k vector search over a schema-bound index, optionally
+  // restricted by a CEL filter over the planned fields.
+  //
+  // The filter is a boolean CEL expression whose variables are the
+  // document's own proto fields, spelled as they are in the schema:
+  // `price_cents < 5000 && meta.author == "kagome"`. The node evaluates
+  // it against the stored field values of every document and restricts
+  // the vector search to the documents it admits, so the result is the
+  // exact top-k of the admitted set — filtering never trades exactness
+  // for speed on this path.
+  //
+  // Unset proto3 fields evaluate as their proto3 defaults (empty
+  // string, 0, false; an unset Timestamp is the epoch), matching what
+  // the document actually carries on the wire. An expression that does
+  // not parse, references a field the schema does not plan, or does not
+  // evaluate to a boolean fails with INVALID_ARGUMENT naming the
+  // problem; it is never silently treated as "match nothing".
+  //
+  // collapse_parents asks for the top-k parents rather than the top-k
+  // chunk rows. The node ranks every admitted chunk, then keeps the
+  // first k distinct parents in score order, so a parent with many
+  // high-scoring chunks cannot crowd other parents out of a local
+  // top-k. matched and total stay in chunk rows either way.
+  rpc SearchDocuments(SearchDocumentsRequest) returns (SearchDocumentsResponse);
+
+  // Resolves parent labels to the parent id and the live chunk labels
+  // this node holds for each. Unknown labels are omitted, not an
+  // error, so a coordinator can fan the same set to every shard and
+  // union the membership. A flat index, or a schema-bound index with
+  // no parent table, returns an empty list.
+  rpc GetParents(GetParentsRequest) returns (GetParentsResponse);
+}
+
+// SchemaSource names one message type inside one descriptor set.
+message SchemaSource {
+  // A serialized google.protobuf.FileDescriptorSet containing the
+  // message type and every import it needs (protoc --include_imports,
+  // or any registry that stores complete sets). Carried as bytes so the
+  // contract does not depend on the descriptor.proto revision this
+  // service was compiled against.
+  bytes descriptor_set = 1;
+
+  // Fully qualified message type to index, e.g. "shop.v1.Product".
+  // No leading dot.
+  string message_type = 2;
+}
+
+// FieldKind is the resolved index type of one planned field. This is the
+// engine's own vocabulary: every planned field has a definite kind, so
+// there is no unspecified member to interpret. The names align with the
+// ai.pipestream hint vocabulary where the concepts coincide.
+enum FieldKind {
+  // Zero value. Never present in a derived plan.
+  FIELD_KIND_UNSPECIFIED = 0;
+
+  // Full-text analyzed string. Not consumed by the vector engine yet;
+  // recorded for the lexical stage.
+  FIELD_KIND_TEXT = 1;
+
+  // Exact-value string.
+  FIELD_KIND_KEYWORD = 2;
+
+  // 32-bit integer.
+  FIELD_KIND_INT32 = 3;
+
+  // 64-bit integer.
+  FIELD_KIND_INT64 = 4;
+
+  // 32-bit float.
+  FIELD_KIND_FLOAT = 5;
+
+  // 64-bit float.
+  FIELD_KIND_DOUBLE = 6;
+
+  // Boolean.
+  FIELD_KIND_BOOLEAN = 7;
+
+  // Date/time, sourced from google.protobuf.Timestamp.
+  FIELD_KIND_DATE = 8;
+
+  // Opaque bytes.
+  FIELD_KIND_BINARY = 9;
+
+  // The KNN vector the index is built over.
+  FIELD_KIND_VECTOR = 10;
+
+  // A message field kept as a single un-expanded entry. Recorded but not
+  // consumed: turbovec is a flat engine.
+  FIELD_KIND_OBJECT = 11;
+
+  // A repeated message field kept as a single un-expanded entry.
+  // Recorded but not consumed.
+  FIELD_KIND_NESTED = 12;
+}
+
+// FieldRole is the structural role a field plays, beyond its kind.
+enum FieldRole {
+  // A regular field.
+  FIELD_ROLE_NONE = 0;
+
+  // The document's stable identity. Exactly one per schema.
+  FIELD_ROLE_DOC_ID = 1;
+
+  // The repeated message field holding child chunks. At most one per
+  // schema; its children are planned as their own unprefixed fields.
+  FIELD_ROLE_CHUNKS = 2;
+
+  // Per-chunk identity inside the CHUNKS scope.
+  FIELD_ROLE_CHUNK_ID = 3;
+}
+
+// PlannedField is one field of the derived plan.
+message PlannedField {
+  // Dotted path of proto field names from the message root, e.g.
+  // "metadata.created_at". This is how the extractor navigates a
+  // document, and it never changes with naming conventions.
+  string path = 1;
+
+  // Index field name: the underscore-joined qualified name, or the
+  // hint's explicit override.
+  string name = 2;
+
+  // Resolved index kind. Never FIELD_KIND_UNSPECIFIED.
+  FieldKind kind = 3;
+
+  // True for a repeated field (or a CHUNKS-scoped child of one).
+  bool repeated = 4;
+
+  // Structural role, from the hint's block_role.
+  FieldRole role = 5;
+
+  // Declared vector dimensionality for a VECTOR field, 0 when the hint
+  // does not declare one.
+  uint32 vector_dims = 6;
+
+  // Index-time analyzer name for a TEXT field, empty for the default.
+  // Recorded now because analysis identity is an invariant the lexical
+  // stage will enforce; ingest and query must agree on it per field.
+  string analyzer = 7;
+
+  // Query-time analyzer when it differs from the index-time one.
+  string search_analyzer = 8;
+}
+
+// IndexSchema is the complete derived schema for one message type.
+message IndexSchema {
+  // Fully qualified message type the plan was derived from.
+  string message_type = 1;
+
+  // Planned fields, in derivation order. The order is a function of the
+  // descriptor, so it is part of what the fingerprint covers.
+  repeated PlannedField fields = 2;
+
+  // Lowercase hex SHA-256 over the canonical encoding of this plan.
+  // Two schemas are the same schema exactly when these agree.
+  string fingerprint = 3;
+
+  // Path of the field ingest reads the vector from.
+  string vector_path = 4;
+
+  // Path of the field ingest reads the document id from. An integer
+  // field is used verbatim; a string field is reduced to the first 8
+  // bytes of SHA-256 over its UTF-8 bytes, big-endian. The reduction is
+  // part of this contract: any client can compute the same id.
+  string doc_id_path = 5;
+
+  // Vector dimensionality the plan declares, 0 when unknown until the
+  // first document binds it.
+  uint32 dim = 6;
+}
+
+// PlanSchemaRequest asks for a dry-run derivation.
+message PlanSchemaRequest {
+  // The descriptor set and type to derive from.
+  SchemaSource source = 1;
+}
+
+// PlanSchemaResponse returns the plan that BindSchema would bind.
+message PlanSchemaResponse {
+  // The derived schema.
+  IndexSchema schema = 1;
+}
+
+// BindSchemaRequest creates a schema-bound index.
+message BindSchemaRequest {
+  // The descriptor set and type to derive from.
+  SchemaSource source = 1;
+
+  // Quantization bit width for the new index. Must be 2, 3, or 4.
+  uint32 bit_width = 2;
+}
+
+// BindSchemaResponse returns the new index and its bound schema.
+message BindSchemaResponse {
+  // Handle of the created index.
+  string index_id = 1;
+
+  // The bound schema.
+  IndexSchema schema = 2;
+
+  // Metadata of the created index.
+  IndexInfo info = 3;
+}
+
+// GetSchemaRequest names the index whose schema is requested.
+message GetSchemaRequest {
+  // Stable handle returned by BindSchema.
+  string index_id = 1;
+}
+
+// GetSchemaResponse returns the bound schema.
+message GetSchemaResponse {
+  // The bound schema, exactly as BindSchema returned it.
+  IndexSchema schema = 1;
+}
+
+// AddDocumentsRequest is one frame of the client-streaming document
+// upload.
+message AddDocumentsRequest {
+  // Handle of a schema-bound index. Read from the first frame; later
+  // frames must repeat the same id.
+  string index_id = 1;
+
+  // Serialized protobuf messages of the bound type, one per document.
+  repeated bytes documents = 2;
+}
+
+// AddDocumentsResponse reports the result of an AddDocuments stream.
+message AddDocumentsResponse {
+  // Documents added across the whole stream.
+  uint64 added = 1;
+
+  // Total rows in the index after the stream.
+  uint64 len = 2;
+}
+
+// SearchDocumentsRequest carries queries, k, and an optional CEL filter.
+message SearchDocumentsRequest {
+  // Handle of a schema-bound index.
+  string index_id = 1;
+
+  // Row-major query data. Length must be a whole multiple of the index
+  // dim.
+  repeated float queries = 2;
+
+  // Number of neighbours to return per query. The effective count is
+  // min(k, number of admitted documents). When collapse_parents is
+  // set, k is the number of parents, not the number of chunk rows.
+  uint32 k = 3;
+
+  // Boolean CEL expression over the planned fields, or empty for no
+  // filter. Nested fields read as they do in the proto:
+  // `meta.created_at > timestamp("2020-01-01T00:00:00Z")`.
+  string filter = 4;
+
+  // When true, return at most one hit per parent — the best-scoring
+  // admitted chunk of that parent. k is then top-k parents.
+  bool collapse_parents = 5;
+}
+
+// DocumentHit is one returned neighbour.
+message DocumentHit {
+  // Similarity score.
+  float score = 1;
+
+  // The indexed row's u64 label. For a flat document this is the document
+  // id's reduction; for a chunked document it is the chunk row's label
+  // (see the documented parent‖chunk hash), never the parent id alone.
+  uint64 label = 2;
+
+  // The parent document id field's original value: the string itself for
+  // a string id, the integer rendered in decimal for an integer id. This
+  // is the value the client indexed, not the reduction.
+  string id = 3;
+
+  // The chunk id inside a CHUNKS scope: the CHUNK_ID field's original
+  // value, or the chunk's ordinal in decimal when the schema has no
+  // CHUNK_ID. Empty for a flat (non-chunked) document.
+  string chunk_id = 4;
+
+  // The parent document id's u64 reduction. Equal to `label` for a
+  // flat document; for a chunked document it is the parent id hash,
+  // never the chunk row label.
+  uint64 parent_label = 5;
+
+  // Sibling chunk hits dropped for this parent in this result. Zero
+  // when collapse_parents is unset or the parent had only one hit.
+  uint32 collapsed = 6;
+
+  // Live chunk rows this node (or, after a coordinator join, the
+  // collection) holds for the parent. Zero on a flat document.
+  uint32 parent_chunks = 7;
+}
+
+// DocumentQueryResult is the top-k for a single query, best first.
+message DocumentQueryResult {
+  // Returned neighbours, in descending score order.
+  repeated DocumentHit hits = 1;
+}
+
+// SearchDocumentsResponse returns one result per query, in query order.
+message SearchDocumentsResponse {
+  // Results, aligned with the input queries.
+  repeated DocumentQueryResult results = 1;
+
+  // Documents the filter admitted. Equal to `total` when no filter was
+  // set. Chunk rows on a chunked schema, even under collapse_parents.
+  uint64 matched = 2;
+
+  // Documents the filter was evaluated over: every document in the
+  // index. For a chunked schema this is chunk rows, even when
+  // collapse_parents trimmed the hits to one per parent.
+  uint64 total = 3;
+}
+
+// GetParentsRequest names an index and the parent labels to resolve.
+message GetParentsRequest {
+  // Handle of a schema-bound index.
+  string index_id = 1;
+
+  // Parent labels to look up. Unknown labels are omitted from the
+  // response; they are not an error.
+  repeated uint64 parent_labels = 2;
+}
+
+// ResolvedParent is one parent this node holds.
+message ResolvedParent {
+  // The parent document id's u64 reduction.
+  uint64 parent_label = 1;
+
+  // The parent document id field's original value, as SearchDocuments
+  // reports `id`.
+  string id = 2;
+
+  // Live chunk-row labels this node holds for the parent, in
+  // ascending order.
+  repeated uint64 chunk_labels = 3;
+}
+
+// GetParentsResponse is the subset of requested parents this node
+// holds. A flat index returns an empty list.
+message GetParentsResponse {
+  // Resolved parents, in request order among those that were found.
+  repeated ResolvedParent parents = 1;
+}

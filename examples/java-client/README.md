@@ -31,7 +31,7 @@ consequences the demo makes concrete:
 Start the server (from the repo root):
 
 ```bash
-cargo run -p turbovec-grpc
+TURBOVEC_ALLOW_EPHEMERAL=true cargo run --bin turbovec-grpc
 ```
 
 It listens on `0.0.0.0:50051`; override with `TURBOVEC_GRPC_ADDR`.
@@ -69,8 +69,7 @@ so one record silently shadows the other; a typed long or gRPC keeps them apart.
 
 ## Notes
 
-- The Java stubs come from a demo-local copy of the crate proto (`./proto`) with
-  `java_package` / `java_multiple_files` added; the crate proto stays Rust-only.
-- Add frames are kept under the 4 MB gRPC message limit. For very large corpora a
+- The Java stubs come from the repository's canonical proto (`../../proto`).
+- Add frames are kept under the 16 MiB gRPC message limit. For very large corpora a
   production client would add flow control (`ClientCallStreamObserver`); this demo
   keeps the streaming loop simple.

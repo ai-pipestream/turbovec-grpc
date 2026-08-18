@@ -21,7 +21,7 @@ demonstrate, only the absence of one.
 Start the server (from the repo root):
 
 ```bash
-cargo run -p turbovec-grpc
+TURBOVEC_ALLOW_EPHEMERAL=true cargo run --bin turbovec-grpc
 ```
 
 It listens on `0.0.0.0:50051`; override with `TURBOVEC_GRPC_ADDR`.
@@ -85,6 +85,6 @@ real type on both sides of the wire.
 - The demo uses `insecure.NewCredentials()` because this is a local demo
   against a plaintext listener. In production, TLS belongs in front of the
   server.
-- Add frames are kept under the 4 MB gRPC message limit. For very large
+- Add frames are kept under the 16 MiB gRPC message limit. For very large
   corpora a production client would add flow control; this demo keeps the
   streaming loop simple.

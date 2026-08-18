@@ -2,10 +2,28 @@
 //!
 //! Configuration is by environment variable:
 //! - `TURBOVEC_GRPC_ADDR` — listen address (default `0.0.0.0:50051`).
+//! - `TURBOVEC_DATA_DIR` — durable shard-generation root.
+//! - `TURBOVEC_ALLOW_EPHEMERAL` — opt into a non-durable demo node.
+//! - `TURBOVEC_METRICS_ADDR` — optional OpenMetrics HTTP listener.
+//! - `TURBOVEC_COORD_ADDR` — optional coordinator to self-register with. The
+//!   node announces itself on startup and re-announces periodically; the
+//!   coordinator holds it as a spare until an operator assigns it rows.
+//! - `TURBOVEC_ADVERTISE_ADDR` — the address the coordinator should dial
+//!   this node at. Required with `TURBOVEC_COORD_ADDR` when the listen
+//!   address is unspecified (`0.0.0.0`), because "everywhere" is not a name
+//!   another machine can dial.
+//! - `TURBOVEC_REGISTER_INTERVAL_MS` — re-announce period (default 30000).
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use tonic::transport::Server;
-use turbovec_grpc::proto::turbo_vec_server::TurboVecServer;
-use turbovec_grpc::{proto, IndexStore, TurboVecService};
+use turbovec_grpc::proto::coordinator_client::CoordinatorClient;
+use turbovec_grpc::proto::documents_server::DocumentsServer;
+use turbovec_grpc::proto::turbo_vec_admin_server::TurboVecAdminServer;
+use turbovec_grpc::proto::turbo_vec_query_server::TurboVecQueryServer;
+use turbovec_grpc::proto::RegisterNodeRequest;
+use turbovec_grpc::{proto, DocumentsService, IndexStore, Metrics, ServiceLimits, TurboVecService};
 
 /// Default listen address when `TURBOVEC_GRPC_ADDR` is not set.
 const DEFAULT_ADDR: &str = "0.0.0.0:50051";
@@ -13,25 +31,107 @@ const DEFAULT_ADDR: &str = "0.0.0.0:50051";
 /// Frame limit for a single request or response message. Vector batches are
 /// large, so this is generous; clients should still chunk bulk ingest through
 /// the client-streaming `Add` rather than send one enormous frame.
-const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    turbovec_grpc::init_tracing("turbovec-grpc");
     let addr = std::env::var("TURBOVEC_GRPC_ADDR")
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
         .parse()?;
 
-    let service = TurboVecService::new(IndexStore::new())
+    let allow_ephemeral = turbovec_grpc::config::enabled("TURBOVEC_ALLOW_EPHEMERAL")?;
+    let store =
+        Arc::new(match std::env::var_os("TURBOVEC_DATA_DIR") {
+            Some(path) => IndexStore::open(path)?,
+            None if allow_ephemeral => IndexStore::new(),
+            None => return Err(
+                "TURBOVEC_DATA_DIR is required; set TURBOVEC_ALLOW_EPHEMERAL=true only for demos"
+                    .into(),
+            ),
+        });
+    let limits = ServiceLimits::from_env()?;
+    let max_message_bytes = turbovec_grpc::config::positive_usize(
+        "TURBOVEC_MAX_MESSAGE_BYTES",
+        DEFAULT_MAX_MESSAGE_BYTES,
+    )?;
+    let restored = store.handles().len();
+    let persistent = store.data_root().is_some();
+    let metrics = Metrics::default();
+    if let Some(address) = std::env::var_os("TURBOVEC_METRICS_ADDR") {
+        metrics
+            .clone()
+            .start(address.to_string_lossy().parse()?)
+            .await?;
+    }
+    let readiness_service =
+        TurboVecService::with_limits_and_metrics(Arc::clone(&store), limits, metrics);
+    let query_service = readiness_service
+        .clone()
+        .into_query_server()
+        .max_decoding_message_size(max_message_bytes)
+        .max_encoding_message_size(max_message_bytes);
+    let admin_service = readiness_service
+        .clone()
+        .into_admin_server()
+        .max_decoding_message_size(max_message_bytes)
+        .max_encoding_message_size(max_message_bytes);
+    let documents_service = DocumentsService::new(Arc::clone(&store), ServiceLimits::from_env()?)
         .into_server()
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        .max_decoding_message_size(max_message_bytes)
+        .max_encoding_message_size(max_message_bytes);
 
     // Standard gRPC health checking (grpc.health.v1), so orchestrators and
     // load balancers can probe liveness/readiness without calling the API.
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<TurboVecServer<TurboVecService>>()
-        .await;
+    if readiness_service.ready() {
+        health_reporter
+            .set_serving::<TurboVecQueryServer<TurboVecService>>()
+            .await;
+        health_reporter
+            .set_serving::<TurboVecAdminServer<TurboVecService>>()
+            .await;
+        health_reporter
+            .set_serving::<DocumentsServer<DocumentsService>>()
+            .await;
+    } else {
+        health_reporter
+            .set_not_serving::<TurboVecQueryServer<TurboVecService>>()
+            .await;
+        health_reporter
+            .set_not_serving::<TurboVecAdminServer<TurboVecService>>()
+            .await;
+        health_reporter
+            .set_not_serving::<DocumentsServer<DocumentsService>>()
+            .await;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            if readiness_service.ready() {
+                health_reporter
+                    .set_serving::<TurboVecQueryServer<TurboVecService>>()
+                    .await;
+                health_reporter
+                    .set_serving::<TurboVecAdminServer<TurboVecService>>()
+                    .await;
+                health_reporter
+                    .set_serving::<DocumentsServer<DocumentsService>>()
+                    .await;
+            } else {
+                health_reporter
+                    .set_not_serving::<TurboVecQueryServer<TurboVecService>>()
+                    .await;
+                health_reporter
+                    .set_not_serving::<TurboVecAdminServer<TurboVecService>>()
+                    .await;
+                health_reporter
+                    .set_not_serving::<DocumentsServer<DocumentsService>>()
+                    .await;
+            }
+        }
+    });
 
     // Server reflection, so grpcurl and similar tooling work without a local
     // copy of the proto. Register the health descriptors too, or tooling can
@@ -41,33 +141,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
-    eprintln!("turbovec-grpc listening on {addr}");
-    Server::builder()
+    // Self-registration: tell a coordinator this node exists. Best-effort
+    // and repeating, because the node serving rows must not depend on the
+    // coordinator being up first; every failure is logged, and the next
+    // announce supersedes it. Registration never assigns rows by itself.
+    if let Ok(coordinator) = std::env::var("TURBOVEC_COORD_ADDR") {
+        let advertise = advertise_address(&addr)?;
+        let interval_ms =
+            turbovec_grpc::config::positive_usize("TURBOVEC_REGISTER_INTERVAL_MS", 30_000)?;
+        tokio::spawn(self_register(
+            coordinator,
+            advertise,
+            Duration::from_millis(interval_ms as u64),
+        ));
+    }
+
+    tracing::info!(%addr, restored, persistent, "node listening");
+    let serve_result = Server::builder()
         .tcp_nodelay(true)
-        .add_service(service)
+        .trace_fn(|request| tracing::info_span!("grpc", method = %request.uri().path()))
+        .add_service(query_service)
+        .add_service(admin_service)
+        .add_service(documents_service)
         .add_service(health_service)
         .add_service(reflection)
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
-    eprintln!("turbovec-grpc shut down");
+        .serve_with_shutdown(addr, turbovec_grpc::shutdown_signal())
+        .await;
+    if persistent {
+        let flushed = tokio::task::spawn_blocking(move || store.persist_all()).await??;
+        tracing::info!(shards = flushed.len(), "persisted shards on shutdown");
+    }
+    serve_result?;
+    tracing::info!("node shut down");
     Ok(())
 }
 
-/// Resolve when the process receives Ctrl-C or SIGTERM, so in-flight searches
-/// can drain instead of being cut off mid-response.
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = sigterm.recv() => {}
+/// The address this node registers as: `TURBOVEC_ADVERTISE_ADDR` when set,
+/// otherwise the listen address, refused if that is unspecified. A node that
+/// registers `0.0.0.0` would pass its own probe never and a Split later, so
+/// the misconfiguration is a startup error here, where the fix is obvious.
+fn advertise_address(listen: &std::net::SocketAddr) -> Result<String, String> {
+    if let Ok(advertise) = std::env::var("TURBOVEC_ADVERTISE_ADDR") {
+        let advertise = advertise.trim().to_string();
+        if advertise.is_empty() {
+            return Err("TURBOVEC_ADVERTISE_ADDR is set but empty".to_string());
         }
+        return Ok(advertise);
     }
-    #[cfg(not(unix))]
-    {
-        let _ = ctrl_c.await;
+    if listen.ip().is_unspecified() {
+        return Err(format!(
+            "cannot self-register: the listen address {listen} is unspecified, so it is not a \
+             name the coordinator can dial back; set TURBOVEC_ADVERTISE_ADDR to this node's \
+             reachable host:port"
+        ));
+    }
+    Ok(listen.to_string())
+}
+
+/// Announce this node to the coordinator, forever. The first announce runs
+/// immediately; each later one re-asserts the registration, so a coordinator
+/// that restarted with an older spare pool, or one that never saw the node,
+/// converges within one interval.
+async fn self_register(coordinator: String, advertise: String, interval: Duration) {
+    let coordinator = if coordinator.contains("://") {
+        coordinator
+    } else {
+        format!("http://{coordinator}")
+    };
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut registered = false;
+    loop {
+        ticker.tick().await;
+        let outcome = async {
+            let mut client = CoordinatorClient::connect(coordinator.clone()).await?;
+            let response = client
+                .register_node(RegisterNodeRequest {
+                    address: advertise.clone(),
+                })
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>(response.into_inner())
+        }
+        .await;
+        match outcome {
+            Ok(response) => {
+                // First success at each state is worth a line; the steady
+                // re-announce every interval is not.
+                if !registered {
+                    registered = true;
+                    tracing::info!(
+                        coordinator = %coordinator,
+                        advertise = %advertise,
+                        member = response.member,
+                        topology_generation = response.topology_generation,
+                        "registered with coordinator"
+                    );
+                }
+            }
+            Err(e) => {
+                registered = false;
+                tracing::warn!(
+                    coordinator = %coordinator,
+                    advertise = %advertise,
+                    error = %e,
+                    "self-registration failed; retrying"
+                );
+            }
+        }
     }
 }

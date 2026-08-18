@@ -15,7 +15,7 @@ JSON/double client has to watch for.
 Start the server (from the repo root):
 
 ```bash
-cargo run -p turbovec-grpc
+TURBOVEC_ALLOW_EPHEMERAL=true cargo run --bin turbovec-grpc
 ```
 
 It listens on `0.0.0.0:50051`; override with `TURBOVEC_GRPC_ADDR`.
@@ -67,7 +67,7 @@ turbovec-grpc demo — connected to 127.0.0.1:50051
   and off the system interpreter. (If pip is unavailable entirely, `uv venv`
   plus `uv pip install -r requirements.txt` works the same way.)
 - **Generated stubs are build artifacts.** `gen_stubs.sh` runs
-  `grpc_tools.protoc` over the vendored copy of the crate proto (`./proto`)
+  `grpc_tools.protoc` over the repository's canonical proto (`../../proto`)
   and writes `turbovec_pb2.py` / `turbovec_pb2_grpc.py` into `./generated`.
   Both `generated/` and `.venv/` are gitignored; regenerate the stubs whenever
   the proto changes.
@@ -77,6 +77,6 @@ turbovec-grpc demo — connected to 127.0.0.1:50051
   server instead: a remote, shared process that many clients (in any language
   with a gRPC stub) can add to and search concurrently, and that keeps serving
   after any one client exits.
-- Add frames are kept well under the 4 MB gRPC message limit. For very large
+- Add frames are kept well under the 16 MiB gRPC message limit. For very large
   corpora a production client would chunk by byte size and add backpressure;
   this demo keeps the streaming loop a simple generator.

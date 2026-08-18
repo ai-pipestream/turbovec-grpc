@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turbovec-client"
+version = "0.1.0"
+description = "Thin Python client for a turbovec collection served by turbovec-coordinator"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["vector-search", "grpc", "quantization", "nearest-neighbor", "turboquant"]
+
+# grpcio pulls protobuf in, and nothing else is needed: the package is a thin
+# wrapper over the generated stubs, not a framework.
+dependencies = ["grpcio>=1.60"]
+
+[project.urls]
+Repository = "https://github.com/ai-pipestream/turbovec-grpc"
+
+[tool.setuptools]
+# The generated stubs are a build artifact of gen_stubs.sh rather than source,
+# so they are found by directory rather than listed.
+packages = ["turbovec_client"]

@@ -1,0 +1,411 @@
+// gRPC contract for the thin distributed layer over turbovec nodes.
+//
+// One logical collection is a set of shards: a (node address, index
+// handle) pair each, every one of them a positional index calibrated to
+// the same TQ+ pair. A client searches the collection and never names a
+// shard: the coordinator fans the query batch out, merges the per-shard
+// top-k into a global top-k, and returns rows identified by their own
+// external ids. The result is the result a single index over all the same
+// rows would have returned, score for score.
+//
+// That equality is not an approximation and does not depend on how the
+// rows were spread. Under a fixed calibration pair a row's encoded codes
+// are a pure function of the row, so a row scores the same wherever it is
+// stored, and a top-k over the union of the shards is the top-k over the
+// whole. Everything else here exists to keep the precondition true: the
+// coordinator reads every shard's pair back coordinate by coordinate and
+// refuses to serve a collection whose shards disagree, rather than
+// serving a merge that has no meaning.
+//
+// Split and Join move rows between shards under that same invariant. Both
+// move encoded codes, never vectors, so neither one re-encodes and neither
+// one can drift.
+
+syntax = "proto3";
+
+package turbovec.v1;
+
+import "turbovec/v1/schema.proto";
+import "turbovec/v1/turbovec.proto";
+
+// Coordinator serves one logical collection over several turbovec nodes.
+service Coordinator {
+  // Lists the shards the collection is made of, with each one's live
+  // metadata and calibration, so an operator can see the collection the
+  // coordinator would serve. Probes every node on every call: this is the
+  // visibility RPC, so a stale answer would defeat it.
+  //
+  // A node that cannot be reached, or a collection whose shards disagree,
+  // is reported per shard here rather than failing the call, so the
+  // listing is usable precisely when something is wrong. Search refuses.
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  // Runs a top-k search over the whole collection. Complete searches use one
+  // coordinator-owned global heap while nodes stream candidates and accept
+  // monotonically rising inclusive floors. The call returns only after every
+  // node certifies that its scan completed.
+  //
+  // Fails, by name, if any shard is unreachable or incomplete, or if the
+  // shards do not share one calibration pair. A short result set is never
+  // returned as if it were complete.
+  rpc Search(CollectionSearchRequest) returns (CollectionSearchResponse);
+
+  // Runs a top-k search over a schema-bound collection, optionally
+  // restricted by a CEL filter over the planned fields — the collection
+  // form of the node-level Documents.SearchDocuments, with the same
+  // filter language and the same exactness.
+  //
+  // Every shard must hold a bound schema and every schema must carry one
+  // fingerprint; a collection whose shards disagree about what a document
+  // is cannot mean one thing by a filter, and is refused by name rather
+  // than searched. Each shard evaluates the filter against its own stored
+  // field values, producing its own exact allowlist, and returns the true
+  // top-k of its admitted documents; the union of per-shard admitted sets
+  // is the collection's admitted set, so merging the per-shard top-k by
+  // score is the exact collection top-k, not an approximation of it.
+  //
+  // On a chunked collection the coordinator overlaps a second stream:
+  // as the first shard's hits arrive it fans GetParents for those
+  // parent labels to every shard, so membership is a union and chunks
+  // need not share a shard with their parent. collapse_parents asks
+  // each shard for its local top-k parents (every admitted chunk is
+  // ranked before collapse); the coordinator then re-collapses by
+  // parent, keeping the max score, which is the collection's exact
+  // top-k parents. The RPC does not return until every shard search
+  // and every parent lookup has finished.
+  //
+  // Fails, by name, if any shard is unreachable, if the shards do not
+  // share one schema fingerprint or one calibration pair, or if the
+  // filter does not parse, references an unplanned field, or does not
+  // evaluate to a boolean on some document.
+  rpc SearchDocuments(CollectionSearchDocumentsRequest)
+      returns (CollectionSearchDocumentsResponse);
+
+  // Fits one TQ+ calibration from a caller-supplied sample and commits
+  // that same pair to every shard, so the collection encodes into one
+  // coordinate system.
+  //
+  // The fit happens once, in the coordinator, and the fitted pair is
+  // broadcast. Fitting per node from a broadcast sample would also agree
+  // (turbovec's fit is deterministic), but broadcasting the pair itself
+  // makes agreement structural rather than something to re-establish.
+  //
+  // Every shard must be empty: a pair is committed at construction, not
+  // applied to rows already encoded under another one.
+  rpc FitCalibration(FitCalibrationRequest) returns (FitCalibrationResponse);
+
+  // Redistributes one index's rows into several indexes across nodes.
+  //
+  // The rows move as encoded codes under the source's own calibration
+  // pair, so the shards together score exactly as the source did. On
+  // success the collection is rebound to the new shards. The source index
+  // is left alone; drop it when you are satisfied with the result.
+  rpc Split(SplitRequest) returns (SplitResponse);
+
+  // Combines several same-calibration indexes into one, the inverse of
+  // Split. Refuses, by name, on a calibration or dimension mismatch. On
+  // success the collection is rebound to the single resulting shard, and
+  // the sources are left alone.
+  rpc Join(JoinRequest) returns (JoinResponse);
+
+  // Announces a node to the coordinator. A fresh container calls this on
+  // startup (and periodically re-announces) to say "I am reachable at this
+  // address and ready to hold rows".
+  //
+  // Registration never changes the serving topology. A node that is not
+  // already a member joins the persisted spare pool, where it waits until
+  // an operator names it as a Split or Join target. The coordinator dials
+  // the address back before accepting it: an address it cannot reach is
+  // refused now, when the operator can still read the node's logs, rather
+  // than failing a Split later.
+  //
+  // The call is idempotent: re-announcing an address already in the pool,
+  // or one already serving a shard, succeeds and changes nothing.
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+}
+
+// ShardRef names one shard: which node, and which index on it.
+message ShardRef {
+  // Node address, in the form the coordinator dials, e.g.
+  // `http://127.0.0.1:50051`.
+  string address = 1;
+
+  // Index handle on that node. Empty means "the only index this node has
+  // open", which the coordinator resolves at bind time and refuses as
+  // ambiguous if the node holds none or more than one.
+  string index_id = 2;
+}
+
+// ShardStatus is one shard's live state, as the coordinator found it.
+message ShardStatus {
+  // Which shard this describes.
+  ShardRef shard = 1;
+
+  // Metadata read from the node, absent if the node could not be reached.
+  IndexInfo info = 2;
+
+  // Calibration read from the node, absent if the node could not be
+  // reached.
+  Calibration calibration = 3;
+
+  // Empty when the shard is healthy and agrees with the rest of the
+  // collection. Otherwise the named reason it does not, in the same
+  // wording Search would fail with.
+  string error = 4;
+
+  // Fingerprint of the schema bound to the shard's index, empty for a
+  // plain vector shard. SearchDocuments serves the collection only when
+  // every shard carries the same non-empty value here.
+  string schema_fingerprint = 5;
+}
+
+// SpareNodeStatus is one registered-but-unassigned node, as the
+// coordinator found it on this call.
+message SpareNodeStatus {
+  // Node address, as it registered.
+  string address = 1;
+
+  // Number of indexes the node holds open. Usually zero for a fresh
+  // container; a spare holding indexes is not an error, they are simply
+  // not part of this collection.
+  uint64 indexes = 2;
+
+  // Empty when the node answered the probe. Otherwise the reason it did
+  // not, so the pool listing shows a spare that died since it registered.
+  string error = 3;
+}
+
+// ListNodesRequest asks for the collection's shard table.
+message ListNodesRequest {}
+
+// ListNodesResponse returns the shard table and whether it is servable.
+message ListNodesResponse {
+  // One entry per configured shard, in shard order.
+  repeated ShardStatus shards = 1;
+
+  // True when every shard was reachable and they share one calibration
+  // pair, dim and bit width. False means Search will refuse.
+  bool servable = 2;
+
+  // Empty when `servable`, otherwise the named reason Search refuses.
+  string error = 3;
+
+  // Total rows across the collection, when servable.
+  uint64 rows = 4;
+
+  // Atomic topology generation this table belongs to.
+  uint64 topology_generation = 5;
+
+  // Registered nodes not serving any shard, in registration order, each
+  // probed on this call like the shards are. These are the candidate
+  // targets for the next Split or Join.
+  repeated SpareNodeStatus spares = 6;
+}
+
+// RegisterNodeRequest announces one node.
+message RegisterNodeRequest {
+  // The address the coordinator should dial the node at. Must be the
+  // node's reachable address, not its listen address: a node listening on
+  // 0.0.0.0 has to say which of its names the coordinator can use.
+  string address = 1;
+}
+
+// RegisterNodeResponse says what the coordinator now knows the node as.
+message RegisterNodeResponse {
+  // True when the address already serves a shard (primary or replica) of
+  // the collection. Such a node is not added to the spare pool: it is
+  // already placed.
+  bool member = 1;
+
+  // Active topology generation at the time of registration.
+  uint64 topology_generation = 2;
+}
+
+// CollectionSearchRequest is a top-k search over the whole collection.
+message CollectionSearchRequest {
+  // Row-major query data. Length must be a whole multiple of the
+  // collection dim.
+  repeated float queries = 1;
+
+  // Number of neighbours to return per query, across the collection.
+  uint32 k = 2;
+
+  reserved 3;
+}
+
+// Neighbour is one result row, identified without reference to sharding.
+message Neighbour {
+  // Similarity score, bit-for-bit the score a single index over all the
+  // collection's rows would have produced for this row.
+  float score = 1;
+
+  // The row's external id, when its shard carries labels. Absent for a
+  // shard that does not, where `address`, `index_id` and `slot` identify
+  // the row instead.
+  optional uint64 label = 2;
+
+  // Node the row was found on.
+  string address = 3;
+
+  // Index handle on that node.
+  string index_id = 4;
+
+  // Slot within that index. Slots move when rows are redistributed;
+  // labels do not.
+  uint64 slot = 5;
+}
+
+// CollectionQueryResult is the global top-k for a single query, best
+// first.
+message CollectionQueryResult {
+  // Neighbours, ordered by descending score. Rows with equal scores keep
+  // shard order, which makes the ordering deterministic but is not
+  // otherwise meaningful: a tie between two rows has no winner.
+  repeated Neighbour neighbours = 1;
+}
+
+// CollectionSearchResponse returns one result per query, in query order.
+message CollectionSearchResponse {
+  // Results, aligned with the input queries.
+  repeated CollectionQueryResult results = 1;
+
+  reserved 2, 3;
+
+  // Topology generation searched. In-flight requests may finish on the old
+  // generation while an administrative rebind activates the next one.
+  uint64 topology_generation = 4;
+}
+
+// CollectionSearchDocumentsRequest is a filtered top-k search over a
+// schema-bound collection.
+message CollectionSearchDocumentsRequest {
+  // Row-major query data. Length must be a whole multiple of the
+  // collection dim.
+  repeated float queries = 1;
+
+  // Number of neighbours to return per query, across the collection. The
+  // effective count is min(k, documents the filter admits). When
+  // collapse_parents is set, k is the number of parents.
+  uint32 k = 2;
+
+  // Boolean CEL expression over the planned fields, or empty for no
+  // filter. The variables are the document's own proto fields, spelled
+  // as the schema spells them: `price_cents < 5000 && meta.author ==
+  // "kagome"`. Identical semantics on every shard, because every shard
+  // holds the same schema fingerprint.
+  string filter = 3;
+
+  // When true, return at most one hit per parent across the
+  // collection — the best-scoring admitted chunk of that parent.
+  bool collapse_parents = 4;
+}
+
+// CollectionSearchDocumentsResponse returns one result per query, in
+// query order.
+message CollectionSearchDocumentsResponse {
+  // Results, aligned with the input queries. Hits carry the document's
+  // label and original id, exactly as the node-level SearchDocuments
+  // reports them; rows with equal scores keep shard order, then the
+  // shard's own order.
+  repeated DocumentQueryResult results = 1;
+
+  // Documents the filter admitted, summed across shards. Equal to
+  // `total` when no filter was set.
+  uint64 matched = 2;
+
+  // Documents the filter was evaluated over: every document in the
+  // collection.
+  uint64 total = 3;
+
+  // Topology generation searched.
+  uint64 topology_generation = 4;
+}
+
+// FitCalibrationRequest carries the sample to fit the collection's pair
+// from.
+message FitCalibrationRequest {
+  // Row-major sample, `rows * dim` coordinates. Length must be a whole
+  // multiple of `dim`, and the row count must meet turbovec's minimum.
+  //
+  // How well the collection encodes depends on this being a uniform
+  // random draw from the rows it will hold. Nothing here can tell a
+  // random draw from a biased one; see turbovec's `calibrate` for what a
+  // biased sample costs.
+  repeated float sample = 1;
+
+  // Vector dimensionality of the sample rows.
+  uint32 dim = 2;
+
+  // Quantization bit width the collection's indexes were built at. The
+  // fit depends on it, so a pair fitted at one bit width must not be
+  // committed to an index built at another.
+  uint32 bit_width = 3;
+}
+
+// FitCalibrationResponse returns the pair now committed collection-wide.
+message FitCalibrationResponse {
+  // The fitted pair, as read back from the shards.
+  Calibration calibration = 1;
+
+  // Shards the pair was committed to, in shard order.
+  repeated ShardRef shards = 2;
+
+  uint64 topology_generation = 3;
+}
+
+// SplitRequest describes a redistribution of one index's rows.
+message SplitRequest {
+  // The index to split. Left untouched by the operation.
+  ShardRef source = 1;
+
+  // Node addresses to spread the rows across, in order. A node may
+  // appear more than once, which puts several shards on it.
+  repeated string targets = 2;
+
+  // Rows per target, aligned with `targets`. Empty means an even split,
+  // with the remainder going to the earlier targets. When given it must
+  // have one entry per target and sum to exactly the source row count, so
+  // a split can neither drop nor duplicate a row by arithmetic.
+  repeated uint64 row_counts = 3;
+}
+
+// SplitResponse returns the shards the rows now live in.
+message SplitResponse {
+  // The new shards, in target order. These are the collection's shards
+  // from now on.
+  repeated ShardRef shards = 1;
+
+  // Rows per shard, aligned with `shards`.
+  repeated uint64 rows = 2;
+
+  // The calibration pair the rows moved under, unchanged from the source.
+  Calibration calibration = 3;
+
+  uint64 topology_generation = 4;
+}
+
+// JoinRequest describes a consolidation of several indexes into one.
+message JoinRequest {
+  // Indexes to combine, in the order their rows should appear in the
+  // result. Empty means the collection's current shards, in shard order.
+  // All are left untouched.
+  repeated ShardRef sources = 1;
+
+  // Node address to build the combined index on.
+  string target = 2;
+}
+
+// JoinResponse returns the single shard the rows now live in.
+message JoinResponse {
+  // The combined index. This is the collection's only shard from now on.
+  ShardRef shard = 1;
+
+  // Rows in the combined index, the sum of the sources'.
+  uint64 rows = 2;
+
+  // The calibration pair the rows moved under, unchanged from the
+  // sources'.
+  Calibration calibration = 3;
+
+  uint64 topology_generation = 4;
+}

@@ -13,15 +13,33 @@ categories = ["algorithms", "network-programming"]
 name = "turbovec-grpc"
 path = "src/main.rs"
 
+[[bin]]
+name = "turbovec-coordinator"
+path = "src/coordinator_main.rs"
+
 [dependencies]
-turbovec = { git = "https://github.com/RyanCodrai/turbovec", branch = "main" }
+turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s16" }
 tonic = "0.12"
 prost = "0.13"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+prost-reflect = "0.14"
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tonic-health = "0.12"
 tonic-reflection = "0.12"
 uuid = { version = "1", features = ["v4"] }
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+cel = { version = "0.14", features = ["chrono"] }
+prost-types = "0.13"
+chrono = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12"
+
+[dev-dependencies]
+protox = "0.7"
+prost-reflect = "0.14"

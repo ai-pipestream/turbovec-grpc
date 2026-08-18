@@ -24,7 +24,7 @@ const WARMUP_QUERIES = 50;
 
 const PROTO_PATH = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
-  "proto/turbovec/v1/turbovec.proto",
+  "../../proto/turbovec/v1/turbovec.proto",
 );
 
 // longs: String is the load-bearing option. Without it, uint64 fields are
@@ -39,12 +39,14 @@ const definition = protoLoader.loadSync(PROTO_PATH, {
   oneofs: true,
 });
 const proto = grpc.loadPackageDefinition(definition) as any;
-const client = new proto.turbovec.v1.TurboVec(ADDR, grpc.credentials.createInsecure());
+const admin = new proto.turbovec.v1.TurboVecAdmin(ADDR, grpc.credentials.createInsecure());
+const query = new proto.turbovec.v1.TurboVecQuery(ADDR, grpc.credentials.createInsecure());
 
 // grpc-js is callback-based; these thin wrappers keep the demo sequential.
 function unary(method: string, request: object): Promise<any> {
+  const target = ["createIndex", "dropIndex", "remove"].includes(method) ? admin : query;
   return new Promise((resolve, reject) => {
-    client[method](request, (err: Error | null, resp: any) =>
+    target[method](request, (err: Error | null, resp: any) =>
       err ? reject(err) : resolve(resp),
     );
   });
@@ -76,10 +78,10 @@ function percentileMs(sortedNs: bigint[], percentile: number): number {
 const fmt = (n: number) => n.toLocaleString("en-US");
 
 // Client-streaming Add. Vectors are generated frame by frame and never all
-// held in memory at once. Frames stay well under the 4 MB gRPC message limit.
+// held in memory at once. Frames stay well under the 16 MiB gRPC message limit.
 function streamVectors(indexId: string, nVectors: number, dim: number): Promise<number> {
   return new Promise((resolve, reject) => {
-    const call = client.add((err: Error | null, resp: any) =>
+    const call = admin.add((err: Error | null, resp: any) =>
       err ? reject(err) : resolve(Number(resp.added)),
     );
     const perFrame = Math.max(1, Math.floor(3_000_000 / (dim * Float32Array.BYTES_PER_ELEMENT)));
@@ -93,7 +95,15 @@ function streamVectors(indexId: string, nVectors: number, dim: number): Promise<
         for (let d = 0; d < dim; d++) vectors[r * dim + d] = rand() * 2 - 1;
         ids[r] = sent + r;
       }
-      call.write({ index_id: indexId, dim, vectors, ids });
+      call.write({
+        index_id: indexId,
+        dim,
+        vectors,
+        ids,
+        operation_id: sent === 0 ? `ts-example-${indexId}` : "",
+        expected_len: sent === 0 ? "0" : undefined,
+        expected_rows: sent === 0 ? String(nVectors) : "0",
+      });
       sent += rows;
     }
     call.end();
@@ -150,7 +160,7 @@ async function speedDemo(nVectors: number, dim: number, nQueries: number): Promi
   console.log(`\n[3] server-streaming search, batch of 4 queries`);
   const batch: number[] = [];
   for (let q = 0; q < 4; q++) batch.push(...randomVector(rand, dim));
-  const stream = client.searchStream({ index_id: indexId, queries: batch, k: TOP_K });
+  const stream = query.searchStream({ index_id: indexId, queries: batch, k: TOP_K });
   let q = 0;
   for await (const result of stream as AsyncIterable<any>) {
     console.log(`    query ${q} -> ${result.ids.length} neighbours, best score ${result.scores[0].toFixed(4)}`);
@@ -171,7 +181,7 @@ async function idFidelityDemo(dim: number): Promise<void> {
   const bigId = "9007199254740993"; // 2^53 + 1, sent as a string
   const rand = rng(11);
   await new Promise<void>((resolve, reject) => {
-    const call = client.add((err: Error | null) => (err ? reject(err) : resolve()));
+    const call = admin.add((err: Error | null) => (err ? reject(err) : resolve()));
     call.write({ index_id: indexId, dim, vectors: randomVector(rand, dim), ids: [bigId] });
     call.end();
   });
@@ -205,11 +215,12 @@ async function main(): Promise<void> {
     await idFidelityDemo(dim);
   } catch (err: any) {
     console.error(
-      `\nrpc failed: ${err?.message ?? err}\nis the server up?  cargo run -p turbovec-grpc`,
+      `\nrpc failed: ${err?.message ?? err}\nis the server up?  TURBOVEC_ALLOW_EPHEMERAL=true cargo run --bin turbovec-grpc`,
     );
     process.exit(1);
   }
-  client.close();
+  admin.close();
+  query.close();
 }
 
 await main();
