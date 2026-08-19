@@ -12,14 +12,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.89
         with:
           components: clippy,rustfmt
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install buf
+        run: |
+          curl -sSL -o buf "https://github.com/bufbuild/buf/releases/download/v1.70.0/buf-Linux-x86_64"
+          chmod +x buf && sudo mv buf /usr/local/bin/buf
       - name: Proto drift
         run: |
           cmp proto/turbovec/v1/turbovec.proto clients/python/proto/turbovec/v1/turbovec.proto
           cmp proto/turbovec/v1/coordinator.proto clients/python/proto/turbovec/v1/coordinator.proto
+      - name: Proto compat
+        run: ./scripts/check-proto-compat.sh origin/main
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked

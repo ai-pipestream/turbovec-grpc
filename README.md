@@ -137,9 +137,10 @@ spare only when an operator names it as a `Split` or `Join` target.
 - TLS and authentication belong at a gRPC-aware proxy or service mesh. Authorize
   `TurboVecQuery` and `TurboVecAdmin` independently.
 
-See [architecture](docs/architecture.md) for invariants and
+See [architecture](docs/architecture.md) for invariants,
 [deployment](docs/deployment.md) for configuration, probes, sizing, and the
-container boundary.
+container boundary, and [scaling](docs/scaling.md) for the metadata protocol,
+the wire-compatibility policy, and the autoscaling roadmap.
 
 ## Examples
 
