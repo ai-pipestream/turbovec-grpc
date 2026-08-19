@@ -33,6 +33,7 @@
 //! matches what was pinned. `ListNodes` re-probes on every call, so the
 //! operator-facing view is never the cached one.
 
+pub mod autoscale;
 pub mod nodes;
 
 use std::cmp::Ordering;
@@ -396,10 +397,39 @@ impl CoordinatorService {
     /// they build the new shards, and only once every one of them exists does
     /// the collection start pointing at them.
     fn rebind(&self, shards: Vec<ShardConfig>) -> Result<u64, Status> {
+        self.rebind_inner(None, shards)
+    }
+
+    /// `rebind` that refuses to publish over a topology that moved since
+    /// `expected_generation`. The autoscaler plans a split against one
+    /// generation and must not clobber an operator's Split or Join that
+    /// landed while rows were moving.
+    fn rebind_if_unchanged(
+        &self,
+        expected_generation: u64,
+        shards: Vec<ShardConfig>,
+    ) -> Result<u64, Status> {
+        self.rebind_inner(Some(expected_generation), shards)
+    }
+
+    fn rebind_inner(
+        &self,
+        expected_generation: Option<u64>,
+        shards: Vec<ShardConfig>,
+    ) -> Result<u64, Status> {
         let mut topology = self
             .topology
             .write()
             .expect("coordinator topology lock poisoned");
+        if let Some(expected) = expected_generation {
+            if topology.generation != expected {
+                return Err(Status::aborted(format!(
+                    "topology moved from generation {expected} to {} while the split was being \
+                     staged; the staged targets were built for a collection that no longer exists",
+                    topology.generation
+                )));
+            }
+        }
         let generation = topology
             .generation
             .checked_add(1)
@@ -808,6 +838,45 @@ impl CoordinatorService {
             shard.index_id.clone(),
         )
         .await
+    }
+
+    /// Move one shard's rows, encoded, onto `targets`, under exactly the
+    /// validation the wire `Split` applies. Nothing is published: the caller
+    /// assembles the new shard table and rebinds it. The `Split` RPC and the
+    /// autoscaler both go through here, so there is one row-moving path.
+    ///
+    /// Returns the probed source, the new shard references in target order,
+    /// and the row count each target received.
+    async fn stage_split(
+        &self,
+        source: &ShardConfig,
+        targets: &[String],
+        row_counts: &[u64],
+    ) -> Result<(Probe, Vec<ShardRef>, Vec<u64>), Status> {
+        let source = self.resolve(source).await?;
+        require_positional(&source, "Split")?;
+        let counts = plan_counts(source.info.len, targets.len(), row_counts)?;
+
+        // One target at a time. Every transfer is a bounded block stream and
+        // the target activates only after receiving its exact row count.
+        let mut shards = Vec::with_capacity(targets.len());
+        let mut start = 0u64;
+        for (target, &count) in targets.iter().zip(counts.iter()) {
+            let imported = self
+                .import_ranges(
+                    target,
+                    count,
+                    vec![ExportPlan {
+                        source: source.clone(),
+                        start,
+                        count,
+                    }],
+                )
+                .await?;
+            shards.push(shard_ref(target, &imported.index_id));
+            start += count;
+        }
+        Ok((source, shards, counts))
     }
 
     /// Pipe bounded encoded blocks from one or more sources into one target.
@@ -1434,29 +1503,9 @@ impl Coordinator for CoordinatorService {
         let source = req.source.ok_or_else(|| {
             Status::invalid_argument("split needs a source shard to redistribute")
         })?;
-        let source = self.resolve(&to_config(&source)).await?;
-        require_positional(&source, "Split")?;
-        let counts = plan_counts(source.info.len, req.targets.len(), &req.row_counts)?;
-
-        // One target at a time. Every transfer is a bounded block stream and
-        // the target activates only after receiving its exact row count.
-        let mut shards = Vec::with_capacity(req.targets.len());
-        let mut start = 0u64;
-        for (target, &count) in req.targets.iter().zip(counts.iter()) {
-            let imported = self
-                .import_ranges(
-                    target,
-                    count,
-                    vec![ExportPlan {
-                        source: source.clone(),
-                        start,
-                        count,
-                    }],
-                )
-                .await?;
-            shards.push(shard_ref(target, &imported.index_id));
-            start += count;
-        }
+        let (source, shards, counts) = self
+            .stage_split(&to_config(&source), &req.targets, &req.row_counts)
+            .await?;
 
         self.flush_before_durable_rebind(&shards).await?;
         let configs = self.configs_for_topology(&shards).await?;

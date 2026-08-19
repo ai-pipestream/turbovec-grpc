@@ -24,6 +24,25 @@ pub fn positive_usize(name: &str, default: usize) -> Result<usize, String> {
     Ok(value)
 }
 
+/// An optional positive knob whose absence disables the feature it gates. A
+/// present value must parse and be non-zero: a knob the operator half-set is
+/// a startup error, not a feature quietly running at a default.
+pub fn optional_positive_u64(name: &str) -> Result<Option<u64>, String> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value: u64 = raw
+                .parse()
+                .map_err(|error| format!("invalid {name}={raw:?}: {error}"))?;
+            if value == 0 {
+                return Err(format!("{name} must be positive"));
+            }
+            Ok(Some(value))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
+}
+
 pub fn enabled(name: &str) -> Result<bool, String> {
     match std::env::var(name) {
         Ok(raw) => match raw.to_ascii_lowercase().as_str() {

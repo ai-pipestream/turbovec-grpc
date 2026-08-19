@@ -12,6 +12,9 @@
 //!   instead. See `coordinator::nodes` for the entry syntax.
 //! - `TURBOVEC_COORD_STATE` — atomic topology-generation state file.
 //! - `TURBOVEC_ALLOW_EPHEMERAL` — opt into non-durable demo topology.
+//! - `TURBOVEC_AUTOSCALE_MAX_ROWS_PER_SHARD` — grow-only autoscaler ceiling;
+//!   unset keeps the autoscaler off. `TURBOVEC_AUTOSCALE_INTERVAL_MS` sets
+//!   how often it looks (default 30 s).
 //! - `TURBOVEC_METRICS_ADDR` — optional OpenMetrics HTTP listener.
 //!
 //! ```bash
@@ -68,6 +71,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
     let (generation, table) = coordinator.topology_snapshot();
+    if let Some(policy) = turbovec_grpc::AutoscalePolicy::from_env()? {
+        coordinator.spawn_autoscaler(policy);
+    }
 
     tracing::info!(%addr, topology_generation = generation, shards = table.len(), "coordinator listening");
     for shard in &table.shards {

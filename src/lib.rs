@@ -47,6 +47,7 @@ pub mod observability;
 pub mod service;
 pub mod store;
 
+pub use coordinator::autoscale::AutoscalePolicy;
 pub use coordinator::{CoordinatorLimits, CoordinatorService, NodeTable, ShardConfig};
 pub use observability::Metrics;
 pub use service::{ServiceLimits, TurboVecService};
