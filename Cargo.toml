@@ -21,8 +21,6 @@ path = "src/coordinator_main.rs"
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s16" }
 tonic = "0.12"
 prost = "0.13"
-prost-reflect = "0.14"
-sha2 = "0.10"
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tonic-health = "0.12"
@@ -33,13 +31,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-cel = { version = "0.14", features = ["chrono"] }
-prost-types = "0.13"
-chrono = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12"
-
-[dev-dependencies]
-protox = "0.7"
-prost-reflect = "0.14"

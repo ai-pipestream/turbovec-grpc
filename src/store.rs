@@ -14,23 +14,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crc32fast::Hasher;
-use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use turbovec::{CalibrationState, IdMapIndex, TurboQuantIndex};
 
-use crate::columns::DocumentColumns;
-use crate::parents::ParentStore;
-use crate::proto::{IndexKind, StoredDocumentSet, StoredParentSet};
-use crate::schema::BoundSchema;
+use crate::proto::IndexKind;
 
 const MANIFEST_VERSION: u32 = 1;
 const CURRENT_FILE: &str = "CURRENT";
 const MANIFEST_FILE: &str = "manifest.json";
 const INDEX_FILE: &str = "index.tv";
 const LABELS_FILE: &str = "labels.le64";
-const SCHEMA_FILE: &str = "schema.fds";
-const DOCUMENTS_FILE: &str = "documents.pb";
-const PARENTS_FILE: &str = "parents.pb";
 
 /// One open index, of either storage model.
 pub enum Index {
@@ -122,29 +115,12 @@ impl fmt::Display for PersistenceError {
 
 impl std::error::Error for PersistenceError {}
 
-/// Manifest entry for a bound schema. The descriptor set itself lives in
-/// `schema.fds` beside the index, verbatim as the client registered it,
-/// and the stored document field values live in `documents.pb`; the
-/// manifest carries what restore needs to validate both.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct SchemaManifest {
-    message_type: String,
-    fingerprint: String,
-    descriptor_bytes: u64,
-    descriptor_crc32: u32,
-    documents_bytes: u64,
-    documents_crc32: u32,
-    documents_count: u64,
-    /// Absent for a flat schema (no CHUNKS scope).
-    #[serde(default)]
-    parents_bytes: u64,
-    #[serde(default)]
-    parents_crc32: u32,
-    #[serde(default)]
-    parents_count: u64,
-}
-
+// `deny_unknown_fields`: a manifest written when this build still carried
+// the removed document/schema layer holds a `schema` entry, and silently
+// dropping it on restore would serve that shard as if it were a plain
+// vector index. Refusing it keeps the removal a loud compat break.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShardManifest {
     version: u32,
     shard_id: String,
@@ -163,8 +139,6 @@ struct ShardManifest {
     labels_crc32: u32,
     #[serde(default)]
     last_ingest: Option<IngestRecord>,
-    #[serde(default)]
-    schema: Option<SchemaManifest>,
 }
 
 /// Thread-safe registry keyed by stable shard id.
@@ -173,9 +147,6 @@ pub struct IndexStore {
     labels: RwLock<HashMap<String, Labels>>,
     generations: RwLock<HashMap<String, u64>>,
     ingests: RwLock<HashMap<String, IngestRecord>>,
-    schemas: RwLock<HashMap<String, Arc<BoundSchema>>>,
-    columns: RwLock<HashMap<String, Arc<RwLock<DocumentColumns>>>>,
-    parents: RwLock<HashMap<String, Arc<RwLock<ParentStore>>>>,
     data_root: Option<PathBuf>,
 }
 
@@ -186,9 +157,6 @@ impl Default for IndexStore {
             labels: RwLock::new(HashMap::new()),
             generations: RwLock::new(HashMap::new()),
             ingests: RwLock::new(HashMap::new()),
-            schemas: RwLock::new(HashMap::new()),
-            columns: RwLock::new(HashMap::new()),
-            parents: RwLock::new(HashMap::new()),
             data_root: None,
         }
     }
@@ -305,68 +273,6 @@ impl IndexStore {
             .insert(id.to_string(), record);
     }
 
-    /// Bind a derived schema to an open index, with an empty column set
-    /// (and parent table when chunked). The next persist writes them with
-    /// the generation, and restore re-derives and validates them.
-    pub fn bind_schema(&self, id: &str, schema: Arc<BoundSchema>) {
-        let columns = DocumentColumns::new(schema.schema.fingerprint.clone());
-        let parents = schema
-            .is_chunked()
-            .then(|| ParentStore::new(schema.schema.fingerprint.clone()));
-        self.bind_schema_with_columns(id, schema, columns, parents);
-    }
-
-    fn bind_schema_with_columns(
-        &self,
-        id: &str,
-        schema: Arc<BoundSchema>,
-        columns: DocumentColumns,
-        parents: Option<ParentStore>,
-    ) {
-        self.schemas
-            .write()
-            .expect("index registry lock poisoned")
-            .insert(id.to_string(), schema);
-        self.columns
-            .write()
-            .expect("index registry lock poisoned")
-            .insert(id.to_string(), Arc::new(RwLock::new(columns)));
-        let mut parent_map = self.parents.write().expect("index registry lock poisoned");
-        parent_map.remove(id);
-        if let Some(parents) = parents {
-            parent_map.insert(id.to_string(), Arc::new(RwLock::new(parents)));
-        }
-    }
-
-    /// The schema bound to an index, or `None` for a plain vector index.
-    pub fn schema(&self, id: &str) -> Option<Arc<BoundSchema>> {
-        self.schemas
-            .read()
-            .expect("index registry lock poisoned")
-            .get(id)
-            .cloned()
-    }
-
-    /// The stored document field values of a schema-bound index, or
-    /// `None` for a plain vector index.
-    pub fn columns(&self, id: &str) -> Option<Arc<RwLock<DocumentColumns>>> {
-        self.columns
-            .read()
-            .expect("index registry lock poisoned")
-            .get(id)
-            .cloned()
-    }
-
-    /// The parent table of a chunked schema-bound index, or `None` for a
-    /// flat schema or a plain vector index.
-    pub fn parents(&self, id: &str) -> Option<Arc<RwLock<ParentStore>>> {
-        self.parents
-            .read()
-            .expect("index registry lock poisoned")
-            .get(id)
-            .cloned()
-    }
-
     /// Look up an open index by stable shard id.
     pub fn get(&self, id: &str) -> Option<Handle> {
         self.inner
@@ -404,18 +310,6 @@ impl IndexStore {
             .expect("index registry lock poisoned")
             .remove(id);
         self.ingests
-            .write()
-            .expect("index registry lock poisoned")
-            .remove(id);
-        self.schemas
-            .write()
-            .expect("index registry lock poisoned")
-            .remove(id);
-        self.columns
-            .write()
-            .expect("index registry lock poisoned")
-            .remove(id);
-        self.parents
             .write()
             .expect("index registry lock poisoned")
             .remove(id);
@@ -469,7 +363,6 @@ impl IndexStore {
         fs::create_dir(&temp_dir)
             .map_err(|e| path_error("create temporary generation", &temp_dir, e))?;
 
-        let schema = self.schema(id);
         let result = (|| {
             let index_path = temp_dir.join(INDEX_FILE);
             let last_ingest = self.ingest_record(id);
@@ -492,61 +385,6 @@ impl IndexStore {
                     }
                     None => (0, 0),
                 };
-                let schema_manifest = match schema.as_deref() {
-                    Some(bound) => {
-                        let path = temp_dir.join(SCHEMA_FILE);
-                        write_synced(&path, &bound.descriptor_set)?;
-                        let (descriptor_bytes, descriptor_crc32) = file_size_crc(&path)?;
-                        // The columns snapshot is coherent with the index
-                        // snapshot: this thread holds the index read lock,
-                        // and every columns mutation happens under the
-                        // index write lock.
-                        let columns = self.columns(id).ok_or_else(|| {
-                            PersistenceError::new(format!(
-                                "shard {id} has a bound schema but no document columns"
-                            ))
-                        })?;
-                        let set = columns
-                            .read()
-                            .map_err(|_| PersistenceError::new("columns lock poisoned"))?
-                            .to_set();
-                        let documents_count = set.documents.len() as u64;
-                        let documents_path = temp_dir.join(DOCUMENTS_FILE);
-                        write_synced(&documents_path, &set.encode_to_vec())?;
-                        let (documents_bytes, documents_crc32) = file_size_crc(&documents_path)?;
-                        let (parents_bytes, parents_crc32, parents_count) = if bound.is_chunked() {
-                            let parents = self.parents(id).ok_or_else(|| {
-                                PersistenceError::new(format!(
-                                    "shard {id} is chunked but has no parent store"
-                                ))
-                            })?;
-                            let set = parents
-                                .read()
-                                .map_err(|_| PersistenceError::new("parents lock poisoned"))?
-                                .to_set();
-                            let parents_count = set.parents.len() as u64;
-                            let parents_path = temp_dir.join(PARENTS_FILE);
-                            write_synced(&parents_path, &set.encode_to_vec())?;
-                            let (parents_bytes, parents_crc32) = file_size_crc(&parents_path)?;
-                            (parents_bytes, parents_crc32, parents_count)
-                        } else {
-                            (0, 0, 0)
-                        };
-                        Some(SchemaManifest {
-                            message_type: bound.schema.message_type.clone(),
-                            fingerprint: bound.schema.fingerprint.clone(),
-                            descriptor_bytes,
-                            descriptor_crc32,
-                            documents_bytes,
-                            documents_crc32,
-                            documents_count,
-                            parents_bytes,
-                            parents_crc32,
-                            parents_count,
-                        })
-                    }
-                    None => None,
-                };
                 manifest_for(
                     id,
                     generation,
@@ -557,7 +395,6 @@ impl IndexStore {
                         labelled: labels.is_some(),
                         labels_count,
                         labels_crc32,
-                        schema: schema_manifest,
                     },
                     last_ingest,
                 )
@@ -685,128 +522,13 @@ impl IndexStore {
                 }
                 None
             };
-            let schema = match &manifest.schema {
-                Some(record) => {
-                    let bound = restore_schema(&generation_dir, record)?;
-                    let columns = restore_columns(&generation_dir, record, manifest.rows)?;
-                    let parents = restore_parents(&generation_dir, record, &bound)?;
-                    Some((bound, columns, parents))
-                }
-                None => None,
-            };
             self.insert_with_id(id.to_string(), index, labels, generation)?;
             if let Some(record) = manifest.last_ingest {
                 self.set_ingest_record(id, record);
             }
-            if let Some((bound, columns, parents)) = schema {
-                self.bind_schema_with_columns(id, bound, columns, parents);
-            }
         }
         Ok(())
     }
-}
-
-/// Rebuild a bound schema from its persisted descriptor set. The plan is
-/// re-derived by the code that is loading it, and a fingerprint that no
-/// longer matches the manifest fails the restore: a derivation change is
-/// an index compatibility event, and serving through it would quietly
-/// change what the index means.
-fn restore_schema(
-    generation_dir: &Path,
-    record: &SchemaManifest,
-) -> Result<Arc<BoundSchema>, PersistenceError> {
-    let path = generation_dir.join(SCHEMA_FILE);
-    verify_file(&path, record.descriptor_bytes, record.descriptor_crc32)?;
-    let bytes = fs::read(&path).map_err(|e| path_error("read schema descriptor set", &path, e))?;
-    let bound = BoundSchema::derive(&bytes, &record.message_type).map_err(|e| {
-        PersistenceError::new(format!(
-            "re-derive persisted schema {}: {e}",
-            record.message_type
-        ))
-    })?;
-    if bound.schema.fingerprint != record.fingerprint {
-        return Err(PersistenceError::new(format!(
-            "schema fingerprint drift for {}: persisted {}, re-derived {}; \
-             the derivation rules changed since this shard was written, so this \
-             build refuses to serve it",
-            record.message_type, record.fingerprint, bound.schema.fingerprint
-        )));
-    }
-    Ok(Arc::new(bound))
-}
-
-/// Restore a schema-bound shard's stored document field values, verified
-/// against the manifest and cross-checked against the row count: a
-/// schema-bound index without columns for exactly its rows cannot answer
-/// filters truthfully, so it does not serve.
-fn restore_columns(
-    generation_dir: &Path,
-    record: &SchemaManifest,
-    rows: usize,
-) -> Result<DocumentColumns, PersistenceError> {
-    let path = generation_dir.join(DOCUMENTS_FILE);
-    verify_file(&path, record.documents_bytes, record.documents_crc32)?;
-    let bytes = fs::read(&path).map_err(|e| path_error("read stored documents", &path, e))?;
-    let set = StoredDocumentSet::decode(bytes.as_slice())
-        .map_err(|e| PersistenceError::new(format!("decode {}: {e}", path.display())))?;
-    if set.documents.len() as u64 != record.documents_count {
-        return Err(PersistenceError::new(format!(
-            "{} holds {} documents, manifest expects {}",
-            path.display(),
-            set.documents.len(),
-            record.documents_count
-        )));
-    }
-    if set.documents.len() != rows {
-        return Err(PersistenceError::new(format!(
-            "{} holds {} documents but the index holds {rows} rows",
-            path.display(),
-            set.documents.len()
-        )));
-    }
-    DocumentColumns::from_set(set, &record.fingerprint)
-        .map_err(|e| PersistenceError::new(format!("restore {}: {e}", path.display())))
-}
-
-fn restore_parents(
-    generation_dir: &Path,
-    record: &SchemaManifest,
-    bound: &BoundSchema,
-) -> Result<Option<ParentStore>, PersistenceError> {
-    if !bound.is_chunked() {
-        if record.parents_bytes != 0 || record.parents_count != 0 || record.parents_crc32 != 0 {
-            return Err(PersistenceError::new(format!(
-                "flat schema {} has non-empty parent metadata",
-                bound.schema.message_type
-            )));
-        }
-        return Ok(None);
-    }
-    let path = generation_dir.join(PARENTS_FILE);
-    verify_file(&path, record.parents_bytes, record.parents_crc32)?;
-    let bytes = fs::read(&path).map_err(|e| path_error("read stored parents", &path, e))?;
-    let set = StoredParentSet::decode(bytes.as_slice())
-        .map_err(|e| PersistenceError::new(format!("decode {}: {e}", path.display())))?;
-    if set.parents.len() as u64 != record.parents_count {
-        return Err(PersistenceError::new(format!(
-            "{} holds {} parents, manifest expects {}",
-            path.display(),
-            set.parents.len(),
-            record.parents_count
-        )));
-    }
-    let chunk_labels: usize = set.parents.iter().map(|p| p.chunk_labels.len()).sum();
-    if chunk_labels != record.documents_count as usize {
-        return Err(PersistenceError::new(format!(
-            "{} chunk labels across parents ({chunk_labels}) do not match \
-             documents_count {}",
-            path.display(),
-            record.documents_count
-        )));
-    }
-    ParentStore::from_set(set, &record.fingerprint)
-        .map(Some)
-        .map_err(|e| PersistenceError::new(format!("restore {}: {e}", path.display())))
 }
 
 fn validate_shard_id(id: &str) -> Result<(), PersistenceError> {
@@ -842,7 +564,6 @@ struct PersistedFiles {
     labelled: bool,
     labels_count: u64,
     labels_crc32: u32,
-    schema: Option<SchemaManifest>,
 }
 
 fn manifest_for(
@@ -877,7 +598,6 @@ fn manifest_for(
         labels_count: files.labels_count,
         labels_crc32: files.labels_crc32,
         last_ingest,
-        schema: files.schema,
     }
 }
 

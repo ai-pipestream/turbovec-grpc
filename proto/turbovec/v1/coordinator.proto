@@ -25,7 +25,6 @@ syntax = "proto3";
 
 package turbovec.v1;
 
-import "turbovec/v1/schema.proto";
 import "turbovec/v1/turbovec.proto";
 
 // Coordinator serves one logical collection over several turbovec nodes.
@@ -49,37 +48,6 @@ service Coordinator {
   // shards do not share one calibration pair. A short result set is never
   // returned as if it were complete.
   rpc Search(CollectionSearchRequest) returns (CollectionSearchResponse);
-
-  // Runs a top-k search over a schema-bound collection, optionally
-  // restricted by a CEL filter over the planned fields — the collection
-  // form of the node-level Documents.SearchDocuments, with the same
-  // filter language and the same exactness.
-  //
-  // Every shard must hold a bound schema and every schema must carry one
-  // fingerprint; a collection whose shards disagree about what a document
-  // is cannot mean one thing by a filter, and is refused by name rather
-  // than searched. Each shard evaluates the filter against its own stored
-  // field values, producing its own exact allowlist, and returns the true
-  // top-k of its admitted documents; the union of per-shard admitted sets
-  // is the collection's admitted set, so merging the per-shard top-k by
-  // score is the exact collection top-k, not an approximation of it.
-  //
-  // On a chunked collection the coordinator overlaps a second stream:
-  // as the first shard's hits arrive it fans GetParents for those
-  // parent labels to every shard, so membership is a union and chunks
-  // need not share a shard with their parent. collapse_parents asks
-  // each shard for its local top-k parents (every admitted chunk is
-  // ranked before collapse); the coordinator then re-collapses by
-  // parent, keeping the max score, which is the collection's exact
-  // top-k parents. The RPC does not return until every shard search
-  // and every parent lookup has finished.
-  //
-  // Fails, by name, if any shard is unreachable, if the shards do not
-  // share one schema fingerprint or one calibration pair, or if the
-  // filter does not parse, references an unplanned field, or does not
-  // evaluate to a boolean on some document.
-  rpc SearchDocuments(CollectionSearchDocumentsRequest)
-      returns (CollectionSearchDocumentsResponse);
 
   // Fits one TQ+ calibration from a caller-supplied sample and commits
   // that same pair to every shard, so the collection encodes into one
@@ -153,10 +121,8 @@ message ShardStatus {
   // wording Search would fail with.
   string error = 4;
 
-  // Fingerprint of the schema bound to the shard's index, empty for a
-  // plain vector shard. SearchDocuments serves the collection only when
-  // every shard carries the same non-empty value here.
-  string schema_fingerprint = 5;
+  reserved 5;
+  reserved "schema_fingerprint";
 }
 
 // SpareNodeStatus is one registered-but-unassigned node, as the
@@ -273,51 +239,6 @@ message CollectionSearchResponse {
 
   // Topology generation searched. In-flight requests may finish on the old
   // generation while an administrative rebind activates the next one.
-  uint64 topology_generation = 4;
-}
-
-// CollectionSearchDocumentsRequest is a filtered top-k search over a
-// schema-bound collection.
-message CollectionSearchDocumentsRequest {
-  // Row-major query data. Length must be a whole multiple of the
-  // collection dim.
-  repeated float queries = 1;
-
-  // Number of neighbours to return per query, across the collection. The
-  // effective count is min(k, documents the filter admits). When
-  // collapse_parents is set, k is the number of parents.
-  uint32 k = 2;
-
-  // Boolean CEL expression over the planned fields, or empty for no
-  // filter. The variables are the document's own proto fields, spelled
-  // as the schema spells them: `price_cents < 5000 && meta.author ==
-  // "kagome"`. Identical semantics on every shard, because every shard
-  // holds the same schema fingerprint.
-  string filter = 3;
-
-  // When true, return at most one hit per parent across the
-  // collection — the best-scoring admitted chunk of that parent.
-  bool collapse_parents = 4;
-}
-
-// CollectionSearchDocumentsResponse returns one result per query, in
-// query order.
-message CollectionSearchDocumentsResponse {
-  // Results, aligned with the input queries. Hits carry the document's
-  // label and original id, exactly as the node-level SearchDocuments
-  // reports them; rows with equal scores keep shard order, then the
-  // shard's own order.
-  repeated DocumentQueryResult results = 1;
-
-  // Documents the filter admitted, summed across shards. Equal to
-  // `total` when no filter was set.
-  uint64 matched = 2;
-
-  // Documents the filter was evaluated over: every document in the
-  // collection.
-  uint64 total = 3;
-
-  // Topology generation searched.
   uint64 topology_generation = 4;
 }
 

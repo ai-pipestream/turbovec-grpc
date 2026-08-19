@@ -36,39 +36,33 @@
 pub mod nodes;
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 use turbovec::TurboQuantIndex;
 
-use crate::collapse;
 use crate::errors::{
     self, AMBIGUOUS_INDEX, BIT_WIDTH_MISMATCH, DIMENSION_MISMATCH, EMPTY_COLLECTION,
-    MIXED_CALIBRATION, MIXED_SCHEMA, NODE_UNREACHABLE, POSITIONAL_INDEX_REQUIRED,
-    ROW_COUNT_MISMATCH, SCHEMA_REQUIRED,
+    MIXED_CALIBRATION, NODE_UNREACHABLE, POSITIONAL_INDEX_REQUIRED, ROW_COUNT_MISMATCH,
 };
 use crate::observability::Metrics;
 use crate::proto::coordinator_server::{Coordinator, CoordinatorServer};
-use crate::proto::documents_client::DocumentsClient;
 use crate::proto::turbo_vec_admin_client::TurboVecAdminClient;
 use crate::proto::turbo_vec_query_client::TurboVecQueryClient;
 use crate::proto::{
-    Calibration, CollectionQueryResult, CollectionSearchDocumentsRequest,
-    CollectionSearchDocumentsResponse, CollectionSearchRequest, CollectionSearchResponse,
-    DocumentHit, DocumentQueryResult, ExportRowsRequest, FieldRole, FitCalibrationRequest,
-    FitCalibrationResponse, FlushRequest, GetCalibrationRequest, GetIndexInfoRequest,
-    GetParentsRequest, GetSchemaRequest, ImportRowsRequest, ImportRowsResponse, ImportRowsStart,
-    IndexInfo, IndexSchema, JoinRequest, JoinResponse, ListIndexesRequest, ListNodesRequest,
+    Calibration, CollectionQueryResult, CollectionSearchRequest, CollectionSearchResponse,
+    ExportRowsRequest, FitCalibrationRequest, FitCalibrationResponse, FlushRequest,
+    GetCalibrationRequest, GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse,
+    ImportRowsStart, IndexInfo, JoinRequest, JoinResponse, ListIndexesRequest, ListNodesRequest,
     ListNodesResponse, Neighbour, RegisterNodeRequest, RegisterNodeResponse, RowBlock,
-    SearchDocumentsRequest, SetCalibrationRequest, ShardRef, ShardStatus, SpareNodeStatus,
-    SplitRequest, SplitResponse, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
+    SetCalibrationRequest, ShardRef, ShardStatus, SpareNodeStatus, SplitRequest, SplitResponse,
+    StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
 };
 use crate::service::calibration_difference;
 
@@ -170,9 +164,6 @@ struct Probe {
 
     /// Calibration pair the node reported.
     calibration: Calibration,
-
-    /// The schema bound to the index, absent for a plain vector shard.
-    schema: Option<IndexSchema>,
 }
 
 struct ExportPlan {
@@ -197,12 +188,6 @@ struct Pinned {
 
     /// The calibration pair every shard holds.
     calibration: Calibration,
-
-    /// The schema every shard binds, or `None` for a plain vector
-    /// collection. A collection where the shards disagree — some bound,
-    /// some not, or bound to different fingerprints — does not bind at
-    /// all; see [`bind`].
-    schema: Option<IndexSchema>,
 }
 
 /// One candidate in the coordinator's bounded global heap.
@@ -493,12 +478,6 @@ impl CoordinatorService {
             .max_encoding_message_size(MAX_MESSAGE_BYTES))
     }
 
-    fn documents_client(&self, address: &str) -> Result<DocumentsClient<Channel>, Status> {
-        Ok(DocumentsClient::new(self.channel(address)?)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES))
-    }
-
     /// Search one query with one global heap while every shard streams
     /// candidates above the highest floor observed so far.
     async fn stream_query(
@@ -745,7 +724,6 @@ impl CoordinatorService {
     async fn probe_for_search(&self, shard: &ShardConfig) -> Result<Probe, Status> {
         let primary = probe(
             self.query_client(&shard.address)?,
-            self.documents_client(&shard.address)?,
             shard.address.clone(),
             shard.index_id.clone(),
         )
@@ -763,7 +741,6 @@ impl CoordinatorService {
                 for address in &shard.replicas {
                     let replica = probe(
                         self.query_client(address)?,
-                        self.documents_client(address)?,
                         address.clone(),
                         shard.index_id.clone(),
                     )
@@ -827,7 +804,6 @@ impl CoordinatorService {
     async fn resolve(&self, shard: &ShardConfig) -> Result<Probe, Status> {
         probe(
             self.query_client(&shard.address)?,
-            self.documents_client(&shard.address)?,
             shard.address.clone(),
             shard.index_id.clone(),
         )
@@ -960,11 +936,10 @@ fn empty_block(source: &Probe) -> RowBlock {
     }
 }
 
-/// Read one node's view of one shard: which index, its metadata, its pair,
-/// and the schema bound to it, if any.
+/// Read one node's view of one shard: which index, its metadata, and its
+/// calibration pair.
 async fn probe(
     mut client: TurboVecQueryClient<Channel>,
-    mut documents: DocumentsClient<Channel>,
     address: String,
     index_id: Option<String>,
 ) -> Result<Probe, Status> {
@@ -1008,33 +983,11 @@ async fn probe(
         .await
         .map_err(|e| node_error(&address, &e))?
         .into_inner();
-    // A shard with no bound schema is an answer, not a failure: NOT_FOUND
-    // is what the Documents service says for a plain vector index, and
-    // UNIMPLEMENTED is what a node that does not serve Documents at all
-    // says. Everything else is the node failing the probe.
-    let schema = match documents
-        .get_schema(GetSchemaRequest {
-            index_id: index_id.clone(),
-        })
-        .await
-    {
-        Ok(response) => response.into_inner().schema,
-        Err(status)
-            if matches!(
-                status.code(),
-                tonic::Code::NotFound | tonic::Code::Unimplemented
-            ) =>
-        {
-            None
-        }
-        Err(status) => return Err(node_error(&address, &status)),
-    };
     Ok(Probe {
         address,
         index_id,
         info,
         calibration,
-        schema,
     })
 }
 
@@ -1092,61 +1045,15 @@ fn bind(generation: u64, shards: Vec<Probe>) -> Result<Pinned, Status> {
                 ),
             ));
         }
-        // The schema question is all-or-nothing, like the calibration one:
-        // either every shard binds the same fingerprint (a document
-        // collection) or no shard binds any (a plain vector collection). A
-        // shard that disagrees means the shards do not hold slices of one
-        // thing, which no amount of merging can repair.
-        match (&head.schema, &shard.schema) {
-            (None, None) => {}
-            (Some(expected), Some(found)) if expected.fingerprint == found.fingerprint => {}
-            (Some(expected), Some(found)) => {
-                return Err(errors::precondition(
-                    MIXED_SCHEMA,
-                    format!(
-                        "shard {} binds schema {} ({}) and shard {} binds schema {} ({}); a \
-                         filter over the planned fields cannot mean one thing across them",
-                        head.address,
-                        expected.fingerprint,
-                        expected.message_type,
-                        shard.address,
-                        found.fingerprint,
-                        found.message_type
-                    ),
-                ));
-            }
-            (Some(expected), None) => {
-                return Err(errors::precondition(
-                    MIXED_SCHEMA,
-                    format!(
-                        "shard {} binds schema {} ({}) and shard {} binds no schema; bind the \
-                         same schema on every shard, or on none",
-                        head.address, expected.fingerprint, expected.message_type, shard.address
-                    ),
-                ));
-            }
-            (None, Some(found)) => {
-                return Err(errors::precondition(
-                    MIXED_SCHEMA,
-                    format!(
-                        "shard {} binds no schema and shard {} binds schema {} ({}); bind the \
-                         same schema on every shard, or on none",
-                        head.address, shard.address, found.fingerprint, found.message_type
-                    ),
-                ));
-            }
-        }
         rows += shard.info.len;
     }
     let calibration = head.calibration.clone();
-    let schema = head.schema.clone();
     Ok(Pinned {
         generation,
         shards,
         dim: dim as usize,
         rows,
         calibration,
-        schema,
     })
 }
 
@@ -1157,34 +1064,6 @@ fn bind(generation: u64, shards: Vec<Probe>) -> Result<Pinned, Status> {
 /// node did not answer" would turn a diagnosis into a symptom. Anything else,
 /// including a node that genuinely did not answer, becomes `node_unreachable`
 /// carrying the node's own code and wording.
-/// A shard's INVALID_ARGUMENT on SearchDocuments or GetParents is a
-/// diagnosis of this request, not a node that failed to answer. Every
-/// shard holds one schema, so they would all say the same thing; it
-/// travels back as what it is.
-fn documents_shard_error(address: &str, status: Status) -> Status {
-    match status.code() {
-        tonic::Code::InvalidArgument => {
-            Status::invalid_argument(format!("{} (shard {address})", status.message()))
-        }
-        _ => node_error(address, &status),
-    }
-}
-
-fn schema_is_chunked(schema: &IndexSchema) -> bool {
-    schema
-        .fields
-        .iter()
-        .any(|field| field.role == FieldRole::Chunks as i32)
-}
-
-fn attach_parent_chunks(hits: &mut [DocumentHit], membership: &HashMap<u64, BTreeSet<u64>>) {
-    for hit in hits {
-        if let Some(chunks) = membership.get(&hit.parent_label) {
-            hit.parent_chunks = chunks.len() as u32;
-        }
-    }
-}
-
 fn node_error(address: &str, status: &Status) -> Status {
     if errors::is_named(status.message()) {
         return Status::new(
@@ -1303,11 +1182,6 @@ impl Coordinator for CoordinatorService {
                         info: Some(probe.info.clone()),
                         calibration: Some(probe.calibration.clone()),
                         error: String::new(),
-                        schema_fingerprint: probe
-                            .schema
-                            .as_ref()
-                            .map(|schema| schema.fingerprint.clone())
-                            .unwrap_or_default(),
                     });
                     healthy.push(probe);
                 }
@@ -1319,7 +1193,6 @@ impl Coordinator for CoordinatorService {
                     info: None,
                     calibration: None,
                     error: e.message().to_string(),
-                    schema_fingerprint: String::new(),
                 }),
             }
         }
@@ -1473,181 +1346,6 @@ impl Coordinator for CoordinatorService {
         self.metrics.coordinator_search_finished();
         Ok(Response::new(CollectionSearchResponse {
             results,
-            topology_generation: pinned.generation,
-        }))
-    }
-
-    async fn search_documents(
-        &self,
-        request: Request<CollectionSearchDocumentsRequest>,
-    ) -> Result<Response<CollectionSearchDocumentsResponse>, Status> {
-        let req = request.into_inner();
-        let k = req.k as usize;
-        if k == 0 || k > self.limits.max_k {
-            return Err(Status::invalid_argument(format!(
-                "k must be between 1 and {}",
-                self.limits.max_k
-            )));
-        }
-        let pinned = self.collection().await?;
-        if pinned.schema.is_none() {
-            return Err(errors::precondition(
-                SCHEMA_REQUIRED,
-                "this collection's shards carry no bound schema; SearchDocuments needs a \
-                 schema-bound collection — bind the same schema on every shard, or use Search",
-            ));
-        }
-        if req.queries.is_empty() || !req.queries.len().is_multiple_of(pinned.dim) {
-            return Err(Status::invalid_argument(format!(
-                "query buffer length {} is not a positive multiple of the collection dim {}",
-                req.queries.len(),
-                pinned.dim
-            )));
-        }
-        let nq = req.queries.len() / pinned.dim;
-        if nq > self.limits.max_queries_per_request {
-            return Err(Status::resource_exhausted(format!(
-                "request has {nq} queries; limit is {}",
-                self.limits.max_queries_per_request
-            )));
-        }
-
-        // Every shard evaluates the filter over its own stored fields and
-        // returns the exact top-k of the documents it admits (or, under
-        // collapse_parents, the exact local top-k parents). The union of
-        // the per-shard admitted sets is the collection's admitted set.
-        // On a chunked collection a second stream overlaps that search:
-        // as the first shard's hits arrive, GetParents for those parent
-        // labels goes to every shard so membership is a union and a
-        // parent need not live on the same shard as the chunk that hit.
-        // The RPC does not complete until both streams finish.
-        let chunked = pinned.schema.as_ref().is_some_and(schema_is_chunked);
-        enum ShardWork {
-            Search {
-                rank: usize,
-                result: Result<Response<crate::proto::SearchDocumentsResponse>, Status>,
-            },
-            Parents {
-                address: String,
-                result: Result<Response<crate::proto::GetParentsResponse>, Status>,
-            },
-        }
-        let mut work = JoinSet::new();
-        for (rank, shard) in pinned.shards.iter().enumerate() {
-            let mut client = self.documents_client(&shard.address)?;
-            let mut shard_request = Request::new(SearchDocumentsRequest {
-                index_id: shard.index_id.clone(),
-                queries: req.queries.clone(),
-                k: req.k,
-                filter: req.filter.clone(),
-                collapse_parents: req.collapse_parents,
-            });
-            shard_request.set_timeout(self.limits.query_timeout);
-            work.spawn(async move {
-                ShardWork::Search {
-                    rank,
-                    result: client.search_documents(shard_request).await,
-                }
-            });
-        }
-
-        let mut shard_responses: Vec<Option<crate::proto::SearchDocumentsResponse>> =
-            vec![None; pinned.shards.len()];
-        let mut fetched: HashSet<u64> = HashSet::new();
-        let mut parent_chunks: HashMap<u64, BTreeSet<u64>> = HashMap::new();
-        while let Some(joined) = work.join_next().await {
-            match joined.map_err(|e| Status::internal(format!("shard task failed: {e}")))? {
-                ShardWork::Search { rank, result } => {
-                    let address = &pinned.shards[rank].address;
-                    let response = result
-                        .map_err(|status| documents_shard_error(address, status))?
-                        .into_inner();
-                    if response.results.len() != nq {
-                        return Err(Status::internal(format!(
-                            "shard {address} returned {} results for {nq} queries",
-                            response.results.len()
-                        )));
-                    }
-                    if chunked {
-                        let mut new_labels = Vec::new();
-                        for result in &response.results {
-                            for hit in &result.hits {
-                                if fetched.insert(hit.parent_label) {
-                                    new_labels.push(hit.parent_label);
-                                }
-                            }
-                        }
-                        if !new_labels.is_empty() {
-                            for shard in &pinned.shards {
-                                let mut client = self.documents_client(&shard.address)?;
-                                let mut parent_request = Request::new(GetParentsRequest {
-                                    index_id: shard.index_id.clone(),
-                                    parent_labels: new_labels.clone(),
-                                });
-                                parent_request.set_timeout(self.limits.query_timeout);
-                                let address = shard.address.clone();
-                                work.spawn(async move {
-                                    ShardWork::Parents {
-                                        address,
-                                        result: client.get_parents(parent_request).await,
-                                    }
-                                });
-                            }
-                        }
-                    }
-                    shard_responses[rank] = Some(response);
-                }
-                ShardWork::Parents { address, result } => {
-                    let response = result
-                        .map_err(|status| documents_shard_error(&address, status))?
-                        .into_inner();
-                    for parent in response.parents {
-                        parent_chunks
-                            .entry(parent.parent_label)
-                            .or_default()
-                            .extend(parent.chunk_labels);
-                    }
-                }
-            }
-        }
-        let shard_responses: Vec<crate::proto::SearchDocumentsResponse> = shard_responses
-            .into_iter()
-            .enumerate()
-            .map(|(rank, response)| {
-                response.ok_or_else(|| {
-                    Status::internal(format!(
-                        "shard {} produced no SearchDocuments response",
-                        pinned.shards[rank].address
-                    ))
-                })
-            })
-            .collect::<Result<_, _>>()?;
-
-        let mut results = Vec::with_capacity(nq);
-        for qi in 0..nq {
-            let mut ranked = Vec::new();
-            for (shard_rank, response) in shard_responses.iter().enumerate() {
-                for hit in &response.results[qi].hits {
-                    if hit.score.is_nan() {
-                        return Err(Status::internal(format!(
-                            "shard {} returned a NaN score",
-                            pinned.shards[shard_rank].address
-                        )));
-                    }
-                    ranked.push((shard_rank, hit.clone()));
-                }
-            }
-            let mut hits = collapse::merge_hits(ranked, k, req.collapse_parents);
-            attach_parent_chunks(&mut hits, &parent_chunks);
-            results.push(DocumentQueryResult { hits });
-        }
-        let matched = shard_responses.iter().map(|r| r.matched).sum();
-        let total = shard_responses.iter().map(|r| r.total).sum();
-        self.metrics.coordinator_search_finished();
-        Ok(Response::new(CollectionSearchDocumentsResponse {
-            results,
-            matched,
-            total,
             topology_generation: pinned.generation,
         }))
     }

@@ -729,16 +729,6 @@ impl TurboVec for TurboVecService {
                 ),
             ));
         }
-        if self.store.schema(&index_id).is_some() {
-            // A schema-bound index stores field values beside every row so
-            // CEL filters answer truthfully. A raw vector add would create
-            // rows without stored fields, and every later filter over the
-            // index would silently pass over them.
-            return Err(Status::failed_precondition(format!(
-                "index {index_id} has a bound schema; add documents through \
-                 Documents.AddDocuments so their field values are stored with them"
-            )));
-        }
 
         // Validate and stage the complete bounded operation before mutating the
         // index. A broken stream therefore commits no prefix.
@@ -889,38 +879,12 @@ impl TurboVec for TurboVecService {
     ) -> Result<Response<RemoveResponse>, Status> {
         let req = request.into_inner();
         let handle = self.handle(&req.index_id)?;
-        let columns = self.store.columns(&req.index_id);
-        let parents = self.store.parents(&req.index_id);
         let removed = tokio::task::spawn_blocking(move || {
             let mut guard = handle
                 .write()
                 .map_err(|_| Status::internal("index lock poisoned"))?;
             match &mut *guard {
-                Index::IdMap(inner) => {
-                    let removed = inner.remove(req.id);
-                    // A schema-bound index drops the row's stored fields
-                    // (and its membership in the parent table) with the
-                    // row, under the same index write lock.
-                    if removed {
-                        if let Some(columns) = columns {
-                            let mut columns = columns
-                                .write()
-                                .map_err(|_| Status::internal("columns lock poisoned"))?;
-                            if let Some(row) = columns.get(req.id).cloned() {
-                                columns.remove(req.id);
-                                if let Some(parents) = parents {
-                                    parents
-                                        .write()
-                                        .map_err(|_| Status::internal("parents lock poisoned"))?
-                                        .remove_chunk(row.parent_label, req.id);
-                                }
-                            } else {
-                                columns.remove(req.id);
-                            }
-                        }
-                    }
-                    Ok(removed)
-                }
+                Index::IdMap(inner) => Ok(inner.remove(req.id)),
                 Index::Positional(_) => Err(Status::failed_precondition(
                     "remove requires an ID_MAP index",
                 )),

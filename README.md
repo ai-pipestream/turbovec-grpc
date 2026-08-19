@@ -38,11 +38,13 @@ not own document schemas, CEL, BM25, text analysis, model serving, facets,
 hybrid ranking, or corpus pipelines. Those are search-product concerns owned by
 `turbovec-search` and ProtoMolt.
 
-The `thin-coordinator` branch currently contains a `Documents` service and its
-schema, scalar-column, CEL, and parent/chunk implementation. That code was
-completed before this boundary was corrected. Preserve it while migrating the
-useful mechanisms, but do not extend it here or treat it as the intended scope
-of the facade.
+An earlier revision of this repository carried a transitional `Documents`
+service (descriptor-derived schemas, stored scalar columns, CEL filtering,
+parent/chunk scopes). It has been removed: the facade accepts plain slot masks
+and allowlists compiled by its caller and never interprets a document schema.
+Git history preserves the implementation as migration material for
+`turbovec-search`. A shard generation persisted with a bound schema is not
+restorable by this binary; rebuild it as a plain vector shard.
 
 ## Build and test
 
@@ -72,13 +74,12 @@ cargo run --release --locked --bin turbovec-grpc
 For a local disposable demo, set `TURBOVEC_ALLOW_EPHEMERAL=true` instead of a
 data directory.
 
-Node methods are currently separated into three gRPC services:
+Node methods are separated into two gRPC services:
 
 | Service | Methods |
 |---|---|
 | `TurboVecQuery` | metadata, calibration read, `Search`, `SearchStream`, `StreamSearch` |
 | `TurboVecAdmin` | create/delete, retry-safe `Add`, remove, calibration write, `Flush`, streaming row export/import |
-| `Documents` | Transitional product-layer API awaiting migration to `turbovec-search` or a shared product crate |
 
 `Snapshot` and `Load` server-path RPCs do not exist. `Flush` writes an atomic,
 checksummed generation below `TURBOVEC_DATA_DIR`, including stable row labels
@@ -88,117 +89,6 @@ Retry-safe ingest sets `operation_id`, `expected_len`, and `expected_rows` on
 the first `Add` frame. The bounded operation is validated before mutation and
 flushed before success. A retry after a lost response or restart is replayed
 without duplicating rows.
-
-## Transitional protobuf document implementation
-
-This section records behavior that must not be lost during extraction. It does
-not expand the long-term `turbovec-grpc` product boundary.
-
-The `Documents` service indexes the protobuf messages producers already emit,
-with no JSON and no hand-maintained field mapping. The contract is
-[`schema.proto`](proto/turbovec/v1/schema.proto):
-
-1. `PlanSchema` takes a serialized `google.protobuf.FileDescriptorSet`
-   (compiled with `--include_imports`) plus a message type name and returns
-   the derived indexing plan: dotted field paths, resolved kinds, and a
-   SHA-256 fingerprint over the plan's canonical encoding. Two indexes agree
-   on their schema exactly when their fingerprints agree.
-2. `BindSchema` creates an id-mapped index shaped by that plan. `Flush`
-   persists the bound schema with the shard generation; restart re-derives
-   the plan and refuses to serve on a fingerprint mismatch.
-3. `AddDocuments` streams serialized messages of the bound type. The node
-   decodes each document against the bound descriptor and indexes its
-   `(id, vector)` pair along with every planned scalar field's value. A
-   broken or invalid stream commits no prefix. The stored field values
-   persist with the shard generation (`documents.pb`, checksummed like
-   every other section) and restore with it.
-4. `SearchDocuments` runs a top-k vector search optionally restricted by a
-   [CEL](https://cel.dev) filter over the planned fields, spelled the way
-   the proto spells them:
-
-   ```text
-   price_cents < 5000 && meta.author == "kagome" && "legal" in tags
-     && meta.created_at > timestamp("2020-01-01T00:00:00Z")
-   ```
-
-   The expression is evaluated against every document's stored values and
-   the admitted labels become an exact allowlist for the vector search, so
-   a filtered result is the true top-k of the admitted set — never an
-   over-fetch heuristic. Enum fields compare by value name, unset proto3
-   fields evaluate as their defaults, and hits report the original
-   document id, not just its u64 label. An expression that does not
-   parse, references an unplanned field, or does not evaluate to a
-   boolean fails with `INVALID_ARGUMENT` naming the problem.
-
-Because a schema-bound index stores field values beside every row, the raw
-vector `Add` RPC refuses such indexes; ingest goes through `AddDocuments`,
-and `Remove` drops a row's stored fields with the row.
-
-Fields may carry explicit hints as descriptor options using the
-`ai.pipestream.proto.index.hints.v1` extension (vendored byte-identically
-from [protomolt](https://github.com/ai-pipestream/protomolt), which owns the
-vocabulary): a proto annotated for protomolt's indexers works here without
-modification. Unhinted fields are inferred from the descriptor. Ambiguity is
-an error naming the fix, never a guess: the vector field is either the one
-hinted `INDEX_FIELD_TYPE_VECTOR` or the only vector-shaped repeated float
-field, and the document id is either the field hinted `BLOCK_ROLE_DOC_ID` or
-a singular top-level field named `id`.
-
-Integer ids are used verbatim (zero is refused, because proto3 cannot
-distinguish it from unset). String ids reduce to the first 8 bytes of
-SHA-256 over their UTF-8 bytes, big-endian — part of the wire contract, so
-any client can predict the labels its documents will carry in search
-results.
-
-### Chunk scopes (parent / child)
-
-A message may declare one `BLOCK_ROLE_CHUNKS` repeated field. The vector
-must live inside that scope; the document id stays on the parent. Ingest
-explodes each wire message into N chunk rows (unique labels from the
-documented `parent_id‖chunk_id` hash) plus one parent record. Parent
-scalars are denormalized onto every chunk row so CEL filters see
-`title == "…" && chunks.ordinal == 0` without a join at query time.
-`SearchDocuments` hits report `id` (parent), `chunk_id`, and `parent_label`.
-`GetParents` resolves parent labels to the live chunk-row labels this node
-holds; unknown labels are omitted so a coordinator can fan the same set to
-every shard. `collapse_parents` ranks every admitted chunk and returns the
-first `k` distinct parents in score order — `k` is then top-k parents, not
-top-k chunks. `matched`/`total` stay in chunk rows. `parents.pb` persists
-the parent table beside `documents.pb`.
-
-### Sharded document collections
-
-The coordinator serves the same surface over many shards. Its
-`SearchDocuments` fans the query batch and the same CEL filter out to every
-shard, where each one evaluates the filter over its own stored fields and
-returns the exact top-k of the documents it admits; merging those lists by
-score is the exact collection top-k, because the union of per-shard admitted
-sets is the collection's admitted set. `matched`/`total` sum across shards.
-
-On a chunked collection a second stream overlaps that search: as the first
-shard's hits arrive, the coordinator fans `GetParents` for those parent
-labels to every shard and unions membership, so a chunk need not share a
-shard with its parent. `collapse_parents` asks each shard for its local
-top-k parents (every admitted chunk is ranked before collapse); the
-coordinator then re-collapses by parent, keeping the max score. That is the
-collection's exact top-k parents. The RPC does not return until every shard
-search and every parent lookup has finished.
-
-A filter can only mean one thing when every shard agrees what a document is,
-so schema agreement is part of collection binding: every shard must carry
-the same schema fingerprint, or none may carry any. A collection where some
-shards bind a schema and others do not — or bind different fingerprints —
-is refused by name (`mixed_schema`), and `SearchDocuments` on a plain vector
-collection is refused as `schema_required`. `ListNodes` reports each shard's
-fingerprint.
-
-Schema-bound shards need no calibration step to score comparably: an
-uncalibrated index encodes each row as a pure function of the row (fixed
-rotation and codebook from `(dim, bit_width)`, per-row scales), so the empty
-pair is itself a shared calibration and the merge is exact. `Split`/`Join`
-refuse id-mapped shards by name — turbovec's `IdMapIndex` does not expose
-the encoded rows those calls move — so a document collection is resharded by
-re-ingesting, for now.
 
 ## Run the coordinator
 
