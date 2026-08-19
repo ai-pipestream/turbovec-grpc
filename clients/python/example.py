@@ -1,36 +1,35 @@
 #!/usr/bin/env python3
-"""Search one collection that is spread over several machines.
+"""One index on one node, in the shape of the embedded turbovec API.
 
-Brings up nothing itself: point it at a running coordinator and it will
-calibrate the collection, fill it, split it across the nodes the coordinator
-knows about, and search it. Nothing below mentions a shard.
+Brings up nothing itself: point it at a running node and it will create an
+id-mapped index, fill it, search it, remove a row, and flush it — the same
+calls the embedded ``turbovec`` package's ``IdMapIndex`` takes, against a
+server instead of your own process.
 
-    .venv/bin/python example.py                       # 127.0.0.1:50050
-    .venv/bin/python example.py 127.0.0.1:50050
-    .venv/bin/python example.py 127.0.0.1:50050 20000 128
+    .venv/bin/python example.py                       # 127.0.0.1:50051
+    .venv/bin/python example.py 127.0.0.1:50051
+    .venv/bin/python example.py 127.0.0.1:50051 20000 128
 
-See the README for the three commands that start the servers first.
+Start the node first (from the repo root). Retry-safe ingest and flush both
+need durable storage, so give it a data dir rather than the ephemeral demo
+mode:
+
+    TURBOVEC_DATA_DIR=/tmp/turbovec-demo cargo run --release --bin turbovec-grpc
 """
 
 import random
 import sys
 import time
 
-import grpc
+from turbovec_client import CollectionError, create_index
 
-from turbovec_client import CollectionError, connect
-from turbovec_client._stubs import turbovec_pb2, turbovec_pb2_grpc
-
-DEFAULT_ADDR = "127.0.0.1:50050"
+DEFAULT_ADDR = "127.0.0.1:50051"
 DEFAULT_VECTORS = 20_000
 DEFAULT_DIM = 128
 BIT_WIDTH = 4
 TOP_K = 10
 QUERIES = 200
 WARMUP_QUERIES = 50
-# turbovec's fit wants a uniform random draw of the rows the collection will
-# hold, and enough of them: ~1024 rows matches a fit over a whole corpus.
-CALIBRATION_ROWS = 1024
 
 
 def rows(rng, dim, count):
@@ -48,59 +47,30 @@ def main():
     dim = int(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT_DIM
     rng = random.Random(7)
 
-    with connect(address) as collection:
-        print(f"turbovec collection - connected to {address}\n")
+    # Id-mapped, so rows carry our own ids and remove works. The same calls
+    # against create_index(address, dim, BIT_WIDTH) give a positional index,
+    # whose rows are named by slot instead.
+    with create_index(address, dim, BIT_WIDTH, id_mapped=True) as index:
+        print(f"turbovec index - connected to {address}\n")
 
-        # Each node needs an empty index for the collection to be made of.
-        # Creating one is a node-level call, not a collection-level one: the
-        # collection is what you search, and it is assembled out of indexes
-        # that already exist.
-        health = collection.health()
-        nodes = [node.address for node in health.nodes]
-        for address in nodes:
-            _ensure_index(address, dim)
-        health = collection.health()
-
-        print(f"[1] the collection is {len(nodes)} node(s)")
-        for node in health.nodes:
-            print(f"    {node.address}  {node.rows:,} rows  {node.error or 'ok'}")
-        if not health.servable:
-            print(f"    not servable: {health.error}", file=sys.stderr)
-            sys.exit(1)
-
-        # One calibration for the whole collection. Without it the nodes would
-        # each encode into their own coordinate system and the coordinator
-        # would refuse to merge them, which is the point.
-        print(f"\n[2] fitting one calibration from {CALIBRATION_ROWS:,} sample rows")
-        collection.calibrate(rows(rng, dim, CALIBRATION_ROWS), dim, BIT_WIDTH)
-        print("    committed to every node")
-
-        # Fill the first node, then spread the rows over all of them. Filling
-        # one and splitting is the lifecycle this layer is for: a collection
-        # outgrows a machine, and moves onto several without being rebuilt.
-        print(f"\n[3] indexing {n_vectors:,} vectors of dim {dim} at {BIT_WIDTH}-bit")
+        print(f"[1] indexing {n_vectors:,} vectors of dim {dim} at {BIT_WIDTH}-bit")
+        vectors = rows(rng, dim, n_vectors)
+        ids = [1_000_000 + i for i in range(n_vectors)]
         started = time.perf_counter()
-        _fill(nodes[0], health.nodes[0].index_id, rows(rng, dim, n_vectors), dim)
+        # add keeps the operation id it used; if the response were lost,
+        # repeating the call with operation_id=op would answer the committed
+        # result instead of doubling the rows.
+        op = index.add_with_ids(vectors, ids)
         elapsed = time.perf_counter() - started
-        print(f"    added {n_vectors:,} in {elapsed:.2f}s")
+        print(f"    added {len(index):,} in {elapsed:.2f}s  (operation {op})")
 
-        if len(nodes) > 1:
-            print(f"\n[4] splitting across {len(nodes)} nodes")
-            spread = collection.split(source=nodes[0], targets=nodes)
-            print(f"    rows per node: {', '.join(f'{r:,}' for r in spread)}")
-        else:
-            print("\n[4] one node configured, so there is nothing to split across")
-
-        health = collection.health()
-        print(f"    collection holds {health.rows:,} rows, servable={health.servable}")
-
-        print(f"\n[5] top-{TOP_K} search, one query at a time")
+        print(f"\n[2] top-{TOP_K} search, one query at a time")
         for query in rows(rng, dim, WARMUP_QUERIES):
-            collection.search(query, k=TOP_K)
+            index.search(query, k=TOP_K)
         latencies = []
         for query in rows(rng, dim, QUERIES):
             started = time.perf_counter_ns()
-            found = collection.search(query, k=TOP_K)
+            found = index.search(query, k=TOP_K)
             latencies.append(time.perf_counter_ns() - started)
         latencies.sort()
         total_s = sum(latencies) / 1e9
@@ -112,70 +82,22 @@ def main():
         )
         print(f"    best neighbour: id {found[0].id}, score {found[0].score:.4f}")
 
-        print("\n[6] a batch of 4 queries")
-        for i, result in enumerate(collection.search(rows(rng, dim, 4), k=TOP_K)):
-            print(f"    query {i} -> {len(result)} neighbours, best {result[0].score:.4f}")
+        # A stored row is its own best neighbour.
+        print("\n[3] searching for a stored row")
+        found = index.search(vectors[0], k=TOP_K)
+        print(f"    row {ids[0]}'s top neighbour is itself: {found[0].id == ids[0]}")
 
-        if len(nodes) > 1:
-            print(f"\n[7] joining back onto {nodes[0]}")
-            print(f"    combined index holds {collection.join(nodes[0]):,} rows")
-            found = collection.search(rows(rng, dim, 1)[0], k=TOP_K)
-            print(f"    still searchable: {len(found)} neighbours")
+        print("\n[4] removing that row")
+        print(f"    removed {ids[0]}: {index.remove(ids[0])}")
+        print(f"    again (already gone): {index.remove(ids[0])}")
+        found = index.search(vectors[0], k=TOP_K)
+        print(f"    top neighbour now: id {found[0].id}, score {found[0].score:.4f}")
 
-
-def _node_stubs(channel):
-    """The separately authorizable node data and control plane stubs."""
-    return (
-        turbovec_pb2_grpc.TurboVecQueryStub(channel),
-        turbovec_pb2_grpc.TurboVecAdminStub(channel),
-    )
-
-
-def _ensure_index(address, dim):
-    """Give a node one empty positional index, if it has none yet.
-
-    The coordinator resolves a node configured without an index handle to its
-    only open index, so leaving a node with none, or with several, is what it
-    refuses as ambiguous.
-    """
-    with grpc.insecure_channel(_bare(address)) as channel:
-        query, admin = _node_stubs(channel)
-        if query.ListIndexes(turbovec_pb2.ListIndexesRequest()).indexes:
-            return
-        admin.CreateIndex(
-            turbovec_pb2.CreateIndexRequest(
-                dim=dim,
-                bit_width=BIT_WIDTH,
-                kind=turbovec_pb2.INDEX_KIND_POSITIONAL,
-            )
-        )
-
-
-def _fill(address, index_id, vectors, dim):
-    """Stream vectors into one node's index.
-
-    Filling is a node-level operation, so it uses the node stub rather than the
-    collection handle: the collection is what you search, not what you write
-    into row by row.
-    """
-    # Keep each frame well under the 4 MB default gRPC message limit.
-    per_frame = max(1, 3_000_000 // (dim * 4))
-
-    def frames():
-        for start in range(0, len(vectors), per_frame):
-            chunk = vectors[start : start + per_frame]
-            flat = [c for row in chunk for c in row]
-            yield turbovec_pb2.AddRequest(index_id=index_id, dim=dim, vectors=flat)
-
-    with grpc.insecure_channel(_bare(address)) as channel:
-        _, admin = _node_stubs(channel)
-        admin.Add(frames())
-
-
-def _bare(address):
-    """Strip the scheme the coordinator dials with; grpc.insecure_channel
-    wants a bare host:port."""
-    return address.removeprefix("http://").removeprefix("https://")
+        # flush() is write(path, durable=True) against a server: the node
+        # owns the path, so the client names no file. The flushed generation
+        # is what the node restores at startup.
+        print("\n[5] flushing")
+        print(f"    durable generation {index.flush()} holds {len(index):,} rows")
 
 
 if __name__ == "__main__":
@@ -183,6 +105,6 @@ if __name__ == "__main__":
         main()
     except CollectionError as error:
         # The server refuses rather than degrading, so a failure here names
-        # what is wrong with the collection instead of returning less of it.
+        # what is wrong instead of returning less of the answer.
         print(f"\nrefused ({error.name}): {error.detail}", file=sys.stderr)
         sys.exit(1)

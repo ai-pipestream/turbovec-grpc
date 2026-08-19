@@ -1,7 +1,18 @@
-"""A thin Python client for a turbovec collection.
+"""A thin Python client for turbovec over gRPC.
 
-One collection, however many machines it is spread over. Connect to a
-coordinator and search it as a single index:
+Two shapes, one engine. One index on one node reads like the embedded
+``turbovec`` package's ``TurboQuantIndex``:
+
+    from turbovec_client import create_index
+
+    with create_index("127.0.0.1:50051", dim=128, bit_width=4) as index:
+        index.add(vectors)
+        for neighbour in index.search(query, k=10):
+            print(neighbour.id, neighbour.score)
+        index.flush()
+
+One collection, however many machines it is spread over, reached through a
+coordinator and searched as a single index:
 
     from turbovec_client import connect
 
@@ -9,10 +20,9 @@ coordinator and search it as a single index:
         for neighbour in collection.search(query, k=10):
             print(neighbour.id, neighbour.score)
 
-The scores are the scores a single index holding every row would have
-returned, bit for bit, and nothing in this API says how many nodes there are
-or which one a row came from. The two calls that do name nodes,
-:meth:`~turbovec_client.Collection.split` and
+Either way the scores are the scores a single embedded index holding every
+row would have returned, bit for bit. The two collection calls that do name
+nodes, :meth:`~turbovec_client.Collection.split` and
 :meth:`~turbovec_client.Collection.join`, exist to move rows between them.
 
 The generated protobuf stubs are build artifacts and are not shipped in the
@@ -21,14 +31,20 @@ import below fails with instructions if you have not.
 """
 
 from ._collection import Collection, CollectionError, Health, Neighbour, Node, connect
+from ._index import ADD_CHUNK_COORDS, Index, IndexInfo, create_index, open_index
 
 __all__ = [
+    "ADD_CHUNK_COORDS",
     "Collection",
     "CollectionError",
     "Health",
+    "Index",
+    "IndexInfo",
     "Neighbour",
     "Node",
     "connect",
+    "create_index",
+    "open_index",
 ]
 
 __version__ = "0.1.0"
