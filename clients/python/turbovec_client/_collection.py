@@ -134,7 +134,7 @@ class Collection:
         """
         if k < 1:
             raise ValueError("k must be at least 1")
-        queries, batched = _flatten(vectors)
+        queries, batched, _ = _flatten(vectors)
         request = coordinator_pb2.CollectionSearchRequest(queries=queries, k=k)
         try:
             response = self._stub.Search(request)
@@ -158,7 +158,7 @@ class Collection:
         Every node's index must still be empty: a calibration is committed at
         construction, not applied to rows already encoded under another one.
         """
-        rows, _ = _flatten(sample)
+        rows, _, _ = _flatten(sample)
         request = coordinator_pb2.FitCalibrationRequest(
             sample=rows, dim=dim, bit_width=bit_width
         )
@@ -243,15 +243,22 @@ def _row_id(neighbour) -> int:
 
 
 def _flatten(vectors):
-    """Accept one row or a sequence of rows; return (flat floats, was_batch)."""
+    """Accept one row or a sequence of rows; return (flat floats, was_batch,
+    row width). Anything sequence-like works, and anything with ``tolist()``
+    (a numpy array, say) is converted through it, so numpy is welcome but
+    never required."""
+    if hasattr(vectors, "tolist"):
+        vectors = vectors.tolist()
     rows = list(vectors)
     if not rows:
         raise ValueError("no vectors given")
     if isinstance(rows[0], (int, float)):
-        return [float(x) for x in rows], False
+        return [float(x) for x in rows], False, len(rows)
     flat = []
     width = None
     for i, row in enumerate(rows):
+        if hasattr(row, "tolist"):
+            row = row.tolist()
         row = [float(x) for x in row]
         if width is None:
             width = len(row)
@@ -261,7 +268,7 @@ def _flatten(vectors):
                 "every row must be the same width"
             )
         flat.extend(row)
-    return flat, True
+    return flat, True, width
 
 
 def connect(address: str, channel_options=None) -> Collection:

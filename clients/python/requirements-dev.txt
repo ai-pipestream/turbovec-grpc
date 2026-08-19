@@ -1,3 +1,5 @@
-# Only needed to generate the stubs; the package itself needs grpcio alone.
+# grpcio-tools is needed once, to generate the stubs; the package itself
+# needs grpcio alone. pytest runs the integration tests in tests/.
 grpcio>=1.60
 grpcio-tools>=1.60
+pytest>=8
