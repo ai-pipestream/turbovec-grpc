@@ -119,7 +119,28 @@ A fresh node can announce itself instead of being pre-listed: start it with
 `TURBOVEC_REGISTER_INTERVAL_MS` (default 30 s). The coordinator dials it back,
 holds it in the spare pool persisted with the topology, and reports it through
 `ListNodes`. Registration never changes the serving topology: rows reach a
-spare only when an operator names it as a `Split` or `Join` target.
+spare only when an operator names it as a `Split` or `Join` target — or when
+the autoscaler does.
+
+### Grow-only autoscaler
+
+Set `TURBOVEC_AUTOSCALE_MAX_ROWS_PER_SHARD` and the coordinator keeps each
+serving shard under that row count itself (unset means off; the autoscaler
+never runs by default). Every `TURBOVEC_AUTOSCALE_INTERVAL_MS` (default
+30 000) it checks the collection, and when one shard is over the ceiling and
+the spare pool is stocked, it splits that shard onto its own node and one
+spare with an even row split, so only half the rows cross the network. The
+split rides the exact operator `Split` path: targets are validated and
+flushed before the new topology generation publishes, and in-flight searches
+finish on the old generation. Once the new generation serves, the quiesced
+source index is dropped and its node returns to empty-spare state. With no
+spare registered, or with the collection not servable, it logs and waits.
+An operator `Split` or `Join` that lands mid-tick wins: the autoscaler
+abandons and tears down the split it was staging.
+
+The autoscaler only ever grows the collection. It never moves a live shard
+for balance, and scale-in (`Join`) stays operator-driven. The operator's job
+under autoscaling is keeping the spare pool stocked.
 
 ## Production behavior
 
