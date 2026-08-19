@@ -75,6 +75,21 @@ service Coordinator {
   // success the collection is rebound to the single resulting shard, and
   // the sources are left alone.
   rpc Join(JoinRequest) returns (JoinResponse);
+
+  // Announces a node to the coordinator. A fresh container calls this on
+  // startup (and periodically re-announces) to say "I am reachable at this
+  // address and ready to hold rows".
+  //
+  // Registration never changes the serving topology. A node that is not
+  // already a member joins the persisted spare pool, where it waits until
+  // an operator names it as a Split or Join target. The coordinator dials
+  // the address back before accepting it: an address it cannot reach is
+  // refused now, when the operator can still read the node's logs, rather
+  // than failing a Split later.
+  //
+  // The call is idempotent: re-announcing an address already in the pool,
+  // or one already serving a shard, succeeds and changes nothing.
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
 }
 
 // ShardRef names one shard: which node, and which index on it.
@@ -105,6 +120,25 @@ message ShardStatus {
   // collection. Otherwise the named reason it does not, in the same
   // wording Search would fail with.
   string error = 4;
+
+  reserved 5;
+  reserved "schema_fingerprint";
+}
+
+// SpareNodeStatus is one registered-but-unassigned node, as the
+// coordinator found it on this call.
+message SpareNodeStatus {
+  // Node address, as it registered.
+  string address = 1;
+
+  // Number of indexes the node holds open. Usually zero for a fresh
+  // container; a spare holding indexes is not an error, they are simply
+  // not part of this collection.
+  uint64 indexes = 2;
+
+  // Empty when the node answered the probe. Otherwise the reason it did
+  // not, so the pool listing shows a spare that died since it registered.
+  string error = 3;
 }
 
 // ListNodesRequest asks for the collection's shard table.
@@ -127,6 +161,30 @@ message ListNodesResponse {
 
   // Atomic topology generation this table belongs to.
   uint64 topology_generation = 5;
+
+  // Registered nodes not serving any shard, in registration order, each
+  // probed on this call like the shards are. These are the candidate
+  // targets for the next Split or Join.
+  repeated SpareNodeStatus spares = 6;
+}
+
+// RegisterNodeRequest announces one node.
+message RegisterNodeRequest {
+  // The address the coordinator should dial the node at. Must be the
+  // node's reachable address, not its listen address: a node listening on
+  // 0.0.0.0 has to say which of its names the coordinator can use.
+  string address = 1;
+}
+
+// RegisterNodeResponse says what the coordinator now knows the node as.
+message RegisterNodeResponse {
+  // True when the address already serves a shard (primary or replica) of
+  // the collection. Such a node is not added to the spare pool: it is
+  // already placed.
+  bool member = 1;
+
+  // Active topology generation at the time of registration.
+  uint64 topology_generation = 2;
 }
 
 // CollectionSearchRequest is a top-k search over the whole collection.

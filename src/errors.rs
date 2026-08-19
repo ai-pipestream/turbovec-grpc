@@ -51,14 +51,6 @@ pub const ROW_COUNT_MISMATCH: &str = "row_count_mismatch";
 /// cannot use.
 pub const INVALID_CALIBRATION: &str = "invalid_calibration";
 
-/// Shards do not agree on one bound schema fingerprint, so a filter over
-/// the planned fields cannot mean one thing across the collection.
-pub const MIXED_SCHEMA: &str = "mixed_schema";
-
-/// The call needs a schema-bound collection and this collection's shards
-/// carry no bound schema.
-pub const SCHEMA_REQUIRED: &str = "schema_required";
-
 /// Every name above, so a caller can recognise one it did not raise itself.
 const NAMES: &[&str] = &[
     MIXED_CALIBRATION,
@@ -72,8 +64,6 @@ const NAMES: &[&str] = &[
     LABELLED_INDEX_IMMUTABLE,
     ROW_COUNT_MISMATCH,
     INVALID_CALIBRATION,
-    MIXED_SCHEMA,
-    SCHEMA_REQUIRED,
 ];
 
 /// Whether a status message is one of these named refusals.
