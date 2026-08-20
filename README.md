@@ -168,4 +168,6 @@ the wire-compatibility policy, and the autoscaling roadmap.
 Examples are available for Java, TypeScript, Python, Go, and Rust under
 [`examples/`](examples). They use the separated query and admin services. The
 Rust gRPC engine and wire contract are the release gate; the packaged Python
-wrapper comes afterward.
+wrapper comes afterward. A compose walkthrough under
+[`examples/compose-demo/`](examples/compose-demo) loads a million vectors into
+a one-node collection and lets the autoscaler split it across three.

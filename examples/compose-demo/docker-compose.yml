@@ -1,0 +1,104 @@
+# One coordinator and three durable nodes, built once from the repo root.
+#
+# The coordinator's topology is durable, which pins every startup shard to an
+# index id and a durable generation, so a one-shot `setup` container creates
+# and flushes node1's index first and hands the entry to the coordinator
+# through the setup-data volume. The loader is profiled so a plain `up`
+# starts only the cluster. node2 and node3 join the spare pool whenever they
+# are started; the autoscaler grows the collection onto them. The runbook is
+# README.md.
+
+services:
+  node1:
+    build:
+      context: ../..
+    image: turbovec-grpc:compose-demo
+    environment:
+      TURBOVEC_GRPC_ADDR: 0.0.0.0:50051
+      TURBOVEC_DATA_DIR: /var/lib/turbovec
+      TURBOVEC_COORD_ADDR: coordinator:50050
+      TURBOVEC_ADVERTISE_ADDR: node1:50051
+      TURBOVEC_REGISTER_INTERVAL_MS: "2000"
+    ports:
+      - "50051:50051"
+    volumes:
+      - node1-data:/var/lib/turbovec
+
+  node2:
+    image: turbovec-grpc:compose-demo
+    environment:
+      TURBOVEC_GRPC_ADDR: 0.0.0.0:50051
+      TURBOVEC_DATA_DIR: /var/lib/turbovec
+      TURBOVEC_COORD_ADDR: coordinator:50050
+      TURBOVEC_ADVERTISE_ADDR: node2:50051
+      TURBOVEC_REGISTER_INTERVAL_MS: "2000"
+    volumes:
+      - node2-data:/var/lib/turbovec
+
+  node3:
+    image: turbovec-grpc:compose-demo
+    environment:
+      TURBOVEC_GRPC_ADDR: 0.0.0.0:50051
+      TURBOVEC_DATA_DIR: /var/lib/turbovec
+      TURBOVEC_COORD_ADDR: coordinator:50050
+      TURBOVEC_ADVERTISE_ADDR: node3:50051
+      TURBOVEC_REGISTER_INTERVAL_MS: "2000"
+    volumes:
+      - node3-data:/var/lib/turbovec
+
+  setup:
+    image: python:3.12-slim
+    depends_on:
+      - node1
+    environment:
+      DEMO_NODE: http://node1:50051
+      SETUP_ENTRY: node1:50051
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ../../clients/python:/client:ro
+      - .:/demo:ro
+      - setup-data:/setup
+    entrypoint: ["sh", "/demo/run_setup.sh"]
+
+  coordinator:
+    image: turbovec-grpc:compose-demo
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    entrypoint:
+      - sh
+      - -c
+      - 'TURBOVEC_COORD_NODES="$$(cat /setup/node-entry)" exec /usr/local/bin/turbovec-coordinator'
+    environment:
+      TURBOVEC_COORD_ADDR: 0.0.0.0:50050
+      TURBOVEC_COORD_STATE: /var/lib/turbovec/topology.json
+      TURBOVEC_AUTOSCALE_MAX_ROWS_PER_SHARD: "250000"
+      TURBOVEC_AUTOSCALE_INTERVAL_MS: "5000"
+    ports:
+      - "50050:50050"
+    volumes:
+      - coord-data:/var/lib/turbovec
+      - setup-data:/setup
+
+  loader:
+    image: python:3.12-slim
+    profiles: ["demo"]
+    depends_on:
+      - node1
+      - coordinator
+    environment:
+      DEMO_NODE: http://node1:50051
+      DEMO_COORDINATOR: http://coordinator:50050
+      DEMO_ROWS: "1000000"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ../../clients/python:/client:ro
+      - .:/demo:ro
+    entrypoint: ["sh", "/demo/run_loader.sh"]
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  coord-data:
+  setup-data:
