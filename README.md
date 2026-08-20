@@ -4,7 +4,7 @@ Minimal CPU-only distributed vector search over
 [`turbovec`](https://github.com/RyanCodrai/turbovec).
 
 This is a sister project, not code embedded in the upstream engine. It uses the
-`ai-pipestream/turbovec` fork branch `turbovec-pipestream-s16`, whose small
+`ai-pipestream/turbovec` fork branch `turbovec-pipestream-s17`, whose small
 patch exposes live-floor streaming scans and chunk-boundary control. All gRPC,
 persistence, sharding, topology, and failure behavior lives here.
 
@@ -15,9 +15,9 @@ generation before deploying it over an older durable node.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s16` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) (this repo) | Network and sharding facade over the fork: durable node service plus an exact distributed coordinator | fork branch `turbovec-pipestream-s16` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s16` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s17` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) (this repo) | Network and sharding facade over the fork: durable node service plus an exact distributed coordinator | fork branch `turbovec-pipestream-s17` |
+| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s17` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 The repository builds two binaries:
