@@ -34,3 +34,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [build-dependencies]
 tonic-build = "0.12"
+
+[dev-dependencies]
+# VIBE benchmark harness (examples/vibe-bench): pure-Rust HDF5 reader and an
+# HTTPS downloader for the precomputed datasets. Dev-only so the server
+# binaries stay lean. hidefix reads the bulk datasets; its `static` feature
+# builds the bundled HDF5 C library, so no system libhdf5 is needed. The
+# hdf5 crate (same vendored build, already in hidefix's tree) reads the
+# root attributes, which hidefix's index API does not expose.
+hidefix = { version = "0.11", default-features = false, features = ["static"] }
+hdf5 = { version = "0.9", package = "hdf5-metno", default-features = false, features = ["static"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
