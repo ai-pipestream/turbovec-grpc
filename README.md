@@ -17,7 +17,7 @@ generation before deploying it over an older durable node.
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
 | [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s17` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
 | [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) (this repo) | Network and sharding facade over the fork: durable node service plus an exact distributed coordinator | fork branch `turbovec-pipestream-s17` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s17` |
+| [ai-pipestream/protomolt-search](https://github.com/ai-pipestream/protomolt-search) | Pipestream Search product: BM25, CEL, hybrid ranking, document semantics, and provider routing | fork branch `turbovec-pipestream-s17` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 The repository builds two binaries:
@@ -29,6 +29,11 @@ The coordinator owns the only global top-k heap. Shards stream candidates and
 receive a monotonically rising inclusive floor. A result is returned only when
 every shard certifies completion. There is no partial-result mode.
 
+The crate also exports `CoordinatorService` as a library. A search product may
+embed it and call the generated coordinator trait directly, avoiding a local
+product-to-coordinator socket while retaining the same optional standalone
+gRPC surface. Both transports execute the same exact heap and completion code.
+
 ## Scope
 
 This project is the network and sharding facade for local turbovec semantics.
@@ -36,14 +41,14 @@ It owns vector RPCs, deadlines and cancellation, global heaps and floors,
 completion, replicas, topology, persistence, and encoded-row movement. It does
 not own document schemas, CEL, BM25, text analysis, model serving, facets,
 hybrid ranking, or corpus pipelines. Those are search-product concerns owned by
-`turbovec-search` and ProtoMolt.
+Pipestream Search and ProtoMolt.
 
 An earlier revision of this repository carried a transitional `Documents`
 service (descriptor-derived schemas, stored scalar columns, CEL filtering,
 parent/chunk scopes). It has been removed: the facade accepts plain slot masks
 and allowlists compiled by its caller and never interprets a document schema.
-Git history preserves the implementation as migration material for
-`turbovec-search`. A shard generation persisted with a bound schema is not
+Git history preserves the implementation as migration material for Pipestream
+Search. A shard generation persisted with a bound schema is not
 restorable by this binary; rebuild it as a plain vector shard.
 
 ## Build and test
@@ -112,6 +117,13 @@ cargo run --release --locked --bin turbovec-coordinator
 Targets are fully validated and flushed before a new topology generation is
 published. The coordinator state survives restart and cannot silently fall
 back to the startup table.
+
+`Coordinator.Search` can order ties by persisted external label and filter by
+those labels. The presence bit distinguishes an empty admitted set from no
+filter. Product callers use label order because labels survive redistribution;
+the historical shard/slot tie order remains the default for existing clients.
+An optional initial floor and tie-complete response support product-side gates
+without teaching this facade about documents.
 
 A fresh node can announce itself instead of being pre-listed: start it with
 `TURBOVEC_COORD_ADDR` (and `TURBOVEC_ADVERTISE_ADDR` when it listens on

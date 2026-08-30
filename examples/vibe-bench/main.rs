@@ -636,6 +636,7 @@ async fn run_coordinator(
             .search(CollectionSearchRequest {
                 queries: ds.queries[q * ds.dim..(q + 1) * ds.dim].to_vec(),
                 k: fetch as u32,
+                ..Default::default()
             })
             .await?;
     }
@@ -646,6 +647,7 @@ async fn run_coordinator(
         let request = CollectionSearchRequest {
             queries: ds.queries[q * ds.dim..(q + 1) * ds.dim].to_vec(),
             k: fetch as u32,
+            ..Default::default()
         };
         let t = Instant::now();
         let response = coordinator.search(request).await?.into_inner();

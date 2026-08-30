@@ -17,8 +17,8 @@ use turbovec_grpc::proto::coordinator_client::CoordinatorClient;
 use turbovec_grpc::proto::turbo_vec_client::TurboVecClient;
 use turbovec_grpc::proto::{
     import_rows_request, AddRequest, Calibration, CollectionSearchRequest, CreateIndexRequest,
-    ExportRowsRequest, ImportRowsRequest, ImportRowsStart, IndexKind, JoinRequest, RowBlock,
-    SearchRequest, SetCalibrationRequest, ShardRef, SplitRequest,
+    ExportRowsRequest, ImportRowsRequest, ImportRowsStart, IndexKind, JoinRequest, LabelBitmap,
+    RowBlock, SearchRequest, SetCalibrationRequest, ShardRef, SplitRequest,
 };
 use turbovec_grpc::{CoordinatorService, IndexStore, NodeTable, ShardConfig, TurboVecService};
 
@@ -246,6 +246,7 @@ async fn distributed_ranking(
         .search(CollectionSearchRequest {
             queries: queries.to_vec(),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -418,6 +419,7 @@ async fn split_search_join_all_equal_the_monolithic_index() {
         .search(CollectionSearchRequest {
             queries: queries.clone(),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -434,6 +436,120 @@ async fn split_search_join_all_equal_the_monolithic_index() {
             );
         }
     }
+
+    // A product-level caller needs ties to follow stable document identity,
+    // not the current shard layout. A zero query ties every row exactly; the
+    // smallest labels must survive even though Split scattered them across
+    // three independently scanned heaps.
+    let stable_ties = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let tie_labels: Vec<u64> = stable_ties.results[0]
+        .neighbours
+        .iter()
+        .map(|neighbour| neighbour.label.expect("split shards are labelled"))
+        .collect();
+    assert_eq!(tie_labels, (0..u64::from(K)).collect::<Vec<_>>());
+
+    let complete_ties = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            tie_complete: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let complete_labels: Vec<u64> = complete_ties.results[0]
+        .neighbours
+        .iter()
+        .map(|neighbour| neighbour.label.expect("split shards are labelled"))
+        .collect();
+    assert_eq!(complete_labels, (0..ROWS as u64).collect::<Vec<_>>());
+
+    // Stable-label filtering is independent of the rows' new shard and slot.
+    // Presence is explicit so an empty admitted set means no matches rather
+    // than the unfiltered collection.
+    let admitted = vec![5, 137, 599];
+    let filtered = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            allowed_labels: admitted.clone(),
+            has_allowed_labels: true,
+            initial_floor: Some(0.0),
+            tie_complete: false,
+            allowed_label_bitmaps: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let filtered_labels: Vec<u64> = filtered.results[0]
+        .neighbours
+        .iter()
+        .map(|neighbour| neighbour.label.expect("filtered shards are labelled"))
+        .collect();
+    assert_eq!(filtered_labels, admitted);
+
+    // Packed ranges are the scalable form used when another service owns
+    // document predicates. Their boundaries are independent of vector shard
+    // boundaries and may end on partial bytes.
+    let mut bitmaps = Vec::new();
+    for &(base, count) in &[(0u64, 129u64), (129, 391), (520, 80)] {
+        let mut bits = vec![0u8; count.div_ceil(8) as usize];
+        for &label in &admitted {
+            if label >= base && label < base + count {
+                let local = (label - base) as usize;
+                bits[local / 8] |= 1 << (local % 8);
+            }
+        }
+        bitmaps.push(LabelBitmap {
+            base_label: base,
+            label_count: count,
+            bits,
+        });
+    }
+    let bitmap_filtered = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            has_allowed_labels: true,
+            allowed_label_bitmaps: bitmaps,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let bitmap_labels: Vec<u64> = bitmap_filtered.results[0]
+        .neighbours
+        .iter()
+        .map(|neighbour| neighbour.label.expect("filtered shards are labelled"))
+        .collect();
+    assert_eq!(bitmap_labels, admitted);
+
+    let empty = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            has_allowed_labels: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(empty.results[0].neighbours.is_empty());
 
     // The collection is now three shards and reports itself so.
     let listed = coordinator
@@ -572,6 +688,7 @@ async fn mixed_calibration_is_refused_by_name() {
         .search(CollectionSearchRequest {
             queries: Lcg(5).rows(1),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -605,6 +722,7 @@ async fn dimension_mismatch_is_refused_by_name() {
         .search(CollectionSearchRequest {
             queries: Lcg(6).rows(1),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -765,6 +883,7 @@ async fn an_unreachable_shard_fails_the_search() {
         .search(CollectionSearchRequest {
             queries: queries.clone(),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -813,6 +932,7 @@ async fn a_replica_is_used_only_at_the_required_generation() {
         .search(CollectionSearchRequest {
             queries: queries.clone(),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap_err();

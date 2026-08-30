@@ -195,7 +195,8 @@ struct Pinned {
 ///
 /// [`BinaryHeap`] exposes its greatest item. This ordering deliberately makes
 /// the worst candidate greatest: lower scores lose, then later shards and
-/// larger slots lose ties. The heap root is therefore the current global
+/// larger slots lose historical ties, or larger stable labels lose when the
+/// caller selects label order. The heap root is therefore the current global
 /// k-th candidate and its score is the safe floor broadcast to every shard.
 #[derive(Clone)]
 struct HeapCandidate {
@@ -203,6 +204,9 @@ struct HeapCandidate {
     shard_rank: usize,
     slot: u64,
     label: Option<u64>,
+    /// Stable product-level tie key when the caller requested label order.
+    /// `None` retains the coordinator's historical shard/slot order.
+    label_order_key: Option<u64>,
 }
 
 impl PartialEq for HeapCandidate {
@@ -224,9 +228,20 @@ impl Ord for HeapCandidate {
         other
             .score
             .total_cmp(&self.score)
+            .then_with(|| self.label_order_key.cmp(&other.label_order_key))
             .then_with(|| self.shard_rank.cmp(&other.shard_rank))
             .then_with(|| self.slot.cmp(&other.slot))
     }
+}
+
+/// Collection-level search semantics shared by every query in one batch.
+struct CollectionQueryOptions {
+    stable_label_order: bool,
+    allowed_labels: Vec<u64>,
+    allowed_label_bitmaps: Vec<crate::proto::LabelBitmap>,
+    has_allowed_labels: bool,
+    initial_floor: Option<f32>,
+    tie_complete: bool,
 }
 
 /// Event forwarded by one shard response task to the query's collector.
@@ -515,6 +530,7 @@ impl CoordinatorService {
         pinned: &Pinned,
         vector: Vec<f32>,
         k: usize,
+        options: Arc<CollectionQueryOptions>,
     ) -> Result<CollectionQueryResult, Status> {
         let event_capacity = (pinned.shards.len() * 4).max(16);
         let (event_tx, mut event_rx) = mpsc::channel(event_capacity);
@@ -528,8 +544,11 @@ impl CoordinatorService {
                     StartStreamSearch {
                         index_id: shard.index_id.clone(),
                         vector: vector.clone(),
-                        initial_floor: None,
+                        initial_floor: options.initial_floor,
                         request_id: request_id.clone(),
+                        allowed_labels: options.allowed_labels.clone(),
+                        has_allowed_labels: options.has_allowed_labels,
+                        allowed_label_bitmaps: options.allowed_label_bitmaps.clone(),
                     },
                 )),
             });
@@ -577,7 +596,8 @@ impl CoordinatorService {
         drop(event_tx);
 
         let mut heap = BinaryHeap::with_capacity(k + 1);
-        let mut published_floor = f32::NEG_INFINITY;
+        let mut tie_candidates = Vec::new();
+        let mut published_floor = options.initial_floor.unwrap_or(f32::NEG_INFINITY);
         let mut completed = vec![false; pinned.shards.len()];
         let mut remaining = pinned.shards.len();
 
@@ -607,6 +627,12 @@ impl CoordinatorService {
                             )));
                         }
                         let labelled = !batch.labels.is_empty();
+                        if options.stable_label_order && !labelled && !batch.scores.is_empty() {
+                            return Err(Status::failed_precondition(format!(
+                                "shard {} returned unlabelled candidates but stable label order was requested",
+                                pinned.shards[shard_rank].address
+                            )));
+                        }
                         let shard = &pinned.shards[shard_rank];
                         for (rank, (score, slot)) in
                             batch.scores.into_iter().zip(batch.slots).enumerate()
@@ -622,7 +648,13 @@ impl CoordinatorService {
                                 shard_rank,
                                 slot,
                                 label: labelled.then(|| batch.labels[rank]),
+                                label_order_key: options
+                                    .stable_label_order
+                                    .then(|| batch.labels[rank]),
                             };
+                            if options.tie_complete {
+                                tie_candidates.push(candidate.clone());
+                            }
                             if heap.len() < k {
                                 heap.push(candidate);
                             } else if heap.peek().is_some_and(|worst| candidate < *worst) {
@@ -635,6 +667,9 @@ impl CoordinatorService {
                             let floor = heap.peek().expect("a full top-k heap has a root").score;
                             if floor > published_floor {
                                 published_floor = floor;
+                                if options.tie_complete {
+                                    tie_candidates.retain(|candidate| candidate.score >= floor);
+                                }
                                 for (rank, sender) in outbound.iter().enumerate() {
                                     if completed[rank] {
                                         continue;
@@ -699,7 +734,14 @@ impl CoordinatorService {
             }
         }
 
-        let mut candidates = heap.into_vec();
+        let mut candidates = if options.tie_complete {
+            if let Some(boundary) = heap.peek().map(|candidate| candidate.score) {
+                tie_candidates.retain(|candidate| candidate.score >= boundary);
+            }
+            tie_candidates
+        } else {
+            heap.into_vec()
+        };
         candidates.sort();
         tracing::info!(
             request_id = %request_id,
@@ -1350,7 +1392,30 @@ impl Coordinator for CoordinatorService {
                 self.limits.max_k
             )));
         }
+        if !req.has_allowed_labels
+            && (!req.allowed_labels.is_empty() || !req.allowed_label_bitmaps.is_empty())
+        {
+            return Err(Status::invalid_argument(
+                "allowed label filters require has_allowed_labels=true",
+            ));
+        }
+        if !req.allowed_labels.is_empty() && !req.allowed_label_bitmaps.is_empty() {
+            return Err(Status::invalid_argument(
+                "allowed_labels and allowed_label_bitmaps are mutually exclusive",
+            ));
+        }
+        crate::service::validate_label_bitmaps(&req.allowed_label_bitmaps)?;
+        if req.initial_floor.is_some_and(f32::is_nan) {
+            return Err(Status::invalid_argument("initial_floor must not be NaN"));
+        }
         let pinned = self.collection().await?;
+        if (req.stable_label_order || req.has_allowed_labels)
+            && pinned.shards.iter().any(|shard| !shard.info.labelled)
+        {
+            return Err(Status::failed_precondition(
+                "stable label order and filtering require every collection shard to be labelled",
+            ));
+        }
         if req.queries.is_empty() || !req.queries.len().is_multiple_of(pinned.dim) {
             return Err(Status::invalid_argument(format!(
                 "query buffer length {} is not a positive multiple of the collection dim {}",
@@ -1374,6 +1439,14 @@ impl Coordinator for CoordinatorService {
             .chunks_exact(pinned.dim)
             .map(<[f32]>::to_vec)
             .collect();
+        let options = Arc::new(CollectionQueryOptions {
+            stable_label_order: req.stable_label_order,
+            allowed_labels: req.allowed_labels,
+            allowed_label_bitmaps: req.allowed_label_bitmaps,
+            has_allowed_labels: req.has_allowed_labels,
+            initial_floor: req.initial_floor,
+            tie_complete: req.tie_complete,
+        });
         let mut results: Vec<Option<CollectionQueryResult>> = (0..nq).map(|_| None).collect();
         let mut tasks = tokio::task::JoinSet::new();
         let mut next = 0usize;
@@ -1382,15 +1455,18 @@ impl Coordinator for CoordinatorService {
                 let service = self.clone();
                 let pinned = Arc::clone(&pinned);
                 let vector = vectors[next].clone();
+                let options = Arc::clone(&options);
                 let query_index = next;
                 let timeout = self.limits.query_timeout;
                 tasks.spawn(async move {
-                    let result =
-                        tokio::time::timeout(timeout, service.stream_query(&pinned, vector, k))
-                            .await
-                            .map_err(|_| {
-                                Status::deadline_exceeded("distributed search deadline exceeded")
-                            })?;
+                    let result = tokio::time::timeout(
+                        timeout,
+                        service.stream_query(&pinned, vector, k, options),
+                    )
+                    .await
+                    .map_err(|_| {
+                        Status::deadline_exceeded("distributed search deadline exceeded")
+                    })?;
                     Ok::<_, Status>((query_index, result?))
                 });
                 next += 1;

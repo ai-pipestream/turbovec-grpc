@@ -23,7 +23,7 @@
 //! need `TurboQuantIndex`'s raw-parts accessors and `IdMapIndex` does not
 //! forward them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -45,9 +45,9 @@ use crate::proto::{
     AddRequest, AddResponse, Calibration, CreateIndexRequest, CreateIndexResponse,
     DropIndexRequest, DropIndexResponse, ExportRowsRequest, FlushRequest, FlushResponse,
     GetCalibrationRequest, GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse, IndexInfo,
-    IndexKind, ListIndexesRequest, ListIndexesResponse, QueryResult, RemoveRequest, RemoveResponse,
-    RowBlock, SearchRequest, SearchResponse, SetCalibrationRequest, StreamSearchBatch,
-    StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
+    IndexKind, LabelBitmap, ListIndexesRequest, ListIndexesResponse, QueryResult, RemoveRequest,
+    RemoveResponse, RowBlock, SearchRequest, SearchResponse, SetCalibrationRequest,
+    StreamSearchBatch, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
 };
 use crate::store::{Handle, Index, IndexStore, IngestRecord, Labels};
 
@@ -471,6 +471,72 @@ fn prepare_filter<'a>(index: &Index, allowlist: &'a [u64]) -> Result<Filter<'a>,
             Ok(Filter::Ids(allowlist))
         }
     }
+}
+
+pub(crate) fn validate_label_bitmaps(bitmaps: &[LabelBitmap]) -> Result<(), Status> {
+    let mut previous_end = 0u64;
+    for (position, bitmap) in bitmaps.iter().enumerate() {
+        if bitmap.label_count == 0 {
+            return Err(Status::invalid_argument(format!(
+                "allowed label bitmap {position} has zero labels"
+            )));
+        }
+        let expected = usize::try_from(bitmap.label_count.div_ceil(8)).map_err(|_| {
+            Status::invalid_argument(format!(
+                "allowed label bitmap {position} is too large for this process"
+            ))
+        })?;
+        if bitmap.bits.len() != expected {
+            return Err(Status::invalid_argument(format!(
+                "allowed label bitmap {position} has {} bytes for {} labels; expected {expected}",
+                bitmap.bits.len(),
+                bitmap.label_count
+            )));
+        }
+        let end = bitmap
+            .base_label
+            .checked_add(bitmap.label_count)
+            .ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "allowed label bitmap {position} range overflows u64"
+                ))
+            })?;
+        if position > 0 && bitmap.base_label < previous_end {
+            return Err(Status::invalid_argument(format!(
+                "allowed label bitmap {position} overlaps or is out of order"
+            )));
+        }
+        if !bitmap.label_count.is_multiple_of(8) {
+            let used = (bitmap.label_count % 8) as u8;
+            let unused_mask = !((1u8 << used) - 1);
+            if bitmap
+                .bits
+                .last()
+                .is_some_and(|byte| byte & unused_mask != 0)
+            {
+                return Err(Status::invalid_argument(format!(
+                    "allowed label bitmap {position} has set bits beyond label_count"
+                )));
+            }
+        }
+        previous_end = end;
+    }
+    Ok(())
+}
+
+fn label_in_bitmaps(bitmaps: &[LabelBitmap], label: u64) -> bool {
+    let position = bitmaps.partition_point(|bitmap| bitmap.base_label <= label);
+    let Some(bitmap) = position.checked_sub(1).and_then(|index| bitmaps.get(index)) else {
+        return false;
+    };
+    let offset = label - bitmap.base_label;
+    if offset >= bitmap.label_count {
+        return false;
+    }
+    let Ok(offset) = usize::try_from(offset) else {
+        return false;
+    };
+    bitmap.bits[offset / 8] & (1 << (offset % 8)) != 0
 }
 
 /// Search a slice of one or more queries against a prepared filter and return
@@ -998,6 +1064,24 @@ impl TurboVec for TurboVecService {
         let handle = self.handle(&start.index_id)?;
         let labels = self.store.labels(&start.index_id);
         self.validate_vector_frame(start.vector.len())?;
+        if !start.has_allowed_labels
+            && (!start.allowed_labels.is_empty() || !start.allowed_label_bitmaps.is_empty())
+        {
+            return Err(Status::invalid_argument(
+                "allowed label filters require has_allowed_labels=true",
+            ));
+        }
+        if !start.allowed_labels.is_empty() && !start.allowed_label_bitmaps.is_empty() {
+            return Err(Status::invalid_argument(
+                "allowed_labels and allowed_label_bitmaps are mutually exclusive",
+            ));
+        }
+        validate_label_bitmaps(&start.allowed_label_bitmaps)?;
+        if start.has_allowed_labels && labels.is_none() {
+            return Err(Status::failed_precondition(
+                "stable-label filtering requires a labelled positional index",
+            ));
+        }
         let initial_floor = start.initial_floor.unwrap_or(f32::NEG_INFINITY);
         if initial_floor.is_nan() {
             return Err(Status::invalid_argument("initial_floor must not be NaN"));
@@ -1082,11 +1166,31 @@ impl TurboVec for TurboVecService {
                     )));
                 }
 
-                let options = if initial_floor == f32::NEG_INFINITY {
+                let allow_mask = start.has_allowed_labels.then(|| {
+                    let labels = labels
+                        .as_ref()
+                        .expect("label presence validated before scan task");
+                    if start.allowed_label_bitmaps.is_empty() {
+                        let admitted: HashSet<u64> = start.allowed_labels.iter().copied().collect();
+                        labels
+                            .iter()
+                            .map(|label| admitted.contains(label))
+                            .collect::<Vec<_>>()
+                    } else {
+                        labels
+                            .iter()
+                            .map(|&label| label_in_bitmaps(&start.allowed_label_bitmaps, label))
+                            .collect::<Vec<_>>()
+                    }
+                });
+                let mut options = if initial_floor == f32::NEG_INFINITY {
                     SearchOptions::new()
                 } else {
                     SearchOptions::new().with_initial_threshold(initial_floor)
                 };
+                if let Some(mask) = allow_mask.as_deref() {
+                    options = options.with_mask(mask);
+                }
                 let mut floor_now = initial_floor;
                 let mut floor_raises = 0u64;
                 let summary = inner

@@ -197,6 +197,34 @@ message CollectionSearchRequest {
   uint32 k = 2;
 
   reserved 3;
+
+  // Break equal-score ties by stable external label rather than by the
+  // collection's current shard order and movable slot. Every shard must be
+  // labelled when this is true. Search products use this to preserve their
+  // public document-id order across split and join.
+  bool stable_label_order = 4;
+
+  // Optional stable external ids admitted to the scan. The explicit presence
+  // bit distinguishes an intentionally empty set from no filter. Every shard
+  // must be labelled when the filter is present.
+  repeated uint64 allowed_labels = 5;
+  bool has_allowed_labels = 6;
+
+  // Optional inclusive score floor known before the collection scan starts.
+  // It may reduce emissions or work but never changes which candidate at or
+  // above the requested floor is returned.
+  optional float initial_floor = 7;
+
+  // Return every row tied at the final k-th score. The response may contain
+  // more than k neighbours. This is required when a product reranks the
+  // vector gate and must not let the collection's arbitrary tie truncation
+  // decide which equal-score documents reach the next stage.
+  bool tie_complete = 8;
+
+  // Packed stable-label admitted sets, forwarded to every vector shard. This
+  // avoids expanding broad product filters to one uint64 per admitted row.
+  // Mutually exclusive with `allowed_labels`.
+  repeated LabelBitmap allowed_label_bitmaps = 9;
 }
 
 // Neighbour is one result row, identified without reference to sharding.
@@ -224,9 +252,9 @@ message Neighbour {
 // CollectionQueryResult is the global top-k for a single query, best
 // first.
 message CollectionQueryResult {
-  // Neighbours, ordered by descending score. Rows with equal scores keep
-  // shard order, which makes the ordering deterministic but is not
-  // otherwise meaningful: a tie between two rows has no winner.
+  // Neighbours, ordered by descending score. Equal scores use stable labels
+  // when `stable_label_order` was requested; otherwise they retain the
+  // historical shard/slot order.
   repeated Neighbour neighbours = 1;
 }
 

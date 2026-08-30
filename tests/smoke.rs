@@ -294,6 +294,7 @@ async fn create_add_search_filter_stream_idmap() {
                 vector: query,
                 initial_floor: None,
                 request_id: "id-map-refusal".to_string(),
+                ..Default::default()
             })),
         }]))
         .await
@@ -435,6 +436,7 @@ async fn live_floor_stream_is_exact_and_reports_completion() {
             vector: query.clone(),
             initial_floor: Some(safe_floor),
             request_id: "seeded-floor".to_string(),
+            ..Default::default()
         })),
     };
     let mut seeded_stream = client
@@ -491,6 +493,7 @@ async fn live_floor_stream_is_exact_and_reports_completion() {
                 vector: query.clone(),
                 initial_floor: None,
                 request_id: "raised-floor".to_string(),
+                ..Default::default()
             })),
         })
         .await
@@ -553,6 +556,7 @@ async fn live_floor_stream_is_exact_and_reports_completion() {
                 vector: query.clone(),
                 initial_floor: Some(f32::INFINITY),
                 request_id: "cancelled-empty-stream".to_string(),
+                ..Default::default()
             })),
         },
         StreamSearchRequest {
