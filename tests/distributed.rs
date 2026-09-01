@@ -24,7 +24,9 @@ use turbovec_grpc::proto::{
     JoinRequest, LabelBitmap, RowBlock, SearchRequest, SetCalibrationRequest, ShardRef,
     SplitRequest, StartCollectionCandidates, StopStreamSearch,
 };
-use turbovec_grpc::{CoordinatorService, IndexStore, NodeTable, ShardConfig, TurboVecService};
+use turbovec_grpc::{
+    CoordinatorLimits, CoordinatorService, IndexStore, NodeTable, ShardConfig, TurboVecService,
+};
 
 /// Vector width used throughout. A multiple of 8, as turbovec requires, and
 /// small enough that a few hundred rows cost nothing to encode.
@@ -798,6 +800,21 @@ async fn candidate_stream_marks_cancellation_and_missing_shards_incomplete() {
         cancelled.completion.error,
         "candidate stream cancelled by caller"
     );
+
+    let (_, table) = direct.topology_snapshot();
+    let deadline = CoordinatorService::with_limits(
+        table,
+        CoordinatorLimits {
+            query_timeout: std::time::Duration::from_nanos(1),
+            ..Default::default()
+        },
+    );
+    let timed_out = collect_candidates(deadline.candidate_stream(tokio_stream::iter(vec![Ok(
+        candidate_start(Lcg(923).rows(1)),
+    )])))
+    .await;
+    assert!(!timed_out.completion.completed);
+    assert!(timed_out.completion.error.contains("deadline"));
 }
 
 /// The coordinator fits one pair and every shard ends up holding it.

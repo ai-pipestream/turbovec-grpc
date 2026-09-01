@@ -706,9 +706,48 @@ impl CoordinatorService {
             });
             let mut shard_request = Request::new(WatchStream::new(request_rx));
             shard_request.set_timeout(self.limits.query_timeout);
-            let mut responses = match client.stream_search(shard_request).await {
-                Ok(response) => response.into_inner(),
-                Err(status) => {
+            let mut responses = match tokio::time::timeout(
+                self.limits.query_timeout,
+                client.stream_search(shard_request),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response.into_inner(),
+                Err(_) => {
+                    send_incomplete_candidate_completion(
+                        &tx,
+                        &pinned,
+                        &fingerprint,
+                        0,
+                        0,
+                        0,
+                        0,
+                        "distributed candidate stream deadline exceeded",
+                    )
+                    .await;
+                    self.metrics.search_failed();
+                    return;
+                }
+                Ok(Err(status))
+                    if status.code() == tonic::Code::DeadlineExceeded
+                        || (status.code() == tonic::Code::Cancelled
+                            && status.message().contains("Timeout")) =>
+                {
+                    send_incomplete_candidate_completion(
+                        &tx,
+                        &pinned,
+                        &fingerprint,
+                        0,
+                        0,
+                        0,
+                        0,
+                        "distributed candidate stream deadline exceeded",
+                    )
+                    .await;
+                    self.metrics.search_failed();
+                    return;
+                }
+                Ok(Err(status)) => {
                     send_incomplete_candidate_completion(
                         &tx,
                         &pinned,
