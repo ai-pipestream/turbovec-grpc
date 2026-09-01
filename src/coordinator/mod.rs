@@ -42,8 +42,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 use turbovec::TurboQuantIndex;
@@ -57,13 +59,15 @@ use crate::proto::coordinator_server::{Coordinator, CoordinatorServer};
 use crate::proto::turbo_vec_admin_client::TurboVecAdminClient;
 use crate::proto::turbo_vec_query_client::TurboVecQueryClient;
 use crate::proto::{
-    Calibration, CollectionQueryResult, CollectionSearchRequest, CollectionSearchResponse,
-    ExportRowsRequest, FitCalibrationRequest, FitCalibrationResponse, FlushRequest,
-    GetCalibrationRequest, GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse,
-    ImportRowsStart, IndexInfo, JoinRequest, JoinResponse, ListIndexesRequest, ListNodesRequest,
-    ListNodesResponse, Neighbour, RegisterNodeRequest, RegisterNodeResponse, RowBlock,
-    SetCalibrationRequest, ShardRef, ShardStatus, SpareNodeStatus, SplitRequest, SplitResponse,
-    StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
+    Calibration, CollectionCandidateBatch, CollectionCandidateCompletion,
+    CollectionCandidateRequest, CollectionCandidateResponse, CollectionQualityContract,
+    CollectionQueryResult, CollectionSearchRequest, CollectionSearchResponse, ExportRowsRequest,
+    FitCalibrationRequest, FitCalibrationResponse, FlushRequest, GetCalibrationRequest,
+    GetIndexInfoRequest, ImportRowsRequest, ImportRowsResponse, ImportRowsStart, IndexInfo,
+    JoinRequest, JoinResponse, ListIndexesRequest, ListNodesRequest, ListNodesResponse, Neighbour,
+    RegisterNodeRequest, RegisterNodeResponse, RowBlock, SetCalibrationRequest, ShardRef,
+    ShardStatus, SpareNodeStatus, SplitRequest, SplitResponse, StartStreamSearch,
+    StreamSearchRequest, StreamSearchResponse,
 };
 use crate::service::calibration_difference;
 
@@ -73,6 +77,12 @@ pub use nodes::{NodeTable, ShardConfig};
 /// carry a whole shard's codes, which is the largest thing on this wire by a
 /// wide margin, so it matches the node binary's own limit.
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Provider batches target enough payload to amortize protobuf and HTTP/2
+/// framing without delaying the first useful floor for a large pre-floor
+/// burst. A short timer flushes smaller tails.
+const CANDIDATE_BATCH_BYTES: usize = 64 * 1024;
+const CANDIDATE_BATCH_LATENCY: Duration = Duration::from_millis(2);
 
 /// Coordinator-side request limits.
 #[derive(Clone, Debug)]
@@ -521,6 +531,449 @@ impl CoordinatorService {
         Ok(TurboVecAdminClient::new(self.channel(address)?)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES))
+    }
+
+    /// Open the collection-level provider stream used by an embedding search
+    /// product. Both the generated gRPC method and an in-process caller enter
+    /// this exact implementation; only the input/output transport differs.
+    pub fn candidate_stream<S>(
+        &self,
+        inbound: S,
+    ) -> ReceiverStream<Result<CollectionCandidateResponse, Status>>
+    where
+        S: Stream<Item = Result<CollectionCandidateRequest, Status>> + Send + Unpin + 'static,
+    {
+        let (tx, rx) = mpsc::channel(64);
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.run_candidate_stream(inbound, tx).await;
+        });
+        ReceiverStream::new(rx)
+    }
+
+    async fn run_candidate_stream<S>(
+        &self,
+        mut inbound: S,
+        tx: mpsc::Sender<Result<CollectionCandidateResponse, Status>>,
+    ) where
+        S: Stream<Item = Result<CollectionCandidateRequest, Status>> + Send + Unpin + 'static,
+    {
+        let first = match inbound.next().await {
+            Some(Ok(message)) => message,
+            Some(Err(status)) => {
+                let _ = tx.send(Err(status)).await;
+                return;
+            }
+            None => {
+                let _ = tx
+                    .send(Err(Status::invalid_argument(
+                        "candidate stream closed before StartCollectionCandidates",
+                    )))
+                    .await;
+                return;
+            }
+        };
+        let start = match first.payload {
+            Some(crate::proto::collection_candidate_request::Payload::Start(start)) => start,
+            _ => {
+                let _ = tx
+                    .send(Err(Status::invalid_argument(
+                        "first CollectionCandidateRequest must be StartCollectionCandidates",
+                    )))
+                    .await;
+                return;
+            }
+        };
+
+        let pinned = match self.collection().await {
+            Ok(pinned) => pinned,
+            Err(status) => {
+                send_candidate_completion(
+                    &tx,
+                    CollectionCandidateCompletion {
+                        completed: false,
+                        error: status.message().to_string(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                self.metrics.search_failed();
+                return;
+            }
+        };
+        if pinned.shards.iter().any(|shard| !shard.info.labelled) {
+            let status = Status::failed_precondition(
+                "candidate streaming requires stable labels on every collection shard",
+            );
+            let _ = tx.send(Err(status)).await;
+            return;
+        }
+        if start.vector.len() != pinned.dim {
+            let _ = tx
+                .send(Err(Status::invalid_argument(format!(
+                    "candidate query has dim {}, collection expects {}",
+                    start.vector.len(),
+                    pinned.dim
+                ))))
+                .await;
+            return;
+        }
+        if let Some((coordinate, value)) = start
+            .vector
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            let _ = tx
+                .send(Err(Status::invalid_argument(format!(
+                    "candidate query coordinate {coordinate} is not finite: {value}"
+                ))))
+                .await;
+            return;
+        }
+        if !start.has_allowed_labels
+            && (!start.allowed_labels.is_empty() || !start.allowed_label_bitmaps.is_empty())
+        {
+            let _ = tx
+                .send(Err(Status::invalid_argument(
+                    "allowed label filters require has_allowed_labels=true",
+                )))
+                .await;
+            return;
+        }
+        if !start.allowed_labels.is_empty() && !start.allowed_label_bitmaps.is_empty() {
+            let _ = tx
+                .send(Err(Status::invalid_argument(
+                    "allowed_labels and allowed_label_bitmaps are mutually exclusive",
+                )))
+                .await;
+            return;
+        }
+        if let Err(status) = crate::service::validate_label_bitmaps(&start.allowed_label_bitmaps) {
+            let _ = tx.send(Err(status)).await;
+            return;
+        }
+        if start.initial_floor.is_some_and(f32::is_nan) {
+            let _ = tx
+                .send(Err(Status::invalid_argument(
+                    "initial_floor must not be NaN",
+                )))
+                .await;
+            return;
+        }
+
+        let fingerprint = collection_scoring_fingerprint(&pinned);
+        let request_id = if start.request_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            start.request_id.clone()
+        };
+        let event_capacity = (pinned.shards.len() * 4).max(16);
+        let (event_tx, mut event_rx) = mpsc::channel(event_capacity);
+        let mut outbound = Vec::with_capacity(pinned.shards.len());
+        for (shard_rank, shard) in pinned.shards.iter().enumerate() {
+            let mut client = match self.query_client(&shard.address) {
+                Ok(client) => client,
+                Err(status) => {
+                    send_incomplete_candidate_completion(
+                        &tx,
+                        &pinned,
+                        &fingerprint,
+                        0,
+                        0,
+                        0,
+                        0,
+                        status.message(),
+                    )
+                    .await;
+                    self.metrics.search_failed();
+                    return;
+                }
+            };
+            let (request_tx, request_rx) = watch::channel(StreamSearchRequest {
+                payload: Some(crate::proto::stream_search_request::Payload::Start(
+                    StartStreamSearch {
+                        index_id: shard.index_id.clone(),
+                        vector: start.vector.clone(),
+                        initial_floor: start.initial_floor,
+                        request_id: request_id.clone(),
+                        allowed_labels: start.allowed_labels.clone(),
+                        has_allowed_labels: start.has_allowed_labels,
+                        allowed_label_bitmaps: start.allowed_label_bitmaps.clone(),
+                    },
+                )),
+            });
+            let mut shard_request = Request::new(WatchStream::new(request_rx));
+            shard_request.set_timeout(self.limits.query_timeout);
+            let mut responses = match client.stream_search(shard_request).await {
+                Ok(response) => response.into_inner(),
+                Err(status) => {
+                    send_incomplete_candidate_completion(
+                        &tx,
+                        &pinned,
+                        &fingerprint,
+                        0,
+                        0,
+                        0,
+                        0,
+                        node_error(&shard.address, &status).message(),
+                    )
+                    .await;
+                    self.metrics.search_failed();
+                    return;
+                }
+            };
+            let shard_events = event_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match responses.message().await {
+                        Ok(Some(response)) => {
+                            if shard_events
+                                .send(StreamEvent::Message {
+                                    shard_rank,
+                                    response,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = shard_events.send(StreamEvent::Closed { shard_rank }).await;
+                            break;
+                        }
+                        Err(status) => {
+                            let _ = shard_events
+                                .send(StreamEvent::Error { shard_rank, status })
+                                .await;
+                            break;
+                        }
+                    }
+                }
+            });
+            outbound.push(Some(ShardControl {
+                sender: request_tx,
+                completed: false,
+            }));
+        }
+        drop(event_tx);
+
+        let mut completion = CollectionCandidateCompletion {
+            completed: false,
+            scoring_fingerprint: fingerprint.clone(),
+            quality_contract: CollectionQualityContract::ExhaustiveQuantized as i32,
+            topology_generation: pinned.generation,
+            shards_total: u32::try_from(pinned.shards.len()).unwrap_or(u32::MAX),
+            ..Default::default()
+        };
+        let mut completed = vec![false; pinned.shards.len()];
+        let mut remaining = pinned.shards.len();
+        let mut last_floor = start.initial_floor.unwrap_or(f32::NEG_INFINITY);
+        let mut pending = Vec::with_capacity(CANDIDATE_BATCH_BYTES);
+        let mut inbound_open = true;
+        let deadline = tokio::time::sleep(self.limits.query_timeout);
+        tokio::pin!(deadline);
+        let mut flush = tokio::time::interval(CANDIDATE_BATCH_LATENCY);
+        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        flush.tick().await;
+
+        while remaining > 0 {
+            tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                _ = &mut deadline => {
+                    for control in outbound.iter().flatten() {
+                        control.sender.send_replace(StreamSearchRequest {
+                            payload: Some(crate::proto::stream_search_request::Payload::Stop(
+                                crate::proto::StopStreamSearch {},
+                            )),
+                        });
+                    }
+                    completion.error = "distributed candidate stream deadline exceeded".to_string();
+                    send_candidate_completion(&tx, completion).await;
+                    self.metrics.search_failed();
+                    return;
+                }
+                _ = flush.tick(), if !pending.is_empty() => {
+                    match flush_candidate_bytes(&tx, &mut pending).await {
+                        Ok(emitted) => completion.emitted = completion.emitted.saturating_add(emitted),
+                        Err(()) => return,
+                    }
+                }
+                message = inbound.next(), if inbound_open => {
+                    match message {
+                        Some(Ok(message)) => match message.payload {
+                            Some(crate::proto::collection_candidate_request::Payload::FloorUpdate(update)) => {
+                                if update.floor.is_nan() {
+                                    completion.error = "candidate floor must not be NaN".to_string();
+                                    send_candidate_completion(&tx, completion).await;
+                                    self.metrics.search_failed();
+                                    return;
+                                }
+                                if update.floor > last_floor {
+                                    last_floor = update.floor;
+                                    for (rank, control) in outbound.iter().enumerate() {
+                                        if completed[rank] {
+                                            continue;
+                                        }
+                                        control.as_ref().expect("incomplete shard retains control")
+                                            .sender.send_replace(StreamSearchRequest {
+                                                payload: Some(crate::proto::stream_search_request::Payload::FloorUpdate(
+                                                    crate::proto::FloorUpdate { floor: update.floor },
+                                                )),
+                                            });
+                                    }
+                                }
+                            }
+                            Some(crate::proto::collection_candidate_request::Payload::Stop(_)) => {
+                                for control in outbound.iter().flatten() {
+                                    control.sender.send_replace(StreamSearchRequest {
+                                        payload: Some(crate::proto::stream_search_request::Payload::Stop(
+                                            crate::proto::StopStreamSearch {},
+                                        )),
+                                    });
+                                }
+                                completion.error = "candidate stream cancelled by caller".to_string();
+                                send_candidate_completion(&tx, completion).await;
+                                return;
+                            }
+                            Some(crate::proto::collection_candidate_request::Payload::Start(_)) | None => {
+                                completion.error = "candidate stream received a second or empty start".to_string();
+                                send_candidate_completion(&tx, completion).await;
+                                self.metrics.search_failed();
+                                return;
+                            }
+                        },
+                        Some(Err(status)) => {
+                            completion.error = format!("candidate request stream failed: {}", status.message());
+                            send_candidate_completion(&tx, completion).await;
+                            self.metrics.search_failed();
+                            return;
+                        }
+                        None => inbound_open = false,
+                    }
+                }
+                event = event_rx.recv() => {
+                    let Some(event) = event else {
+                        completion.error = "all shard streams closed before completion".to_string();
+                        send_candidate_completion(&tx, completion).await;
+                        self.metrics.search_failed();
+                        return;
+                    };
+                    match event {
+                        StreamEvent::Message { shard_rank, response } => match response.payload {
+                            Some(crate::proto::stream_search_response::Payload::Batch(batch)) => {
+                                if completed[shard_rank] {
+                                    completion.error = format!(
+                                        "shard {} emitted candidates after completion",
+                                        pinned.shards[shard_rank].address,
+                                    );
+                                    send_candidate_completion(&tx, completion).await;
+                                    self.metrics.search_failed();
+                                    return;
+                                }
+                                if batch.scores.len() != batch.slots.len()
+                                    || batch.labels.len() != batch.scores.len()
+                                {
+                                    completion.error = format!(
+                                        "shard {} returned unlabelled or misaligned candidates",
+                                        pinned.shards[shard_rank].address,
+                                    );
+                                    send_candidate_completion(&tx, completion).await;
+                                    self.metrics.search_failed();
+                                    return;
+                                }
+                                for (&label, &score) in batch.labels.iter().zip(&batch.scores) {
+                                    if score.is_nan() {
+                                        completion.error = format!(
+                                            "shard {} returned a NaN score",
+                                            pinned.shards[shard_rank].address,
+                                        );
+                                        send_candidate_completion(&tx, completion).await;
+                                        self.metrics.search_failed();
+                                        return;
+                                    }
+                                    pending.extend_from_slice(&label.to_le_bytes());
+                                    pending.extend_from_slice(&score.to_le_bytes());
+                                }
+                                if pending.len() >= CANDIDATE_BATCH_BYTES {
+                                    match flush_candidate_bytes(&tx, &mut pending).await {
+                                        Ok(emitted) => completion.emitted = completion.emitted.saturating_add(emitted),
+                                        Err(()) => return,
+                                    }
+                                }
+                            }
+                            Some(crate::proto::stream_search_response::Payload::Summary(summary)) => {
+                                if completed[shard_rank] {
+                                    completion.error = format!(
+                                        "shard {} sent more than one completion",
+                                        pinned.shards[shard_rank].address,
+                                    );
+                                    send_candidate_completion(&tx, completion).await;
+                                    self.metrics.search_failed();
+                                    return;
+                                }
+                                completion.blocks_scanned = completion.blocks_scanned
+                                    .saturating_add(summary.blocks_scanned);
+                                completion.floor_raises_applied = completion.floor_raises_applied
+                                    .saturating_add(summary.floor_raises_applied);
+                                if !summary.completed {
+                                    completion.error = format!(
+                                        "shard {} did not complete its candidate scan",
+                                        pinned.shards[shard_rank].address,
+                                    );
+                                    send_candidate_completion(&tx, completion).await;
+                                    self.metrics.search_failed();
+                                    return;
+                                }
+                                completed[shard_rank] = true;
+                                completion.shards_completed = completion.shards_completed.saturating_add(1);
+                                remaining -= 1;
+                                outbound[shard_rank].as_mut()
+                                    .expect("incomplete shard retains control").completed = true;
+                                outbound[shard_rank] = None;
+                            }
+                            None => {
+                                completion.error = format!(
+                                    "shard {} returned an empty candidate response",
+                                    pinned.shards[shard_rank].address,
+                                );
+                                send_candidate_completion(&tx, completion).await;
+                                self.metrics.search_failed();
+                                return;
+                            }
+                        },
+                        StreamEvent::Error { shard_rank, status } => {
+                            completion.error = node_error(&pinned.shards[shard_rank].address, &status)
+                                .message().to_string();
+                            send_candidate_completion(&tx, completion).await;
+                            self.metrics.search_failed();
+                            return;
+                        }
+                        StreamEvent::Closed { shard_rank } if !completed[shard_rank] => {
+                            completion.error = format!(
+                                "{} closed its candidate scan without completion",
+                                pinned.shards[shard_rank].address,
+                            );
+                            send_candidate_completion(&tx, completion).await;
+                            self.metrics.search_failed();
+                            return;
+                        }
+                        StreamEvent::Closed { .. } => {}
+                    }
+                }
+            }
+        }
+
+        match flush_candidate_bytes(&tx, &mut pending).await {
+            Ok(emitted) => completion.emitted = completion.emitted.saturating_add(emitted),
+            Err(()) => return,
+        }
+        completion.completed = true;
+        send_candidate_completion(&tx, completion).await;
+        self.metrics.coordinator_search_finished();
     }
 
     /// Search one query with one global heap while every shard streams
@@ -1274,8 +1727,106 @@ fn plan_counts(rows: u64, targets: usize, requested: &[u64]) -> Result<Vec<u64>,
     Ok(requested.to_vec())
 }
 
+async fn flush_candidate_bytes(
+    tx: &mpsc::Sender<Result<CollectionCandidateResponse, Status>>,
+    pending: &mut Vec<u8>,
+) -> Result<u64, ()> {
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let candidates = std::mem::take(pending);
+    let emitted = u64::try_from(candidates.len() / 12).unwrap_or(u64::MAX);
+    tx.send(Ok(CollectionCandidateResponse {
+        payload: Some(crate::proto::collection_candidate_response::Payload::Batch(
+            CollectionCandidateBatch { candidates },
+        )),
+    }))
+    .await
+    .map_err(|_| ())?;
+    Ok(emitted)
+}
+
+async fn send_candidate_completion(
+    tx: &mpsc::Sender<Result<CollectionCandidateResponse, Status>>,
+    completion: CollectionCandidateCompletion,
+) {
+    let _ = tx
+        .send(Ok(CollectionCandidateResponse {
+            payload: Some(
+                crate::proto::collection_candidate_response::Payload::Completion(completion),
+            ),
+        }))
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_incomplete_candidate_completion(
+    tx: &mpsc::Sender<Result<CollectionCandidateResponse, Status>>,
+    pinned: &Pinned,
+    fingerprint: &str,
+    emitted: u64,
+    blocks_scanned: u64,
+    floor_raises_applied: u64,
+    shards_completed: u32,
+    error: &str,
+) {
+    send_candidate_completion(
+        tx,
+        CollectionCandidateCompletion {
+            completed: false,
+            emitted,
+            blocks_scanned,
+            floor_raises_applied,
+            scoring_fingerprint: fingerprint.to_string(),
+            quality_contract: CollectionQualityContract::ExhaustiveQuantized as i32,
+            topology_generation: pinned.generation,
+            shards_total: u32::try_from(pinned.shards.len()).unwrap_or(u32::MAX),
+            shards_completed,
+            error: error.to_string(),
+        },
+    )
+    .await;
+}
+
+/// Identify the exact score space a collection candidate stream uses.
+///
+/// Labels and topology do not affect score values, so they are deliberately
+/// absent. The domain tag versions this encoding before any field layout can
+/// change.
+fn collection_scoring_fingerprint(pinned: &Pinned) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"turbovec-grpc-score-v1\0");
+    digest.update((pinned.dim as u64).to_le_bytes());
+    digest.update(
+        pinned
+            .shards
+            .first()
+            .map_or(0, |shard| shard.info.bit_width)
+            .to_le_bytes(),
+    );
+    digest.update(pinned.calibration.state.to_le_bytes());
+    digest.update((pinned.calibration.tqplus_shift.len() as u64).to_le_bytes());
+    for value in &pinned.calibration.tqplus_shift {
+        digest.update(value.to_bits().to_le_bytes());
+    }
+    digest.update((pinned.calibration.tqplus_scale.len() as u64).to_le_bytes());
+    for value in &pinned.calibration.tqplus_scale {
+        digest.update(value.to_bits().to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 #[tonic::async_trait]
 impl Coordinator for CoordinatorService {
+    type StreamCandidatesStream = ReceiverStream<Result<CollectionCandidateResponse, Status>>;
+
+    async fn stream_candidates(
+        &self,
+        request: Request<tonic::Streaming<CollectionCandidateRequest>>,
+    ) -> Result<Response<Self::StreamCandidatesStream>, Status> {
+        Ok(Response::new(self.candidate_stream(request.into_inner())))
+    }
+
     async fn list_nodes(
         &self,
         _request: Request<ListNodesRequest>,
