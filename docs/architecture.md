@@ -8,9 +8,8 @@ gRPC, sharding, exact global top-k, persistence, redistribution, limits, and
 failure behavior.
 
 It intentionally does not own documents, text analysis, BM25, embedding
-generation, or corpus pipelines. Those remain separate services. The larger
-`turbovec-search` project is where hybrid and document-oriented mechanisms
-belong.
+generation, or corpus pipelines. Those remain separate services. Pipestream
+Search is where hybrid and document-oriented mechanisms belong.
 
 ## Processes and services
 
@@ -30,6 +29,13 @@ turbovec-coordinator                 topology.json
     |          |          |
  TurboQuantIndex generations below TURBOVEC_DATA_DIR
 ```
+
+The coordinator may also be linked into its caller as a Rust library. In that
+shape the caller invokes the same `CoordinatorService` implementation in
+memory, so the first arrow above disappears. Coordinator-to-shard calls remain
+gRPC because they cross ownership and usually host boundaries. The standalone
+server remains available when the coordinator needs an independent lifecycle
+or authorization boundary.
 
 Node RPCs are split by authorization boundary:
 
@@ -63,6 +69,15 @@ shape mismatch, or calibration mismatch fails the request.
 Batch queries execute concurrently up to `TURBOVEC_MAX_CONCURRENT_QUERIES`.
 Node scans are admitted by `TURBOVEC_MAX_CONCURRENT_SCANS` so CPU work cannot
 grow without bound.
+
+Rows imported or redistributed with labels can be queried in stable-label
+order and restricted by a stable-label admitted set. Each node resolves that
+set against its local label table into a positional mask before the scan. This
+keeps product identity stable when Split or Join changes shard and slot. An
+explicit presence bit makes an empty set match nothing; omitting the set keeps
+the unfiltered behavior. Tie-complete calls retain every candidate at the
+final inclusive k-th score while discarding candidates below each rising
+floor.
 
 ## Durable shard identity
 

@@ -49,6 +49,17 @@ service Coordinator {
   // returned as if it were complete.
   rpc Search(CollectionSearchRequest) returns (CollectionSearchResponse);
 
+  // Opens one provider-level candidate stream over the whole collection.
+  // The caller owns ranking and sends monotonically rising inclusive floors;
+  // this coordinator owns shard fan-out, stable-label transport, and the
+  // requirement that every shard issue a completion certificate.
+  //
+  // Candidates are batched as packed label/score records. The terminal
+  // completion explicitly names the scoring fingerprint and quality contract.
+  // Cancellation, deadline, or loss of any shard returns completed=false and
+  // can never be mistaken for a complete candidate set.
+  rpc StreamCandidates(stream CollectionCandidateRequest) returns (stream CollectionCandidateResponse);
+
   // Fits one TQ+ calibration from a caller-supplied sample and commits
   // that same pair to every shard, so the collection encodes into one
   // coordinate system.
@@ -197,6 +208,34 @@ message CollectionSearchRequest {
   uint32 k = 2;
 
   reserved 3;
+
+  // Break equal-score ties by stable external label rather than by the
+  // collection's current shard order and movable slot. Every shard must be
+  // labelled when this is true. Search products use this to preserve their
+  // public document-id order across split and join.
+  bool stable_label_order = 4;
+
+  // Optional stable external ids admitted to the scan. The explicit presence
+  // bit distinguishes an intentionally empty set from no filter. Every shard
+  // must be labelled when the filter is present.
+  repeated uint64 allowed_labels = 5;
+  bool has_allowed_labels = 6;
+
+  // Optional inclusive score floor known before the collection scan starts.
+  // It may reduce emissions or work but never changes which candidate at or
+  // above the requested floor is returned.
+  optional float initial_floor = 7;
+
+  // Return every row tied at the final k-th score. The response may contain
+  // more than k neighbours. This is required when a product reranks the
+  // vector gate and must not let the collection's arbitrary tie truncation
+  // decide which equal-score documents reach the next stage.
+  bool tie_complete = 8;
+
+  // Packed stable-label admitted sets, forwarded to every vector shard. This
+  // avoids expanding broad product filters to one uint64 per admitted row.
+  // Mutually exclusive with `allowed_labels`.
+  repeated LabelBitmap allowed_label_bitmaps = 9;
 }
 
 // Neighbour is one result row, identified without reference to sharding.
@@ -224,9 +263,9 @@ message Neighbour {
 // CollectionQueryResult is the global top-k for a single query, best
 // first.
 message CollectionQueryResult {
-  // Neighbours, ordered by descending score. Rows with equal scores keep
-  // shard order, which makes the ordering deterministic but is not
-  // otherwise meaningful: a tie between two rows has no winner.
+  // Neighbours, ordered by descending score. Equal scores use stable labels
+  // when `stable_label_order` was requested; otherwise they retain the
+  // historical shard/slot order.
   repeated Neighbour neighbours = 1;
 }
 
@@ -240,6 +279,84 @@ message CollectionSearchResponse {
   // Topology generation searched. In-flight requests may finish on the old
   // generation while an administrative rebind activates the next one.
   uint64 topology_generation = 4;
+}
+
+// One message on the caller-to-provider side of StreamCandidates.
+message CollectionCandidateRequest {
+  oneof payload {
+    // Opens the collection scan. Exactly one, first.
+    StartCollectionCandidates start = 1;
+    // Raises the inclusive emission floor. Duplicate and lower values are
+    // harmless and ignored; NaN is rejected.
+    FloorUpdate floor_update = 2;
+    // Cancels the scan. The terminal completion reports completed=false.
+    StopStreamSearch stop = 3;
+  }
+}
+
+// Opens one collection-wide candidate scan for one query vector.
+message StartCollectionCandidates {
+  // Opaque caller id, echoed only in logs.
+  string request_id = 1;
+  // Exactly one query vector. Length must equal the collection dimension.
+  repeated float vector = 2;
+  // Optional inclusive score floor known before the scan starts.
+  optional float initial_floor = 3;
+  // Optional stable-label filter. The presence bit distinguishes match-none
+  // from no filter. Every collection shard must carry stable labels.
+  repeated uint64 allowed_labels = 4;
+  bool has_allowed_labels = 5;
+  // Packed stable-label ranges, mutually exclusive with allowed_labels.
+  repeated LabelBitmap allowed_label_bitmaps = 6;
+}
+
+// One message on the provider-to-caller side of StreamCandidates.
+message CollectionCandidateResponse {
+  oneof payload {
+    CollectionCandidateBatch batch = 1;
+    CollectionCandidateCompletion completion = 2;
+  }
+}
+
+// Packed stable candidates. Records are little-endian and fixed-stride:
+//   u64 stable label
+//   f32 provider-native score
+// candidates.len() is therefore always a multiple of 12. Empty batches are
+// never sent.
+message CollectionCandidateBatch {
+  bytes candidates = 1;
+}
+
+// What a successful provider completion certifies.
+enum CollectionQualityContract {
+  COLLECTION_QUALITY_CONTRACT_UNSPECIFIED = 0;
+  // Every admitted row was evaluated under one TurboVec quantized score and
+  // the inclusive live-floor contract.
+  COLLECTION_QUALITY_CONTRACT_EXHAUSTIVE_QUANTIZED = 1;
+}
+
+// Terminal provider certificate. Exactly one is emitted on every accepted
+// stream, including cancellation, deadline, or shard loss.
+message CollectionCandidateCompletion {
+  // True only when every pinned shard completed its scan.
+  bool completed = 1;
+  // Candidates emitted to the caller after coordinator batching.
+  uint64 emitted = 2;
+  // Total scan blocks visited across shards.
+  uint64 blocks_scanned = 3;
+  // Total floor raises applied across shards.
+  uint64 floor_raises_applied = 4;
+  // Backend-defined identity of the exact score function shared by the
+  // collection. Non-empty on every successful completion.
+  string scoring_fingerprint = 5;
+  // Semantic quality/completion contract for this stream.
+  CollectionQualityContract quality_contract = 6;
+  // Topology generation pinned for the complete stream.
+  uint64 topology_generation = 7;
+  uint32 shards_total = 8;
+  uint32 shards_completed = 9;
+  // Empty on success; named failure on an incomplete completion.
+  string error = 10;
 }
 
 // FitCalibrationRequest carries the sample to fit the collection's pair

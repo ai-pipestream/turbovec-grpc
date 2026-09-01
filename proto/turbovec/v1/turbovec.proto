@@ -378,6 +378,25 @@ message StartStreamSearch {
 
   // Coordinator-assigned opaque identifier for logs and diagnostics.
   string request_id = 4;
+
+  // Optional stable external ids to admit. These are matched against the
+  // shard's persisted labels, not its movable positional slots. The
+  // enclosing `has_allowed_labels` bit distinguishes an intentionally empty
+  // admitted set from the absence of a filter.
+  repeated uint64 allowed_labels = 5;
+  bool has_allowed_labels = 6;
+
+  // Packed stable-label admitted sets. Segments are non-overlapping label
+  // ranges; bit i (least-significant bit first) admits base_label + i.
+  // This is the scalable form for dense product filters. It is mutually
+  // exclusive with `allowed_labels`.
+  repeated LabelBitmap allowed_label_bitmaps = 7;
+}
+
+message LabelBitmap {
+  uint64 base_label = 1;
+  uint64 label_count = 2;
+  bytes bits = 3;
 }
 
 // Monotonically raises a running scan's inclusive score floor.

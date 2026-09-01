@@ -12,15 +12,21 @@
 //! fan-out, and the merge rather than the functions underneath them.
 
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::{Channel, Endpoint, Server};
 use turbovec_grpc::proto::coordinator_client::CoordinatorClient;
 use turbovec_grpc::proto::turbo_vec_client::TurboVecClient;
 use turbovec_grpc::proto::{
-    import_rows_request, AddRequest, Calibration, CollectionSearchRequest, CreateIndexRequest,
-    ExportRowsRequest, ImportRowsRequest, ImportRowsStart, IndexKind, JoinRequest, RowBlock,
-    SearchRequest, SetCalibrationRequest, ShardRef, SplitRequest,
+    collection_candidate_request, collection_candidate_response, import_rows_request, AddRequest,
+    Calibration, CollectionCandidateCompletion, CollectionCandidateRequest,
+    CollectionCandidateResponse, CollectionQualityContract, CollectionSearchRequest,
+    CreateIndexRequest, ExportRowsRequest, ImportRowsRequest, ImportRowsStart, IndexKind,
+    JoinRequest, LabelBitmap, RowBlock, SearchRequest, SetCalibrationRequest, ShardRef,
+    SplitRequest, StartCollectionCandidates, StopStreamSearch,
 };
-use turbovec_grpc::{CoordinatorService, IndexStore, NodeTable, ShardConfig, TurboVecService};
+use turbovec_grpc::{
+    CoordinatorLimits, CoordinatorService, IndexStore, NodeTable, ShardConfig, TurboVecService,
+};
 
 /// Vector width used throughout. A multiple of 8, as turbovec requires, and
 /// small enough that a few hundred rows cost nothing to encode.
@@ -246,6 +252,7 @@ async fn distributed_ranking(
         .search(CollectionSearchRequest {
             queries: queries.to_vec(),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -260,6 +267,60 @@ async fn distributed_ranking(
                 .collect()
         })
         .collect()
+}
+
+struct CollectedCandidates {
+    records: Vec<(u64, u32)>,
+    batch_sizes: Vec<usize>,
+    completion: CollectionCandidateCompletion,
+}
+
+async fn collect_candidates<S>(mut stream: S) -> CollectedCandidates
+where
+    S: Stream<Item = Result<CollectionCandidateResponse, tonic::Status>> + Unpin,
+{
+    let mut records = Vec::new();
+    let mut batch_sizes = Vec::new();
+    let mut completion = None;
+    while let Some(response) = stream.next().await {
+        match response.unwrap().payload.unwrap() {
+            collection_candidate_response::Payload::Batch(batch) => {
+                assert_eq!(batch.candidates.len() % 12, 0);
+                let size = batch.candidates.len() / 12;
+                assert!(size > 0);
+                batch_sizes.push(size);
+                for record in batch.candidates.chunks_exact(12) {
+                    records.push((
+                        u64::from_le_bytes(record[..8].try_into().unwrap()),
+                        u32::from_le_bytes(record[8..].try_into().unwrap()),
+                    ));
+                }
+            }
+            collection_candidate_response::Payload::Completion(done) => {
+                assert!(
+                    completion.replace(done).is_none(),
+                    "one terminal completion"
+                );
+            }
+        }
+    }
+    CollectedCandidates {
+        records,
+        batch_sizes,
+        completion: completion.expect("candidate stream returned a completion"),
+    }
+}
+
+fn candidate_start(vector: Vec<f32>) -> CollectionCandidateRequest {
+    CollectionCandidateRequest {
+        payload: Some(collection_candidate_request::Payload::Start(
+            StartCollectionCandidates {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                vector,
+                ..Default::default()
+            },
+        )),
+    }
 }
 
 /// Assert two rankings are the same ranking.
@@ -418,6 +479,7 @@ async fn split_search_join_all_equal_the_monolithic_index() {
         .search(CollectionSearchRequest {
             queries: queries.clone(),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -434,6 +496,120 @@ async fn split_search_join_all_equal_the_monolithic_index() {
             );
         }
     }
+
+    // A product-level caller needs ties to follow stable document identity,
+    // not the current shard layout. A zero query ties every row exactly; the
+    // smallest labels must survive even though Split scattered them across
+    // three independently scanned heaps.
+    let stable_ties = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let tie_labels: Vec<u64> = stable_ties.results[0]
+        .neighbours
+        .iter()
+        .map(|neighbour| neighbour.label.expect("split shards are labelled"))
+        .collect();
+    assert_eq!(tie_labels, (0..u64::from(K)).collect::<Vec<_>>());
+
+    let complete_ties = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            tie_complete: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let complete_labels: Vec<u64> = complete_ties.results[0]
+        .neighbours
+        .iter()
+        .map(|neighbour| neighbour.label.expect("split shards are labelled"))
+        .collect();
+    assert_eq!(complete_labels, (0..ROWS as u64).collect::<Vec<_>>());
+
+    // Stable-label filtering is independent of the rows' new shard and slot.
+    // Presence is explicit so an empty admitted set means no matches rather
+    // than the unfiltered collection.
+    let admitted = vec![5, 137, 599];
+    let filtered = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            allowed_labels: admitted.clone(),
+            has_allowed_labels: true,
+            initial_floor: Some(0.0),
+            tie_complete: false,
+            allowed_label_bitmaps: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let filtered_labels: Vec<u64> = filtered.results[0]
+        .neighbours
+        .iter()
+        .map(|neighbour| neighbour.label.expect("filtered shards are labelled"))
+        .collect();
+    assert_eq!(filtered_labels, admitted);
+
+    // Packed ranges are the scalable form used when another service owns
+    // document predicates. Their boundaries are independent of vector shard
+    // boundaries and may end on partial bytes.
+    let mut bitmaps = Vec::new();
+    for &(base, count) in &[(0u64, 129u64), (129, 391), (520, 80)] {
+        let mut bits = vec![0u8; count.div_ceil(8) as usize];
+        for &label in &admitted {
+            if label >= base && label < base + count {
+                let local = (label - base) as usize;
+                bits[local / 8] |= 1 << (local % 8);
+            }
+        }
+        bitmaps.push(LabelBitmap {
+            base_label: base,
+            label_count: count,
+            bits,
+        });
+    }
+    let bitmap_filtered = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            has_allowed_labels: true,
+            allowed_label_bitmaps: bitmaps,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let bitmap_labels: Vec<u64> = bitmap_filtered.results[0]
+        .neighbours
+        .iter()
+        .map(|neighbour| neighbour.label.expect("filtered shards are labelled"))
+        .collect();
+    assert_eq!(bitmap_labels, admitted);
+
+    let empty = coordinator
+        .search(CollectionSearchRequest {
+            queries: vec![0.0; DIM],
+            k: K,
+            stable_label_order: true,
+            has_allowed_labels: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(empty.results[0].neighbours.is_empty());
 
     // The collection is now three shards and reports itself so.
     let listed = coordinator
@@ -484,6 +660,161 @@ async fn split_search_join_all_equal_the_monolithic_index() {
         "split again after the join",
     );
     std::fs::remove_dir_all(topology_root).unwrap();
+}
+
+/// The provider stream has one implementation for direct callers and tonic
+/// callers. Both transports expose the same stable labels, score bits, batch
+/// envelope, and terminal contract as the coordinator's unary exact search.
+#[tokio::test]
+async fn candidate_stream_is_transport_identical_and_explicitly_complete() {
+    let nodes = [start_node().await, start_node().await];
+    let pair = fit_pair(91);
+    let (monolith_id, _corpus) = build_monolith(&nodes[0], &pair).await;
+    let service = CoordinatorService::new(NodeTable::new(vec![ShardConfig::with_index(
+        &nodes[0],
+        &monolith_id,
+    )]));
+    let direct = service.clone();
+    let mut external = start_coordinator_service(service).await;
+    external
+        .split(SplitRequest {
+            source: Some(ShardRef {
+                address: nodes[0].clone(),
+                index_id: monolith_id,
+            }),
+            targets: nodes.to_vec(),
+            row_counts: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let query = Lcg(911).rows(1);
+    let direct_result = collect_candidates(
+        direct.candidate_stream(tokio_stream::iter(vec![Ok(candidate_start(query.clone()))])),
+    )
+    .await;
+    let external_result = collect_candidates(
+        external
+            .stream_candidates(tokio_stream::iter(vec![candidate_start(query.clone())]))
+            .await
+            .unwrap()
+            .into_inner(),
+    )
+    .await;
+
+    assert!(direct_result.completion.completed);
+    assert!(external_result.completion.completed);
+    assert_eq!(direct_result.completion.error, "");
+    assert_eq!(direct_result.completion, external_result.completion);
+    assert_eq!(
+        direct_result.completion.quality_contract,
+        CollectionQualityContract::ExhaustiveQuantized as i32
+    );
+    assert!(!direct_result.completion.scoring_fingerprint.is_empty());
+    assert_eq!(direct_result.completion.shards_total, 2);
+    assert_eq!(direct_result.completion.shards_completed, 2);
+    assert_eq!(direct_result.records.len(), ROWS);
+    assert_eq!(external_result.records.len(), ROWS);
+    assert!(direct_result.batch_sizes.iter().any(|&size| size > 1));
+    assert!(external_result.batch_sizes.iter().any(|&size| size > 1));
+
+    let mut direct_records = direct_result.records;
+    direct_records.sort_unstable();
+    let mut external_records = external_result.records;
+    external_records.sort_unstable();
+    assert_eq!(direct_records, external_records);
+
+    let unary = external
+        .search(CollectionSearchRequest {
+            queries: query,
+            k: ROWS as u32,
+            stable_label_order: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut unary_records: Vec<(u64, u32)> = unary.results[0]
+        .neighbours
+        .iter()
+        .map(|neighbour| {
+            (
+                neighbour.label.expect("split rows carry stable labels"),
+                neighbour.score.to_bits(),
+            )
+        })
+        .collect();
+    unary_records.sort_unstable();
+    assert_eq!(direct_records, unary_records);
+}
+
+#[tokio::test]
+async fn candidate_stream_marks_cancellation_and_missing_shards_incomplete() {
+    let address = start_node().await;
+    let pair = fit_pair(92);
+    let (index_id, _corpus) = build_monolith(&address, &pair).await;
+
+    let missing = CoordinatorService::new(NodeTable::new(vec![
+        ShardConfig::with_index(&address, &index_id),
+        ShardConfig::new("http://127.0.0.1:1"),
+    ]));
+    let missing_result =
+        collect_candidates(missing.candidate_stream(tokio_stream::iter(vec![Ok(
+            candidate_start(Lcg(921).rows(1)),
+        )])))
+        .await;
+    assert!(!missing_result.completion.completed);
+    assert!(missing_result
+        .completion
+        .error
+        .starts_with("node_unreachable:"));
+
+    let second = start_node().await;
+    let service = CoordinatorService::new(NodeTable::new(vec![ShardConfig::with_index(
+        &address, &index_id,
+    )]));
+    let direct = service.clone();
+    let mut coordinator = start_coordinator_service(service).await;
+    coordinator
+        .split(SplitRequest {
+            source: Some(ShardRef {
+                address: address.clone(),
+                index_id,
+            }),
+            targets: vec![address, second],
+            row_counts: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let frames = vec![
+        Ok(candidate_start(Lcg(922).rows(1))),
+        Ok(CollectionCandidateRequest {
+            payload: Some(collection_candidate_request::Payload::Stop(
+                StopStreamSearch {},
+            )),
+        }),
+    ];
+    let cancelled = collect_candidates(direct.candidate_stream(tokio_stream::iter(frames))).await;
+    assert!(!cancelled.completion.completed);
+    assert_eq!(
+        cancelled.completion.error,
+        "candidate stream cancelled by caller"
+    );
+
+    let (_, table) = direct.topology_snapshot();
+    let deadline = CoordinatorService::with_limits(
+        table,
+        CoordinatorLimits {
+            query_timeout: std::time::Duration::from_nanos(1),
+            ..Default::default()
+        },
+    );
+    let timed_out = collect_candidates(deadline.candidate_stream(tokio_stream::iter(vec![Ok(
+        candidate_start(Lcg(923).rows(1)),
+    )])))
+    .await;
+    assert!(!timed_out.completion.completed);
+    assert!(timed_out.completion.error.contains("deadline"));
 }
 
 /// The coordinator fits one pair and every shard ends up holding it.
@@ -572,6 +903,7 @@ async fn mixed_calibration_is_refused_by_name() {
         .search(CollectionSearchRequest {
             queries: Lcg(5).rows(1),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -605,6 +937,7 @@ async fn dimension_mismatch_is_refused_by_name() {
         .search(CollectionSearchRequest {
             queries: Lcg(6).rows(1),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -765,6 +1098,7 @@ async fn an_unreachable_shard_fails_the_search() {
         .search(CollectionSearchRequest {
             queries: queries.clone(),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -813,6 +1147,7 @@ async fn a_replica_is_used_only_at_the_required_generation() {
         .search(CollectionSearchRequest {
             queries: queries.clone(),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap_err();

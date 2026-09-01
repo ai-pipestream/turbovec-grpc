@@ -168,6 +168,7 @@ async fn collection_rankings(
         .search(CollectionSearchRequest {
             queries: queries.to_vec(),
             k: K as u32,
+            ..Default::default()
         })
         .await
         .unwrap()

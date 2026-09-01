@@ -187,6 +187,7 @@ async fn distributed_ranking(
         .search(CollectionSearchRequest {
             queries: queries.to_vec(),
             k: K,
+            ..Default::default()
         })
         .await
         .unwrap()
