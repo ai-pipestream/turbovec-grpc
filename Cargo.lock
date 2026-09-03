@@ -917,6 +917,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2079,8 +2088,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turbovec"
 version = "1.0.0"
-source = "git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-s17#65699eff623cefa0aeddbf7c67847372c106a3e2"
+source = "git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-s20#0c6cf820090825a31f75566830c1b85c019d0a80"
 dependencies = [
+ "memmap2",
  "ordered-float",
  "rand",
  "rand_chacha",
