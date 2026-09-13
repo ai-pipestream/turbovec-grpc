@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The same health and reflection services the node binary registers, so a
     // coordinator is probed and explored with the same tooling as a node.
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     if readiness_coordinator.ready().await {
         health_reporter
             .set_serving::<CoordinatorServer<CoordinatorService>>()

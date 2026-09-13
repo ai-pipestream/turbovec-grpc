@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Standard gRPC health checking (grpc.health.v1), so orchestrators and
     // load balancers can probe liveness/readiness without calling the API.
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     if readiness_service.ready() {
         health_reporter
             .set_serving::<TurboVecQueryServer<TurboVecService>>()
