@@ -18,7 +18,7 @@ name = "turbovec-coordinator"
 path = "src/coordinator_main.rs"
 
 [dependencies]
-turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s21" }
+turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s22" }
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
