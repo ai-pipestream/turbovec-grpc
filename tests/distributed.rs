@@ -289,7 +289,7 @@ where
                 let size = batch.candidates.len() / 12;
                 assert!(size > 0);
                 batch_sizes.push(size);
-                for record in batch.candidates.chunks_exact(12) {
+                for record in batch.candidates.as_chunks::<12>().0 {
                     records.push((
                         u64::from_le_bytes(record[..8].try_into().unwrap()),
                         u32::from_le_bytes(record[8..].try_into().unwrap()),
