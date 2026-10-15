@@ -15,9 +15,9 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>17</maven.compiler.release>
-    <grpc.version>1.68.1</grpc.version>
-    <protobuf.version>4.28.3</protobuf.version>
-    <jackson.version>2.18.2</jackson.version>
+    <grpc.version>1.85.0</grpc.version>
+    <protobuf.version>4.36.2</protobuf.version>
+    <jackson.version>2.22.3</jackson.version>
     <!-- Default demo; override with -Dexec.mainClass=demo.WireFidelityDemo. -->
     <exec.mainClass>demo.TurboVecDemo</exec.mainClass>
   </properties>
@@ -91,7 +91,7 @@
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
-        <version>3.5.0</version>
+        <version>3.6.4</version>
         <configuration>
           <mainClass>${exec.mainClass}</mainClass>
         </configuration>
