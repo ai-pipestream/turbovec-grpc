@@ -1852,7 +1852,13 @@ fn collection_scoring_fingerprint(pinned: &Pinned) -> String {
     for value in &pinned.calibration.tqplus_scale {
         digest.update(value.to_bits().to_le_bytes());
     }
-    format!("{:x}", digest.finalize())
+    let bytes = digest.finalize();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }
 
 #[tonic::async_trait]
