@@ -44,6 +44,6 @@ tonic-prost-build = "0.14"
 # builds the bundled HDF5 C library, so no system libhdf5 is needed. The
 # hdf5 crate (same vendored build, already in hidefix's tree) reads the
 # root attributes, which hidefix's index API does not expose.
-hidefix = { version = "0.11", default-features = false, features = ["static"] }
+hidefix = { version = "0.12", default-features = false, features = ["static"] }
 hdf5 = { version = "0.9", package = "hdf5-metno", default-features = false, features = ["static"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
